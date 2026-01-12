@@ -136,7 +136,8 @@ pub async fn run() -> Result<()> {
 async fn run_start(args: StartArgs) -> Result<()> {
     let assets_root = assets::default_assets_root()?;
     let layout = AssetsLayout::new(assets_root, args.network_name.clone());
-    println!("assets path: {}", layout.net_dir().display());
+    let assets_path = shorten_home_path(&layout.net_dir().display().to_string());
+    println!("assets path: {}", assets_path);
     let assets_exist = layout.exists().await;
     if !args.setup_only && !args.force_setup && assets_exist {
         println!("resuming network operations on {}", layout.network_name());
@@ -157,7 +158,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
     if !layout.exists().await {
         return Err(anyhow!(
             "assets missing under {}; run with --setup-only to create them",
-            layout.net_dir().display()
+            shorten_home_path(&layout.net_dir().display().to_string())
         ));
     }
 
@@ -219,7 +220,7 @@ async fn run_setup_only(
     if layout.exists().await {
         println!(
             "assets already exist at {}; use --force-setup to rebuild",
-            layout.net_dir().display()
+            shorten_home_path(&layout.net_dir().display().to_string())
         );
         print_derived_accounts_summary(layout).await;
         return Ok(());
