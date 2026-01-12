@@ -51,3 +51,4 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - Use `tokio::fs` for IO and `spawn_blocking` for CPU/TOML operations.
 - Prefer concise user-facing logs.
 - Default target for assets is the build target (from `build.rs`).
+- Keep `README.md` updated with CLI defaults/flags whenever code changes.

@@ -61,12 +61,12 @@ struct StartArgs {
     users: Option<u32>,
 
     /// Genesis activation delay in seconds.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 3)]
     delay: u64,
 
     /// Log level for child processes (passed as `RUST_LOG`).
-    #[arg(long, default_value = "info")]
-    loglevel: String,
+    #[arg(long = "log-level", default_value = "info")]
+    log_level: String,
 
     /// Log format for node config files.
     #[arg(long, default_value = "json")]
@@ -160,7 +160,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
         ));
     }
 
-    let rust_log = args.loglevel.clone();
+    let rust_log = args.log_level.clone();
 
     let plan = StartPlan { rust_log };
 

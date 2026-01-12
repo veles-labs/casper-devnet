@@ -99,8 +99,8 @@ casper-devnet start --force-setup
 - `--network-name <name>`: Network name for configs/paths (default: `casper-dev`)
 - `--node-count <n>`: Number of nodes (aliases: `--nodes`, `--validators`; default: 4)
 - `--users <n>`: Number of user accounts (default: node count)
-- `--delay <seconds>`: Genesis activation delay (default: 30)
-- `--loglevel <level>`: Child process log level (default: `info`)
+- `--delay <seconds>`: Genesis activation delay (default: 3). Keep it short for local devnets; increase if you need more time to attach tooling before genesis.
+- `--log-level <level>`: Child process log level (default: `info`)
 - `--node-log-format <format>`: Node logging format in config (default: `json`)
 - `--setup-only`: Build assets and exit
 - `--force-setup`: Rebuild assets even if they exist
