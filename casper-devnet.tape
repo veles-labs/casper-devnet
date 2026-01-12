@@ -1,5 +1,4 @@
 Output casper-devnet.gif
-Output casper-devnet.mp4
 
 Set TypingSpeed 75ms
 Set FontSize 15
@@ -19,6 +18,6 @@ Sleep 500ms
 Type " start"
 Sleep 2s
 Enter
-Sleep 55s
+Sleep 20s
 Ctrl+C
 Sleep 500ms
