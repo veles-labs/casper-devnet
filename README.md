@@ -1,4 +1,4 @@
-# Casper Devnet Launcher (Rust)
+# Casper Devnet Launcher
 
 Casper Devnet Launcher is a Rust local development Casper network, based on and heavily inspired
 by the NCTL workflow, to make local devnets quick and easy for smart contract developers.
