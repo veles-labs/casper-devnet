@@ -5,6 +5,8 @@ by the NCTL workflow, to make local devnets quick and easy for smart contract de
 It embeds the essential node-launcher behavior in-process, so you only need the `casper-node`
 and (optionally) `casper-sidecar` binaries.
 
+![Casper Devnet Launcher demo](casper-devnet.gif)
+
 ## Why this exists
 
 NCTL is fantastic for core protocol development and for building assets from source trees, but it
@@ -25,10 +27,6 @@ CI, and tests.
 | Keys/accounts | Random keys, friction to name/locate | Deterministic keys from a seed (BIP32 paths) |
 | macOS devnet start | Often requires extra local compilation | Planned: download pre-built bundles |
 | Network feedback | Extra commands to watch blocks/txs | Persistent SSE connection with live output |
-
-## Requirements
-
-- A local assets bundle (`.tar.gz`) containing binaries and templates (see below)
 
 ## Installation
 
@@ -65,7 +63,7 @@ casper-devnet assets pull --target x86_64-unknown-linux-gnu
 ## Security note
 
 `casper-devnet assets pull` downloads pre-built binaries from
-`https://github.com/veles-labs/devnet-launcher-assets/releases`.
+[https://github.com/veles-labs/devnet-launcher-assets/releases](https://github.com/veles-labs/devnet-launcher-assets/).
 If you are not comfortable running pre-built binaries, download the assets repo and rebuild the
 binaries locally using the provided scripts before installing them with `assets add`.
 
@@ -122,7 +120,7 @@ v2.1.1/node-config.toml
 ```
 
 For manual rebuilds and bundle scripts, see
-`https://github.com/veles-labs/devnet-launcher-assets/`.
+[https://github.com/veles-labs/devnet-launcher-assets/](https://github.com/veles-labs/devnet-launcher-assets/)`.
 
 ## Notes
 
