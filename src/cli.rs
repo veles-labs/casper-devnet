@@ -9,6 +9,7 @@ use casper_types::execution::ExecutionResult;
 use casper_types::U512;
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
+use spinners::{Spinner, Spinners};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -172,9 +173,9 @@ async fn run_start(args: StartArgs) -> Result<()> {
     print_derived_accounts_summary(&layout).await;
 
     let node_ids = unique_node_ids(&started);
-    let details = format_network_details(&layout, &started).await;
+    let details = format_network_details(&started).await;
     let health = Arc::new(Mutex::new(SseHealth::new(node_ids.clone(), details)));
-    println!("Waiting for SSE connection...");
+    start_sse_spinner(&health).await;
     spawn_sse_listeners(&layout, &node_ids, health).await;
 
     let (event_tx, mut event_rx) = unbounded_channel();
@@ -261,10 +262,9 @@ fn print_pids(records: &[RunningProcess]) {
     }
 }
 
-async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProcess]) -> String {
+async fn format_network_details(processes: &[RunningProcess]) -> String {
     let mut node_pids: HashMap<u32, u32> = HashMap::new();
     let mut sidecar_pids: HashMap<u32, u32> = HashMap::new();
-    let mut process_logs: HashMap<u32, Vec<(ProcessKind, u32, String, String)>> = HashMap::new();
 
     for process in processes {
         if let Some(pid) = record_pid(&process.record) {
@@ -276,15 +276,6 @@ async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProce
                     sidecar_pids.insert(process.record.node_id, pid);
                 }
             }
-            process_logs
-                .entry(process.record.node_id)
-                .or_default()
-                .push((
-                    process.record.kind.clone(),
-                    pid,
-                    process.record.stdout_path.clone(),
-                    process.record.stderr_path.clone(),
-                ));
         }
     }
 
@@ -292,7 +283,6 @@ async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProce
 
     let mut lines = Vec::new();
     lines.push("network details".to_string());
-    lines.push(format!("assets: {}", layout.net_dir().display()));
     for node_id in node_ids {
         let node_pid = node_pids
             .get(&node_id)
@@ -306,19 +296,6 @@ async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProce
             "node-{} pid={} sidecar pid={}",
             node_id, node_pid, sidecar_pid
         ));
-        if let Some(entries) = process_logs.get(&node_id) {
-            let mut entries = entries.clone();
-            entries.sort_by_key(|entry| process_kind_label(&entry.0).to_string());
-            for (kind, pid, stdout, stderr) in entries {
-                lines.push(format!(
-                    "  {} pid={} stdout={} stderr={}",
-                    process_kind_label(&kind),
-                    pid,
-                    stdout,
-                    stderr
-                ));
-            }
-        }
         lines.push(format!("  rest:   {}", assets::rest_endpoint(node_id)));
         lines.push(format!("  sse:    {}", assets::sse_endpoint(node_id)));
         lines.push(format!("  rpc:    {}", assets::rpc_endpoint(node_id)));
@@ -335,13 +312,6 @@ async fn print_derived_accounts_summary(layout: &AssetsLayout) {
         for line in summary.lines() {
             println!("  {}", line);
         }
-    }
-}
-
-fn process_kind_label(kind: &ProcessKind) -> &'static str {
-    match kind {
-        ProcessKind::Node => "node",
-        ProcessKind::Sidecar => "sidecar",
     }
 }
 
@@ -412,10 +382,16 @@ fn spawn_exit_watchers(processes: Vec<RunningProcess>, tx: UnboundedSender<RunEv
     }
 }
 
+const SSE_WAIT_MESSAGE: &str = "Waiting for SSE connection...";
+const BLOCK_WAIT_MESSAGE: &str = "Waiting for new blocks...";
+
 struct SseHealth {
     expected_nodes: HashSet<u32>,
     versions: HashMap<u32, String>,
     announced: bool,
+    block_seen: bool,
+    sse_spinner: Option<Spinner>,
+    block_spinner: Option<Spinner>,
     details: String,
 }
 
@@ -425,6 +401,9 @@ impl SseHealth {
             expected_nodes: node_ids.into_iter().collect(),
             versions: HashMap::new(),
             announced: false,
+            block_seen: false,
+            sse_spinner: None,
+            block_spinner: None,
             details,
         }
     }
@@ -436,6 +415,17 @@ async fn should_log_primary(node_id: u32, health: &Arc<Mutex<SseHealth>>) -> boo
     }
     let state = health.lock().await;
     state.announced
+}
+
+fn start_spinner(message: &str) -> Spinner {
+    Spinner::new(Spinners::Dots, message.to_string())
+}
+
+async fn start_sse_spinner(health: &Arc<Mutex<SseHealth>>) {
+    let mut state = health.lock().await;
+    if state.sse_spinner.is_none() {
+        state.sse_spinner = Some(start_spinner(SSE_WAIT_MESSAGE));
+    }
 }
 
 async fn spawn_sse_listeners(
@@ -493,6 +483,7 @@ async fn run_sse_listener(node_id: u32, endpoint: String, health: Arc<Mutex<SseH
                     }
                     SseEvent::BlockAdded { block_hash, block } => {
                         if should_log_primary(node_id, &health).await {
+                            mark_block_seen(&health).await;
                             let prefix = timestamp_prefix();
                             println!(
                                 "{} Block {} added (height={} era={})",
@@ -542,20 +533,47 @@ async fn run_sse_listener(node_id: u32, endpoint: String, health: Arc<Mutex<SseH
 }
 
 async fn record_api_version(node_id: u32, version: String, health: &Arc<Mutex<SseHealth>>) {
-    let mut state = health.lock().await;
-    if !state.expected_nodes.contains(&node_id) {
-        return;
-    }
-    state.versions.insert(node_id, version);
-    if state.announced || state.versions.len() != state.expected_nodes.len() {
-        return;
-    }
+    let (summary, details, sse_spinner) = {
+        let mut state = health.lock().await;
+        if !state.expected_nodes.contains(&node_id) {
+            return;
+        }
+        state.versions.insert(node_id, version);
+        if state.announced || state.versions.len() != state.expected_nodes.len() {
+            return;
+        }
 
-    let summary = version_summary(&state.versions);
+        let summary = version_summary(&state.versions);
+        let details = state.details.clone();
+        let sse_spinner = state.sse_spinner.take();
+        if state.block_spinner.is_none() {
+            state.block_spinner = Some(start_spinner(BLOCK_WAIT_MESSAGE));
+        }
+        state.announced = true;
+        state.block_seen = false;
+        (summary, details, sse_spinner)
+    };
+
+    if let Some(mut spinner) = sse_spinner {
+        spinner.stop_with_message("SSE connection established.".to_string());
+    }
     println!("Network is healthy ({})", summary);
-    println!("{}", state.details);
-    println!("Waiting for new blocks...");
-    state.announced = true;
+    println!("{}", details);
+}
+
+async fn mark_block_seen(health: &Arc<Mutex<SseHealth>>) {
+    let block_spinner = {
+        let mut state = health.lock().await;
+        if state.block_seen {
+            return;
+        }
+        state.block_seen = true;
+        state.block_spinner.take()
+    };
+
+    if let Some(mut spinner) = block_spinner {
+        spinner.stop_with_message(BLOCK_WAIT_MESSAGE.to_string());
+    }
 }
 
 fn version_summary(versions: &HashMap<u32, String>) -> String {
