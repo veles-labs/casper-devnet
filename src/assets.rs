@@ -214,16 +214,18 @@ impl AssetsLayout {
     }
 }
 
-pub fn default_assets_root() -> Result<PathBuf> {
+pub fn data_dir() -> Result<PathBuf> {
     let project_dirs = ProjectDirs::from("xyz", "veleslabs", "casper-devnet")
         .ok_or_else(|| anyhow!("unable to resolve data directory"))?;
-    Ok(project_dirs.data_dir().join("networks"))
+    Ok(project_dirs.data_dir().to_path_buf())
+}
+
+pub fn default_assets_root() -> Result<PathBuf> {
+    Ok(data_dir()?.join("networks"))
 }
 
 pub fn assets_bundle_root() -> Result<PathBuf> {
-    let project_dirs = ProjectDirs::from("xyz", "veleslabs", "casper-devnet")
-        .ok_or_else(|| anyhow!("unable to resolve data directory"))?;
-    Ok(project_dirs.data_dir().join("assets"))
+    Ok(data_dir()?.join("assets"))
 }
 
 pub fn file_name(path: &Path) -> Option<&OsStr> {

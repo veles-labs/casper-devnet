@@ -8,6 +8,7 @@ use casper_types::contract_messages::MessagePayload;
 use casper_types::execution::ExecutionResult;
 use casper_types::U512;
 use clap::{Args, Parser, Subcommand};
+use directories::BaseDirs;
 use futures::StreamExt;
 use spinners::{Spinner, Spinners};
 use std::collections::{HashMap, HashSet};
@@ -173,7 +174,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
     print_derived_accounts_summary(&layout).await;
 
     let node_ids = unique_node_ids(&started);
-    let details = format_network_details(&started).await;
+    let details = format_network_details(&layout, &started).await;
     let health = Arc::new(Mutex::new(SseHealth::new(node_ids.clone(), details)));
     start_sse_spinner(&health).await;
     spawn_sse_listeners(&layout, &node_ids, health).await;
@@ -262,9 +263,11 @@ fn print_pids(records: &[RunningProcess]) {
     }
 }
 
-async fn format_network_details(processes: &[RunningProcess]) -> String {
+async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProcess]) -> String {
+    let symlink_root = layout.net_dir();
     let mut node_pids: HashMap<u32, u32> = HashMap::new();
     let mut sidecar_pids: HashMap<u32, u32> = HashMap::new();
+    let mut process_logs: HashMap<u32, Vec<(ProcessKind, u32)>> = HashMap::new();
 
     for process in processes {
         if let Some(pid) = record_pid(&process.record) {
@@ -276,6 +279,10 @@ async fn format_network_details(processes: &[RunningProcess]) -> String {
                     sidecar_pids.insert(process.record.node_id, pid);
                 }
             }
+            process_logs
+                .entry(process.record.node_id)
+                .or_default()
+                .push((process.record.kind.clone(), pid));
         }
     }
 
@@ -296,6 +303,20 @@ async fn format_network_details(processes: &[RunningProcess]) -> String {
             "node-{} pid={} sidecar pid={}",
             node_id, node_pid, sidecar_pid
         ));
+        if let Some(entries) = process_logs.get(&node_id) {
+            let mut entries = entries.clone();
+            entries.sort_by_key(|entry| process_kind_label(&entry.0).to_string());
+            for (kind, pid) in entries {
+                let (stdout_link, stderr_link) = log_symlink_paths(&symlink_root, &kind, node_id);
+                lines.push(format!(
+                    "  {} pid={} stdout={} stderr={}",
+                    process_kind_label(&kind),
+                    pid,
+                    stdout_link,
+                    stderr_link
+                ));
+            }
+        }
         lines.push(format!("  rest:   {}", assets::rest_endpoint(node_id)));
         lines.push(format!("  sse:    {}", assets::sse_endpoint(node_id)));
         lines.push(format!("  rpc:    {}", assets::rpc_endpoint(node_id)));
@@ -304,6 +325,42 @@ async fn format_network_details(processes: &[RunningProcess]) -> String {
     }
 
     lines.join("\n")
+}
+
+fn process_kind_label(kind: &ProcessKind) -> &'static str {
+    match kind {
+        ProcessKind::Node => "node",
+        ProcessKind::Sidecar => "sidecar",
+    }
+}
+
+fn shorten_home_path(path: &str) -> String {
+    let path = Path::new(path);
+    let Some(base_dirs) = BaseDirs::new() else {
+        return path.display().to_string();
+    };
+    let home = base_dirs.home_dir();
+    match path.strip_prefix(home) {
+        Ok(stripped) => {
+            let mut shorthand = PathBuf::from("~");
+            shorthand.push(stripped);
+            shorthand.display().to_string()
+        }
+        Err(_) => path.display().to_string(),
+    }
+}
+
+fn log_symlink_paths(symlink_root: &Path, kind: &ProcessKind, node_id: u32) -> (String, String) {
+    let base = match kind {
+        ProcessKind::Node => format!("node-{}", node_id),
+        ProcessKind::Sidecar => format!("sidecar-{}", node_id),
+    };
+    let stdout_link = symlink_root.join(format!("{}.stdout", base));
+    let stderr_link = symlink_root.join(format!("{}.stderr", base));
+    (
+        shorten_home_path(&stdout_link.display().to_string()),
+        shorten_home_path(&stderr_link.display().to_string()),
+    )
 }
 
 async fn print_derived_accounts_summary(layout: &AssetsLayout) {
@@ -803,9 +860,10 @@ async fn resolve_protocol_version(candidate: &Option<String>) -> Result<String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_hex, format_cspr_u512, format_message_payload};
+    use super::{encode_hex, format_cspr_u512, format_message_payload, shorten_home_path};
     use casper_types::contract_messages::MessagePayload;
     use casper_types::U512;
+    use directories::BaseDirs;
 
     #[test]
     fn format_cspr_u512_handles_whole_and_fractional() {
@@ -835,5 +893,26 @@ mod tests {
     #[test]
     fn encode_hex_renders_lowercase() {
         assert_eq!(encode_hex(&[0x00, 0xAB, 0x0f]), "00ab0f");
+    }
+
+    #[test]
+    fn shorten_home_path_replaces_home_prefix() {
+        let Some(base_dirs) = BaseDirs::new() else {
+            return;
+        };
+        let home = base_dirs.home_dir();
+        let shortened = shorten_home_path(&home.to_string_lossy());
+        assert_eq!(shortened, "~");
+
+        let nested = home.join("devnet/logs/stdout.log");
+        let shortened_nested = shorten_home_path(&nested.to_string_lossy());
+        assert!(shortened_nested.starts_with("~"));
+        assert!(shortened_nested.contains("devnet"));
+    }
+
+    #[test]
+    fn shorten_home_path_keeps_relative_paths() {
+        let input = "relative/path";
+        assert_eq!(shorten_home_path(input), input);
     }
 }

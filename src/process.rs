@@ -182,6 +182,14 @@ async fn spawn_node(
 
     let stdout_path = layout.node_logs_dir(node_id).join("stdout.log");
     let stderr_path = layout.node_logs_dir(node_id).join("stderr.log");
+    create_log_symlinks(
+        layout,
+        node_id,
+        ProcessKind::Node,
+        &stdout_path,
+        &stderr_path,
+    )
+    .await?;
 
     let mut launcher = Launcher::new_with_roots(
         None,
@@ -259,6 +267,14 @@ async fn spawn_sidecar(
     let node_dir = layout.node_dir(node_id);
     let stdout_path = layout.node_logs_dir(node_id).join("sidecar-stdout.log");
     let stderr_path = layout.node_logs_dir(node_id).join("sidecar-stderr.log");
+    create_log_symlinks(
+        layout,
+        node_id,
+        ProcessKind::Sidecar,
+        &stdout_path,
+        &stderr_path,
+    )
+    .await?;
 
     let args = vec![
         "--path-to-config".to_string(),
@@ -333,6 +349,38 @@ async fn spawn_process(
         .stderr(stderr);
 
     Ok(cmd.spawn()?)
+}
+
+async fn create_log_symlinks(
+    layout: &AssetsLayout,
+    node_id: u32,
+    kind: ProcessKind,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<()> {
+    let data_dir = layout.net_dir();
+    tokio_fs::create_dir_all(&data_dir).await?;
+    let prefix = match kind {
+        ProcessKind::Node => format!("node-{}", node_id),
+        ProcessKind::Sidecar => format!("sidecar-{}", node_id),
+    };
+    let stdout_link = data_dir.join(format!("{}.stdout", prefix));
+    let stderr_link = data_dir.join(format!("{}.stderr", prefix));
+    create_symlink(&stdout_link, stdout_path).await?;
+    create_symlink(&stderr_link, stderr_path).await?;
+    Ok(())
+}
+
+async fn create_symlink(link_path: &Path, target_path: &Path) -> Result<()> {
+    if let Ok(metadata) = tokio_fs::symlink_metadata(link_path).await {
+        if metadata.is_dir() {
+            tokio_fs::remove_dir_all(link_path).await?;
+        } else {
+            tokio_fs::remove_file(link_path).await?;
+        }
+    }
+    tokio_fs::symlink(target_path, link_path).await?;
+    Ok(())
 }
 
 fn process_group(node_id: u32, total_nodes: u32) -> ProcessGroup {
