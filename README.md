@@ -30,6 +30,12 @@ CI, and tests.
 
 - A local assets bundle (`.tar.gz`) containing binaries and templates (see below)
 
+## Installation
+
+```bash
+cargo install casper-devnet --locked
+```
+
 ## Usage
 
 Add a local assets bundle:
