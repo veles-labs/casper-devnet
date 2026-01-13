@@ -49,6 +49,10 @@ struct StartArgs {
     #[arg(long, default_value = "casper-dev")]
     network_name: String,
 
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
+
     /// Protocol version to use from the assets store (e.g. 2.1.1).
     #[arg(long)]
     protocol_version: Option<String>,
@@ -134,7 +138,10 @@ pub async fn run() -> Result<()> {
 }
 
 async fn run_start(args: StartArgs) -> Result<()> {
-    let assets_root = assets::default_assets_root()?;
+    let assets_root = match &args.net_path {
+        Some(path) => path.clone(),
+        None => assets::default_assets_root()?,
+    };
     let layout = AssetsLayout::new(assets_root, args.network_name.clone());
     let assets_path = shorten_home_path(&layout.net_dir().display().to_string());
     println!("assets path: {}", assets_path);
@@ -167,8 +174,11 @@ async fn run_start(args: StartArgs) -> Result<()> {
     let plan = StartPlan { rust_log };
 
     let state_path = layout.net_dir().join("state.json");
-    let mut state = State::new(state_path).await?;
-    let started = process::start(&layout, &plan, &mut state).await?;
+    let state = Arc::new(Mutex::new(State::new(state_path).await?));
+    let started = {
+        let mut state = state.lock().await;
+        process::start(&layout, &plan, &mut state).await?
+    };
 
     print_pids(&started);
     print_start_banner(&layout, &started).await;
@@ -178,7 +188,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
     let details = format_network_details(&layout, &started).await;
     let health = Arc::new(Mutex::new(SseHealth::new(node_ids.clone(), details)));
     start_sse_spinner(&health).await;
-    spawn_sse_listeners(&layout, &node_ids, health).await;
+    spawn_sse_listeners(&layout, &node_ids, health, Arc::clone(&state)).await;
 
     let (event_tx, mut event_rx) = unbounded_channel();
     spawn_ctrlc_listener(event_tx.clone());
@@ -187,6 +197,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
     if let Some(event) = event_rx.recv().await {
         match event {
             RunEvent::CtrlC => {
+                let mut state = state.lock().await;
                 process::stop(&mut state).await?;
             }
             RunEvent::ProcessExit {
@@ -195,6 +206,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
                 code,
                 signal,
             } => {
+                let mut state = state.lock().await;
                 update_exited_process(&mut state, &id, code, signal).await?;
                 log_exit(&id, pid, code, signal);
                 process::stop(&mut state).await?;
@@ -490,18 +502,25 @@ async fn spawn_sse_listeners(
     _layout: &AssetsLayout,
     node_ids: &[u32],
     health: Arc<Mutex<SseHealth>>,
+    state: Arc<Mutex<State>>,
 ) {
     for node_id in node_ids {
         let node_id = *node_id;
         let endpoint = assets::sse_endpoint(node_id);
         let health = Arc::clone(&health);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            run_sse_listener(node_id, endpoint, health).await;
+            run_sse_listener(node_id, endpoint, health, state).await;
         });
     }
 }
 
-async fn run_sse_listener(node_id: u32, endpoint: String, health: Arc<Mutex<SseHealth>>) {
+async fn run_sse_listener(
+    node_id: u32,
+    endpoint: String,
+    health: Arc<Mutex<SseHealth>>,
+    state: Arc<Mutex<State>>,
+) {
     let mut backoff = ExponentialBackoff::default();
 
     loop {
@@ -540,6 +559,12 @@ async fn run_sse_listener(node_id: u32, endpoint: String, health: Arc<Mutex<SseH
                         record_api_version(node_id, version.to_string(), &health).await;
                     }
                     SseEvent::BlockAdded { block_hash, block } => {
+                        if node_id == 1 {
+                            if let Err(err) = record_last_block_height(&state, block.height()).await
+                            {
+                                eprintln!("warning: failed to record last block height: {}", err);
+                            }
+                        }
                         if should_log_primary(node_id, &health).await {
                             mark_block_seen(&health).await;
                             let prefix = timestamp_prefix();
@@ -632,6 +657,16 @@ async fn mark_block_seen(health: &Arc<Mutex<SseHealth>>) {
     if let Some(mut spinner) = block_spinner {
         spinner.stop_with_message(BLOCK_WAIT_MESSAGE.to_string());
     }
+}
+
+async fn record_last_block_height(state: &Arc<Mutex<State>>, height: u64) -> Result<()> {
+    let mut state = state.lock().await;
+    if state.last_block_height == Some(height) {
+        return Ok(());
+    }
+    state.last_block_height = Some(height);
+    state.touch().await?;
+    Ok(())
 }
 
 fn version_summary(versions: &HashMap<u32, String>) -> String {

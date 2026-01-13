@@ -97,6 +97,7 @@ casper-devnet start --force-setup
 
 - `--protocol-version <version>`: Protocol version to use from the assets store (defaults to newest bundle)
 - `--network-name <name>`: Network name for configs/paths (default: `casper-dev`)
+- `--net-path <path>`: Override the network runtime root (default: platform data dir `.../networks`)
 - `--node-count <n>`: Number of nodes (aliases: `--nodes`, `--validators`; default: 4)
 - `--users <n>`: Number of user accounts (default: node count)
 - `--delay <seconds>`: Genesis activation delay (default: 3). Keep it short for local devnets; increase if you need more time to attach tooling before genesis.

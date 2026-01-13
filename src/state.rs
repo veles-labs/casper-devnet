@@ -66,6 +66,7 @@ pub struct State {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    pub last_block_height: Option<u64>,
     pub processes: Vec<ProcessRecord>,
     #[serde(skip)]
     path: PathBuf,
@@ -77,6 +78,7 @@ impl State {
         let state = Self {
             created_at: now,
             updated_at: now,
+            last_block_height: None,
             processes: Vec::new(),
             path,
         };
