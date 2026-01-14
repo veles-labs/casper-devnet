@@ -34,6 +34,36 @@ CI, and tests.
 cargo install casper-devnet --locked
 ```
 
+## Docker usage
+
+Build the image:
+
+```bash
+docker build -t casper-devnet:local .
+```
+
+Run a devnet with the default data location (persist assets and network state with a volume):
+
+```bash
+docker run --rm -it \
+  -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 \
+  -v "$(pwd)/casper-devnet-data:/opt/casper-devnet-data" \
+  casper-devnet:local
+```
+
+Use a custom data directory by overriding `XDG_DATA_HOME` and mounting it:
+
+```bash
+docker run --rm -it \
+  -e XDG_DATA_HOME=/data \
+  -v "$(pwd)/casper-devnet-data:/data" \
+  -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 \
+  casper-devnet:local
+```
+
+The exposed ports map to node-1 services: RPC (11101), REST (14101), SSE (18101), network gossip
+(22101), and binary protocol (28101).
+
 ## Usage
 
 Add a local assets bundle:
