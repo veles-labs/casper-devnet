@@ -1,7 +1,7 @@
 # Casper Devnet Launcher
 
-Casper Devnet Launcher is a Rust local development Casper network, based on and heavily inspired
-by the NCTL workflow, to make local devnets quick and easy for smart contract developers.
+Casper Devnet Launcher is a Rust tool for running a local Casper network, based on and heavily
+inspired by the NCTL workflow, to make local devnets quick and easy for smart contract developers.
 It embeds the essential node-launcher behavior in-process, so you only need the `casper-node`
 and (optionally) `casper-sidecar` binaries.
 
@@ -25,7 +25,7 @@ CI, and tests.
 | Node launcher | External `casper-node-launcher` | Embedded launcher logic |
 | Requirements | Node + launcher + sidecar + scripts | Assets bundle (node + sidecar + templates) |
 | Keys/accounts | Random keys, friction to name/locate | Deterministic keys from a seed (BIP32 paths) |
-| macOS devnet start | Often requires extra local compilation | Planned: download pre-built bundles |
+| macOS devnet start | Often requires extra local compilation | Download pre-built cross-platform bundles |
 | Network feedback | Extra commands to watch blocks/txs | Persistent SSE connection with live output |
 
 ## Installation
@@ -77,6 +77,15 @@ Download assets from the latest release:
 ```bash
 casper-devnet assets pull
 ```
+
+Supported host architectures:
+
+- `aarch64-apple-darwin`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `x86_64-unknown-linux-gnu`
+
+See also [https://github.com/veles-labs/devnet-launcher-assets/releases/](https://github.com/veles-labs/devnet-launcher-assets/releases/).
 
 Force re-download:
 
@@ -151,7 +160,7 @@ v2.1.1/node-config.toml
 ```
 
 For manual rebuilds and bundle scripts, see
-[https://github.com/veles-labs/devnet-launcher-assets/](https://github.com/veles-labs/devnet-launcher-assets/)`.
+[https://github.com/veles-labs/devnet-launcher-assets/](https://github.com/veles-labs/devnet-launcher-assets/).
 
 ## Notes
 
