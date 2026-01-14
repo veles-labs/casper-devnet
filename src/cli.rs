@@ -355,6 +355,9 @@ fn shorten_home_path(path: &str) -> String {
     let home = base_dirs.home_dir();
     match path.strip_prefix(home) {
         Ok(stripped) => {
+            if stripped.as_os_str().is_empty() {
+                return "~".to_string();
+            }
             let mut shorthand = PathBuf::from("~");
             shorthand.push(stripped);
             shorthand.display().to_string()
