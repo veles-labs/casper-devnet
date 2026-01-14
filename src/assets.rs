@@ -1052,8 +1052,9 @@ async fn setup_node_configs(
         let sse_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_SSE, node_id));
         let binary_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_BINARY, node_id));
         let rpc_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_RPC, node_id));
-        let diagnostics_socket = std::env::temp_dir()
-            .join(format!("{}_diagnostics_port.socket", layout.network_name()))
+        let diagnostics_socket = layout
+            .node_dir(node_id)
+            .join("diagnostics_port.socket")
             .to_string_lossy()
             .to_string();
 
