@@ -29,7 +29,10 @@ jobs:
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+   strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx
