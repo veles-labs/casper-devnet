@@ -1052,6 +1052,17 @@ async fn setup_node_configs(
         let sse_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_SSE, node_id));
         let binary_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_BINARY, node_id));
 
+        #[cfg(not(target_os = "macos"))]
+        let diagnostics_socket = Some(
+            layout
+                .node_dir(node_id)
+                .join("diagnostics_port.socket")
+                .to_string_lossy()
+                .to_string(),
+        );
+        #[cfg(target_os = "macos")]
+        let diagnostics_socket: Option<String> = None;
+
         let updated_config = spawn_blocking_result(move || {
             let mut config_value: toml::Value = toml::from_str(&config_contents)?;
 
@@ -1079,23 +1090,13 @@ async fn setup_node_configs(
                 sse_address,
             )?;
 
-            #[cfg(not(target_os = "macos"))]
-            {
-                let diagnostics_socket = layout
-                    .node_dir(node_id)
-                    .join("diagnostics_port.socket")
-                    .to_string_lossy()
-                    .to_string();
-
+            if let Some(diagnostics_socket) = diagnostics_socket {
                 set_string(
                     &mut config_value,
                     &["diagnostics_port", "socket_path"],
                     diagnostics_socket,
                 )?;
-            }
-
-            #[cfg(target_os = "macos")]
-            {
+            } else {
                 // Even though macOS supports unix sockets, the paths we're using based tend to be too long
                 // and that causes network startup issues.
                 // Let's just disable the diagnostics port on macOS for now, it's mostly useful for core protocol development debugging anyway.
