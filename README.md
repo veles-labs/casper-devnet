@@ -36,10 +36,10 @@ cargo install casper-devnet --locked
 
 ## Docker usage
 
-Build the image:
+Pull the image:
 
 ```bash
-docker build -t casper-devnet:local .
+docker pull ghcr.io/veles-labs/casper-devnet
 ```
 
 Run a devnet with the default data location (persist assets and network state with a volume):
@@ -48,7 +48,7 @@ Run a devnet with the default data location (persist assets and network state wi
 docker run --rm -it \
   -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 \
   -v "$(pwd)/casper-devnet-data:/opt/casper-devnet-data" \
-  casper-devnet:local
+  ghcr.io/veles-labs/casper-devnet
 ```
 
 Use a custom data directory by overriding `XDG_DATA_HOME` and mounting it:
@@ -58,7 +58,7 @@ docker run --rm -it \
   -e XDG_DATA_HOME=/data \
   -v "$(pwd)/casper-devnet-data:/data" \
   -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 \
-  casper-devnet:local
+  ghcr.io/veles-labs/casper-devnet
 ```
 
 The exposed ports map to node-1 services: RPC (11101), REST (14101), SSE (18101), network gossip
