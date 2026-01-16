@@ -690,12 +690,10 @@ async fn setup_binaries(
         let version_dir = node_bin_dir.join(protocol_version_fs);
 
         let node_dest = version_dir.join("casper-node");
-        copy_file(&node_bin_src, &node_dest).await?;
+        hardlink_file(&node_bin_src, &node_dest).await?;
 
-        if is_file(&sidecar_src).await {
-            let sidecar_dest = version_dir.join("casper-sidecar");
-            copy_file(&sidecar_src, &sidecar_dest).await?;
-        }
+        let sidecar_dest = version_dir.join("casper-sidecar");
+        hardlink_file(&sidecar_src, &sidecar_dest).await?;
     }
 
     Ok(())
@@ -1255,6 +1253,23 @@ async fn copy_file(src: &Path, dest: &Path) -> Result<()> {
         tokio_fs::create_dir_all(parent).await?;
     }
     tokio_fs::copy(src, dest).await?;
+    Ok(())
+}
+
+async fn hardlink_file(src: &Path, dest: &Path) -> Result<()> {
+    if !is_file(src).await {
+        return Err(anyhow!("missing source file {}", src.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+    if let Ok(metadata) = tokio_fs::symlink_metadata(dest).await {
+        if metadata.is_dir() {
+            return Err(anyhow!("destination {} is a directory", dest.display()));
+        }
+        tokio_fs::remove_file(dest).await?;
+    }
+    tokio_fs::hard_link(src, dest).await?;
     Ok(())
 }
 
