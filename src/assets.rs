@@ -5,6 +5,8 @@ use blake2::Blake2bVar;
 use casper_types::{AsymmetricType, PublicKey, SecretKey};
 use directories::ProjectDirs;
 use flate2::read::GzDecoder;
+use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
@@ -14,6 +16,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tar::Archive;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -42,6 +45,7 @@ const SECRET_KEY_PEM: &str = "secret_key.pem";
 const PUBLIC_KEY_PEM: &str = "public_key.pem";
 const PUBLIC_KEY_HEX: &str = "public_key_hex";
 const MOTE_PER_CSPR: u128 = 1_000_000_000;
+const PROGRESS_TICK_MS: u64 = 120;
 
 #[derive(Debug)]
 struct DerivedAccountMaterial {
@@ -417,7 +421,7 @@ pub async fn pull_assets_bundles(target_override: Option<&str>, force: bool) -> 
     }
 
     for asset in assets {
-        let bytes = download_asset(&asset.url).await?;
+        let bytes = download_asset(&asset.url, &asset.version).await?;
         let expected_hash = download_asset_sha512(&asset.url).await?;
         let actual_hash = sha512_hex(&bytes);
         if expected_hash != actual_hash {
@@ -446,7 +450,7 @@ pub async fn pull_assets_bundles(target_override: Option<&str>, force: bool) -> 
         }
 
         println!("saving assets bundle v{}", asset.version);
-        extract_assets_from_bytes(&bytes, &bundle_root).await?;
+        unpack_assets_with_progress(&bytes, &bundle_root, &asset.version).await?;
     }
 
     tokio_fs::write(bundle_root.join("latest"), release.tag_name).await?;
@@ -546,13 +550,69 @@ fn parse_release_asset_version(name: &str, target: &str) -> Option<Version> {
     parse_protocol_version(version).ok()
 }
 
-async fn download_asset(url: &str) -> Result<Vec<u8>> {
+fn download_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template("{msg} {bar:40.cyan/blue} {bytes:>7}/{total_bytes:7} ({eta})")
+        .expect("valid download progress template")
+        .progress_chars("█▉▊▋▌▍▎▏ ")
+}
+
+fn download_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{msg} {spinner:.cyan} {bytes:>7}")
+        .expect("valid download spinner template")
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+}
+
+fn unpack_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{msg} {spinner:.magenta} {elapsed_precise}")
+        .expect("valid unpack spinner template")
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+}
+
+async fn download_asset(url: &str, version: &Version) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent("casper-devnet")
         .build()?;
     println!("GET {}", url);
     let response = client.get(url).send().await?.error_for_status()?;
-    Ok(response.bytes().await?.to_vec())
+    let total = response.content_length();
+    let pb = match total {
+        Some(total) if total > 0 => {
+            let pb = ProgressBar::new(total);
+            pb.set_style(download_progress_style());
+            pb
+        }
+        _ => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(download_spinner_style());
+            pb.enable_steady_tick(StdDuration::from_millis(PROGRESS_TICK_MS));
+            pb
+        }
+    };
+    pb.set_message(format!("⬇️  v{} download", version));
+
+    let mut bytes = Vec::new();
+    if let Some(total) = total {
+        if total <= usize::MAX as u64 {
+            bytes.reserve(total as usize);
+        }
+    }
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                pb.inc(chunk.len() as u64);
+                bytes.extend_from_slice(&chunk);
+            }
+            Err(err) => {
+                pb.finish_with_message(format!("❌  v{} download failed", version));
+                return Err(err.into());
+            }
+        }
+    }
+
+    pb.finish_with_message(format!("✅  v{} downloaded", version));
+    Ok(bytes)
 }
 
 async fn download_asset_sha512(url: &str) -> Result<String> {
@@ -620,6 +680,24 @@ async fn read_local_manifest(version_dir: &Path) -> Result<Option<serde_json::Va
     Ok(Some(value))
 }
 
+async fn unpack_assets_with_progress(
+    bytes: &[u8],
+    bundle_root: &Path,
+    version: &Version,
+) -> Result<()> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(unpack_spinner_style());
+    pb.set_message(format!("📦  v{} unpack", version));
+    pb.enable_steady_tick(StdDuration::from_millis(PROGRESS_TICK_MS));
+
+    let result = extract_assets_from_bytes(bytes, bundle_root).await;
+    match result {
+        Ok(()) => pb.finish_with_message(format!("✅  v{} unpacked", version)),
+        Err(_) => pb.finish_with_message(format!("❌  v{} unpack failed", version)),
+    }
+    result
+}
+
 async fn extract_assets_from_bytes(bytes: &[u8], bundle_root: &Path) -> Result<()> {
     let bytes = bytes.to_vec();
     let bundle_root = bundle_root.to_path_buf();
@@ -628,7 +706,6 @@ async fn extract_assets_from_bytes(bytes: &[u8], bundle_root: &Path) -> Result<(
         let cursor = Cursor::new(bytes);
         let decoder = GzDecoder::new(cursor);
         let mut archive = Archive::new(decoder);
-        println!("unpacking assets into {}", bundle_root.display());
         archive.unpack(&bundle_root)?;
         Ok(())
     })
