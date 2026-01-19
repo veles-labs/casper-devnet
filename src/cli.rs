@@ -419,6 +419,8 @@ async fn print_derived_accounts_summary(layout: &AssetsLayout) {
 
 struct DerivedAccountRow {
     name: String,
+    key_type: String,
+    derivation: String,
     path: String,
     account_hash: String,
     balance: String,
@@ -433,7 +435,7 @@ struct DerivedAccountsParsed {
 fn parse_derived_accounts_csv(summary: &str) -> Option<DerivedAccountsParsed> {
     let mut lines = summary.lines();
     let header = lines.next()?.trim();
-    if header != "kind,name,bip32_path,account_hash,balance" {
+    if header != "kind,name,key_type,derivation,path,account_hash,balance" {
         return None;
     }
 
@@ -448,14 +450,18 @@ fn parse_derived_accounts_csv(summary: &str) -> Option<DerivedAccountsParsed> {
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(5, ',');
+        let mut parts = line.splitn(7, ',');
         let kind = parts.next()?.to_string();
         let name = parts.next()?.to_string();
+        let key_type = parts.next()?.to_string();
+        let derivation = parts.next()?.to_string();
         let path = parts.next()?.to_string();
         let account_hash = parts.next()?.to_string();
         let balance = parts.next()?.to_string();
         let row = DerivedAccountRow {
             name,
+            key_type,
+            derivation,
             path,
             account_hash,
             balance,
@@ -473,7 +479,9 @@ fn parse_derived_accounts_csv(summary: &str) -> Option<DerivedAccountsParsed> {
 fn print_account_group(rows: &[DerivedAccountRow]) {
     for row in rows {
         println!("    {}:", row.name);
-        println!("      bip32_path: {}", row.path);
+        println!("      key_type: {}", row.key_type);
+        println!("      derivation: {}", row.derivation);
+        println!("      path: {}", row.path);
         println!("      account_hash: {}", row.account_hash);
         println!("      balance: {}", row.balance);
     }

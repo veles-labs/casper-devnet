@@ -10,7 +10,9 @@ Semantic Versioning.
 
 ### Changed
 - Rename derived accounts output to `derived-accounts.csv` and emit CSV rows.
+- Add key type and split derivation/path fields in derived accounts output.
 - Print derived accounts and network details in a tree-style layout.
+- Pin GitHub release workflow to `softprops/action-gh-release@v2.4.2`.
 
 ### Removed
 - Stop generating `users/user-*` directories and public key files for users.

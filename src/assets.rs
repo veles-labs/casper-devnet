@@ -74,9 +74,11 @@ struct DerivedAccounts {
 impl DerivedAccountInfo {
     fn line(&self) -> String {
         format!(
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
             self.kind,
             self.name,
+            "secp256k1",
+            "bip32",
             self.path,
             self.account_hash,
             format_cspr(self.balance_motes)
@@ -1363,7 +1365,7 @@ async fn write_derived_accounts_summary(
     accounts: &[DerivedAccountInfo],
 ) -> Result<()> {
     let mut lines = Vec::new();
-    lines.push("kind,name,bip32_path,account_hash,balance".to_string());
+    lines.push("kind,name,key_type,derivation,path,account_hash,balance".to_string());
     for account in accounts {
         lines.push(account.line());
     }
