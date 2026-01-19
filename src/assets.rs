@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bip32::{DerivationPath, XPrv};
-use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
+use blake2::digest::{Update, VariableOutput};
 use casper_types::account::AccountHash;
 use casper_types::{AsymmetricType, PublicKey, SecretKey};
 use directories::ProjectDirs;
@@ -438,13 +438,12 @@ pub async fn pull_assets_bundles(target_override: Option<&str>, force: bool) -> 
         let version_dir = bundle_version_dir(&bundle_root, &asset.version);
         let local_manifest = read_local_manifest(&version_dir).await?;
 
-        if !force {
-            if let (Some(remote), Some(local)) = (&remote_manifest, &local_manifest) {
-                if remote == local {
-                    println!("already have this file v{}", asset.version);
-                    continue;
-                }
-            }
+        if !force
+            && let (Some(remote), Some(local)) = (&remote_manifest, &local_manifest)
+            && remote == local
+        {
+            println!("already have this file v{}", asset.version);
+            continue;
         }
 
         if is_dir(&version_dir).await {
@@ -593,10 +592,8 @@ async fn download_asset(url: &str, version: &Version) -> Result<Vec<u8>> {
     pb.set_message(format!("⬇️  v{} download", version));
 
     let mut bytes = Vec::new();
-    if let Some(total) = total {
-        if total <= usize::MAX as u64 {
-            bytes.reserve(total as usize);
-        }
+    if let Some(total) = total && total <= usize::MAX as u64 {
+        bytes.reserve(total as usize);
     }
 
     let mut stream = response.bytes_stream();

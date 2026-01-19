@@ -1,7 +1,12 @@
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "casper-devnet"
-version = "0.3.4"
-edition = "2021"
+version = "0.4.0"
+edition = "2024"
 license = "Apache-2.0"
 readme = "README.md"
 description = "Launcher for local Casper Network development networks."

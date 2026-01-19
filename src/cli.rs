@@ -1,12 +1,12 @@
 use crate::assets::{self, AssetsLayout, SetupOptions};
 use crate::process::{self, ProcessHandle, RunningProcess, StartPlan};
 use crate::state::{ProcessKind, ProcessRecord, ProcessStatus, State};
-use anyhow::{anyhow, Result};
-use backoff::backoff::Backoff;
+use anyhow::{Result, anyhow};
 use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
+use casper_types::U512;
 use casper_types::contract_messages::MessagePayload;
 use casper_types::execution::ExecutionResult;
-use casper_types::U512;
 use clap::{Args, Parser, Subcommand};
 use directories::BaseDirs;
 use futures::StreamExt;
@@ -14,10 +14,10 @@ use spinners::{Spinner, Spinners};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use veles_casper_rust_sdk::sse::event::SseEvent;
 use veles_casper_rust_sdk::sse::{self, config::ListenerConfig};
 
@@ -562,11 +562,11 @@ async fn run_sse_listener(
                         record_api_version(node_id, version.to_string(), &health).await;
                     }
                     SseEvent::BlockAdded { block_hash, block } => {
-                        if node_id == 1 {
-                            if let Err(err) = record_last_block_height(&state, block.height()).await
-                            {
-                                eprintln!("warning: failed to record last block height: {}", err);
-                            }
+                        if node_id == 1
+                            && let Err(err) =
+                                record_last_block_height(&state, block.height()).await
+                        {
+                            eprintln!("warning: failed to record last block height: {}", err);
                         }
                         if should_log_primary(node_id, &health).await {
                             mark_block_seen(&health).await;
@@ -900,8 +900,8 @@ async fn resolve_protocol_version(candidate: &Option<String>) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::{encode_hex, format_cspr_u512, format_message_payload, shorten_home_path};
-    use casper_types::contract_messages::MessagePayload;
     use casper_types::U512;
+    use casper_types::contract_messages::MessagePayload;
     use directories::BaseDirs;
 
     #[test]

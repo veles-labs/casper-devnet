@@ -1,15 +1,15 @@
 use crate::assets::{AssetsLayout, BOOTSTRAP_NODES};
 use crate::node_launcher::Launcher;
 use crate::state::{ProcessGroup, ProcessKind, ProcessRecord, ProcessStatus, State};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use nix::errno::Errno;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;

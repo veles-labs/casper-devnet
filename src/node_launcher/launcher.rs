@@ -3,12 +3,12 @@ use std::{
     mem,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;

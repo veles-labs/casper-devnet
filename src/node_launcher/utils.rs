@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use anyhow::{bail, Error, Result};
+use anyhow::{Error, Result, bail};
 use semver::Version;
 use tokio::fs as tokio_fs;
 use tokio::process::Command;
