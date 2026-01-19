@@ -592,7 +592,9 @@ async fn download_asset(url: &str, version: &Version) -> Result<Vec<u8>> {
     pb.set_message(format!("⬇️  v{} download", version));
 
     let mut bytes = Vec::new();
-    if let Some(total) = total && total <= usize::MAX as u64 {
+    if let Some(total) = total
+        && total <= usize::MAX as u64
+    {
         bytes.reserve(total as usize);
     }
 

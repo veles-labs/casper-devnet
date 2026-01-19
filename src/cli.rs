@@ -563,8 +563,7 @@ async fn run_sse_listener(
                     }
                     SseEvent::BlockAdded { block_hash, block } => {
                         if node_id == 1
-                            && let Err(err) =
-                                record_last_block_height(&state, block.height()).await
+                            && let Err(err) = record_last_block_height(&state, block.height()).await
                         {
                             eprintln!("warning: failed to record last block height: {}", err);
                         }
