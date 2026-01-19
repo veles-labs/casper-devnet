@@ -513,12 +513,10 @@ pub async fn pull_assets_bundles(target_override: Option<&str>, force: bool) -> 
     Ok(())
 }
 
-pub async fn most_recent_bundle_version() -> Result<Version> {
+pub async fn most_recent_bundle_version() -> Result<Option<Version>> {
     let mut versions = list_bundle_versions().await?;
     versions.sort();
-    versions
-        .pop()
-        .ok_or_else(|| anyhow!("no protocol versions found in assets store"))
+    Ok(versions.pop())
 }
 
 pub async fn list_bundle_versions() -> Result<Vec<Version>> {

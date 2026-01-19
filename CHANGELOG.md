@@ -17,6 +17,13 @@ Semantic Versioning.
 
 ### Security
 
+## [0.5.2] - 2026-01-19
+### Changed
+- `most_recent_bundle_version` now returns `Result<Option<Version>>` for empty stores.
+
+### Fixed
+- Show bundle validation errors when resolving the default protocol version.
+
 ## [0.5.1] - 2026-01-19
 ### Changed
 - `assets list` now exits with an error when no asset bundles are installed.
@@ -103,6 +110,7 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.4.1...v0.5.0

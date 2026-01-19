@@ -993,21 +993,24 @@ async fn resolve_protocol_version(candidate: &Option<String>) -> Result<String> 
         }
         return Ok(version.to_string());
     }
-    match assets::most_recent_bundle_version().await {
-        Ok(version) => Ok(version.to_string()),
-        Err(_) => {
-            let argv0 = std::env::args()
-                .next()
-                .unwrap_or_else(|| "casper-devnet".to_string());
-            let pull_cmd = format!("{} assets pull", argv0);
-            let add_cmd = format!("{} assets add <path-to-assets.tar.gz>", argv0);
-            Err(anyhow!(
-                "no assets found; run `{}` or `{}`",
-                pull_cmd,
-                add_cmd
-            ))
-        }
+    let versions = assets::list_bundle_versions().await?;
+    if versions.is_empty() {
+        let argv0 = std::env::args()
+            .next()
+            .unwrap_or_else(|| "casper-devnet".to_string());
+        let pull_cmd = format!("{} assets pull", argv0);
+        let add_cmd = format!("{} assets add <path-to-assets.tar.gz>", argv0);
+        return Err(anyhow!(
+            "no assets found; run `{}` or `{}`",
+            pull_cmd,
+            add_cmd
+        ));
     }
+    let version = versions
+        .into_iter()
+        .max()
+        .expect("non-empty assets versions");
+    Ok(version.to_string())
 }
 
 #[cfg(test)]
