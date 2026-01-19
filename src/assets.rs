@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use bip32::{DerivationPath, XPrv};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
+use casper_types::account::AccountHash;
 use casper_types::{AsymmetricType, PublicKey, SecretKey};
 use directories::ProjectDirs;
 use flate2::read::GzDecoder;
@@ -52,6 +53,7 @@ struct DerivedAccountMaterial {
     path: DerivationPath,
     public_key_hex: String,
     public_key_pem: String,
+    account_hash: String,
     secret_key_pem: Option<String>,
 }
 
@@ -60,7 +62,7 @@ struct DerivedAccountInfo {
     role: &'static str,
     label: String,
     path: DerivationPath,
-    public_key_hex: String,
+    account_hash: String,
     balance_motes: u128,
 }
 
@@ -69,13 +71,13 @@ impl DerivedAccountInfo {
         let balance_cspr = format_cspr(self.balance_motes);
         if self.label.is_empty() {
             return format!(
-                "{} path={} public_key={} balance_cspr={}",
-                self.role, self.path, self.public_key_hex, balance_cspr
+                "{} bip32_path={} account_hash={} balance_cspr={}",
+                self.role, self.path, self.account_hash, balance_cspr
             );
         }
         format!(
-            "{} {} path={} public_key={} balance_cspr={}",
-            self.role, self.label, self.path, self.public_key_hex, balance_cspr
+            "{} {} bip32_path={} account_hash={} balance_cspr={}",
+            self.role, self.label, self.path, self.account_hash, balance_cspr
         )
     }
 }
@@ -870,6 +872,7 @@ fn derive_account_material(
     let public_key = PublicKey::from(&secret_key);
     let public_key_hex = public_key.to_hex();
     let public_key_pem = public_key.to_pem()?;
+    let account_hash = AccountHash::from(&public_key).to_hex_string();
     let secret_key_pem = if write_secret {
         Some(secret_key.to_pem()?)
     } else {
@@ -880,6 +883,7 @@ fn derive_account_material(
         path: path.clone(),
         public_key_hex,
         public_key_pem,
+        account_hash,
         secret_key_pem,
     })
 }
@@ -920,7 +924,7 @@ async fn setup_seeded_keys(
             role: "validator",
             label: format!("node-{}", node_id),
             path: account.path.clone(),
-            public_key_hex: account.public_key_hex.clone(),
+            account_hash: account.account_hash.clone(),
             balance_motes: DEVNET_INITIAL_BALANCE_VALIDATOR,
         });
     }
@@ -949,7 +953,7 @@ async fn setup_seeded_keys(
             role: "user",
             label: format!("user-{}", user_id),
             path: account.path.clone(),
-            public_key_hex: account.public_key_hex.clone(),
+            account_hash: account.account_hash.clone(),
             balance_motes: DEVNET_INITIAL_BALANCE_USER,
         });
     }
