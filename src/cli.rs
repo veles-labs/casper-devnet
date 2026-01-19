@@ -966,7 +966,7 @@ async fn run_assets_pull(args: AssetsPullArgs) -> Result<()> {
 async fn run_assets_list() -> Result<()> {
     let mut versions = assets::list_bundle_versions().await?;
     if versions.is_empty() {
-        return Ok(());
+        return Err(anyhow!("no assets bundles found"));
     }
     versions.sort_by(|a, b| b.cmp(a));
     for version in versions {

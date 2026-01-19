@@ -6,22 +6,20 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
-- None.
 
 ### Changed
-- None.
 
 ### Deprecated
-- None.
 
 ### Removed
-- None.
 
 ### Fixed
-- None.
 
 ### Security
-- None.
+
+## [0.5.1] - 2026-01-19
+### Changed
+- `assets list` now exits with an error when no asset bundles are installed.
 
 ## [0.5.0] - 2026-01-19
 ### Added
@@ -105,5 +103,6 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.4.1...v0.5.0
