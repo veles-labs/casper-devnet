@@ -6,6 +6,25 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
+- None.
+
+### Changed
+- None.
+
+### Deprecated
+- None.
+
+### Removed
+- None.
+
+### Fixed
+- None.
+
+### Security
+- None.
+
+## [0.5.0] - 2026-01-19
+### Added
 - Start tracking releases in a Keep a Changelog format.
 
 ### Changed
@@ -85,3 +104,6 @@ Semantic Versioning.
 ## [0.1.0] - 2026-01-11
 ### Added
 - Initial release.
+
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.4.1...v0.5.0
