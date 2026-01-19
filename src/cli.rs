@@ -169,6 +169,13 @@ async fn run_start(args: StartArgs) -> Result<()> {
         ));
     }
 
+    if !args.force_setup && assets_exist {
+        let restored = assets::ensure_consensus_keys(&layout, Arc::clone(&args.seed)).await?;
+        if restored > 0 {
+            println!("recreated consensus keys for {} node(s)", restored);
+        }
+    }
+
     let rust_log = args.log_level.clone();
 
     let plan = StartPlan { rust_log };
@@ -188,7 +195,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
     let details = format_network_details(&layout, &started).await;
     let health = Arc::new(Mutex::new(SseHealth::new(node_ids.clone(), details)));
     start_sse_spinner(&health).await;
-    spawn_sse_listeners(&layout, &node_ids, health, Arc::clone(&state)).await;
+    spawn_sse_listeners(layout.clone(), &node_ids, health, Arc::clone(&state)).await;
 
     let (event_tx, mut event_rx) = unbounded_channel();
     spawn_ctrlc_listener(event_tx.clone());
@@ -312,17 +319,19 @@ async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProce
             .get(&node_id)
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "-".to_string());
+        lines.push(format!("  node-{}", node_id));
         lines.push(format!(
-            "node-{} pid={} sidecar pid={}",
-            node_id, node_pid, sidecar_pid
+            "    pids: node={} sidecar={}",
+            node_pid, sidecar_pid
         ));
         if let Some(entries) = process_logs.get(&node_id) {
             let mut entries = entries.clone();
             entries.sort_by_key(|entry| process_kind_label(&entry.0).to_string());
+            lines.push("    logs".to_string());
             for (kind, pid) in entries {
                 let (stdout_link, stderr_link) = log_symlink_paths(&symlink_root, &kind, node_id);
                 lines.push(format!(
-                    "  {} pid={} stdout={} stderr={}",
+                    "      {} pid={} stdout={} stderr={}",
                     process_kind_label(&kind),
                     pid,
                     stdout_link,
@@ -330,11 +339,15 @@ async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProce
                 ));
             }
         }
-        lines.push(format!("  rest:   {}", assets::rest_endpoint(node_id)));
-        lines.push(format!("  sse:    {}", assets::sse_endpoint(node_id)));
-        lines.push(format!("  rpc:    {}", assets::rpc_endpoint(node_id)));
-        lines.push(format!("  binary: {}", assets::binary_address(node_id)));
-        lines.push(format!("  gossip: {}", assets::network_address(node_id)));
+        lines.push("    endpoints".to_string());
+        lines.push(format!("      rest:   {}", assets::rest_endpoint(node_id)));
+        lines.push(format!("      sse:    {}", assets::sse_endpoint(node_id)));
+        lines.push(format!("      rpc:    {}", assets::rpc_endpoint(node_id)));
+        lines.push(format!("      binary: {}", assets::binary_address(node_id)));
+        lines.push(format!(
+            "      gossip: {}",
+            assets::network_address(node_id)
+        ));
     }
 
     lines.join("\n")
@@ -381,10 +394,88 @@ fn log_symlink_paths(symlink_root: &Path, kind: &ProcessKind, node_id: u32) -> (
 
 async fn print_derived_accounts_summary(layout: &AssetsLayout) {
     if let Some(summary) = assets::derived_accounts_summary(layout).await {
-        println!("derived accounts");
-        for line in summary.lines() {
-            println!("  {}", line);
+        if let Some(parsed) = parse_derived_accounts_csv(&summary) {
+            println!("derived accounts");
+            if !parsed.validators.is_empty() {
+                println!("  validators");
+                print_account_group(&parsed.validators);
+            }
+            if !parsed.users.is_empty() {
+                println!("  users");
+                print_account_group(&parsed.users);
+            }
+            if !parsed.other.is_empty() {
+                println!("  other");
+                print_account_group(&parsed.other);
+            }
+        } else {
+            println!("derived accounts");
+            for line in summary.lines() {
+                println!("  {}", line);
+            }
         }
+    }
+}
+
+struct DerivedAccountRow {
+    name: String,
+    path: String,
+    account_hash: String,
+    balance: String,
+}
+
+struct DerivedAccountsParsed {
+    validators: Vec<DerivedAccountRow>,
+    users: Vec<DerivedAccountRow>,
+    other: Vec<DerivedAccountRow>,
+}
+
+fn parse_derived_accounts_csv(summary: &str) -> Option<DerivedAccountsParsed> {
+    let mut lines = summary.lines();
+    let header = lines.next()?.trim();
+    if header != "kind,name,bip32_path,account_hash,balance" {
+        return None;
+    }
+
+    let mut parsed = DerivedAccountsParsed {
+        validators: Vec::new(),
+        users: Vec::new(),
+        other: Vec::new(),
+    };
+
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(5, ',');
+        let kind = parts.next()?.to_string();
+        let name = parts.next()?.to_string();
+        let path = parts.next()?.to_string();
+        let account_hash = parts.next()?.to_string();
+        let balance = parts.next()?.to_string();
+        let row = DerivedAccountRow {
+            name,
+            path,
+            account_hash,
+            balance,
+        };
+        match kind.as_str() {
+            "validator" => parsed.validators.push(row),
+            "user" => parsed.users.push(row),
+            _ => parsed.other.push(row),
+        }
+    }
+
+    Some(parsed)
+}
+
+fn print_account_group(rows: &[DerivedAccountRow]) {
+    for row in rows {
+        println!("    {}:", row.name);
+        println!("      bip32_path: {}", row.path);
+        println!("      account_hash: {}", row.account_hash);
+        println!("      balance: {}", row.balance);
     }
 }
 
@@ -502,7 +593,7 @@ async fn start_sse_spinner(health: &Arc<Mutex<SseHealth>>) {
 }
 
 async fn spawn_sse_listeners(
-    _layout: &AssetsLayout,
+    layout: AssetsLayout,
     node_ids: &[u32],
     health: Arc<Mutex<SseHealth>>,
     state: Arc<Mutex<State>>,
@@ -510,10 +601,11 @@ async fn spawn_sse_listeners(
     for node_id in node_ids {
         let node_id = *node_id;
         let endpoint = assets::sse_endpoint(node_id);
+        let layout = layout.clone();
         let health = Arc::clone(&health);
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            run_sse_listener(node_id, endpoint, health, state).await;
+            run_sse_listener(node_id, endpoint, health, state, layout).await;
         });
     }
 }
@@ -523,6 +615,7 @@ async fn run_sse_listener(
     endpoint: String,
     health: Arc<Mutex<SseHealth>>,
     state: Arc<Mutex<State>>,
+    layout: AssetsLayout,
 ) {
     let mut backoff = ExponentialBackoff::default();
 
@@ -568,7 +661,7 @@ async fn run_sse_listener(
                             eprintln!("warning: failed to record last block height: {}", err);
                         }
                         if should_log_primary(node_id, &health).await {
-                            mark_block_seen(&health).await;
+                            mark_block_seen(&health, &layout).await;
                             let prefix = timestamp_prefix();
                             println!(
                                 "{} Block {} added (height={} era={})",
@@ -646,18 +739,32 @@ async fn record_api_version(node_id: u32, version: String, health: &Arc<Mutex<Ss
     println!("{}", details);
 }
 
-async fn mark_block_seen(health: &Arc<Mutex<SseHealth>>) {
-    let block_spinner = {
+async fn mark_block_seen(health: &Arc<Mutex<SseHealth>>, layout: &AssetsLayout) {
+    let (block_spinner, node_ids) = {
         let mut state = health.lock().await;
         if state.block_seen {
             return;
         }
         state.block_seen = true;
-        state.block_spinner.take()
+        (
+            state.block_spinner.take(),
+            state.expected_nodes.iter().copied().collect::<Vec<_>>(),
+        )
     };
 
     if let Some(mut spinner) = block_spinner {
         spinner.stop_with_message(BLOCK_WAIT_MESSAGE.to_string());
+    }
+
+    match assets::remove_consensus_keys(layout, &node_ids).await {
+        Ok(removed) => {
+            if removed > 0 {
+                println!("Consensus secret keys removed from disk.");
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: failed to remove consensus secret keys: {}", err);
+        }
     }
 }
 

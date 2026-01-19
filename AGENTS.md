@@ -52,3 +52,6 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - Prefer concise user-facing logs.
 - Default target for assets is the build target (from `build.rs`).
 - Keep `README.md` updated with CLI defaults/flags whenever code changes.
+- Before finishing a task, run `cargo clippy --all --all-targets --all-features --tests` and report failures.
+- Update `CHANGELOG.md` for user-facing changes; list them under `[Unreleased]` in the appropriate section.
+- Changelog maintenance: follow Keep a Changelog + SemVer; keep the standard section headings; when cutting a release, move entries from `[Unreleased]` into a new tagged section with the release date based on the latest git tag; update compare links for `[Unreleased]` and the new version.

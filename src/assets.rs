@@ -41,10 +41,8 @@ const DEVNET_VALIDATOR_BASE_WEIGHT: u128 = 1_000_000_000_000_000_000;
 const DEVNET_SEED_DOMAIN: &[u8] = b"casper-unsafe-devnet-v1";
 const DERIVATION_PATH_PREFIX: &str = "m/44'/506'/0'/0";
 const USER_DERIVATION_START: u32 = 100;
-const DERIVED_ACCOUNTS_FILE: &str = "derived-accounts.txt";
+const DERIVED_ACCOUNTS_FILE: &str = "derived-accounts.csv";
 const SECRET_KEY_PEM: &str = "secret_key.pem";
-const PUBLIC_KEY_PEM: &str = "public_key.pem";
-const PUBLIC_KEY_HEX: &str = "public_key_hex";
 const MOTE_PER_CSPR: u128 = 1_000_000_000;
 const PROGRESS_TICK_MS: u64 = 120;
 
@@ -52,32 +50,36 @@ const PROGRESS_TICK_MS: u64 = 120;
 struct DerivedAccountMaterial {
     path: DerivationPath,
     public_key_hex: String,
-    public_key_pem: String,
     account_hash: String,
     secret_key_pem: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DerivedAccountInfo {
-    role: &'static str,
-    label: String,
+    kind: &'static str,
+    name: String,
+    id: u32,
     path: DerivationPath,
+    public_key_hex: String,
     account_hash: String,
     balance_motes: u128,
 }
 
+#[derive(Debug)]
+struct DerivedAccounts {
+    nodes: Vec<DerivedAccountInfo>,
+    users: Vec<DerivedAccountInfo>,
+}
+
 impl DerivedAccountInfo {
     fn line(&self) -> String {
-        let balance_cspr = format_cspr(self.balance_motes);
-        if self.label.is_empty() {
-            return format!(
-                "{} bip32_path={} account_hash={} balance_cspr={}",
-                self.role, self.path, self.account_hash, balance_cspr
-            );
-        }
         format!(
-            "{} {} bip32_path={} account_hash={} balance_cspr={}",
-            self.role, self.label, self.path, self.account_hash, balance_cspr
+            "{},{},{},{},{}",
+            self.kind,
+            self.name,
+            self.path,
+            self.account_hash,
+            format_cspr(self.balance_motes)
         )
     }
 }
@@ -299,11 +301,12 @@ pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<(
     let net_dir = layout.net_dir();
     tokio_fs::create_dir_all(&net_dir).await?;
 
-    setup_directories(layout, total_nodes, users, &protocol_version_fs).await?;
+    setup_directories(layout, total_nodes, &protocol_version_fs).await?;
     preflight_bundle(&bundle_dir, &chainspec_path, &config_path).await?;
     setup_binaries(layout, total_nodes, &bundle_dir, &protocol_version_fs).await?;
 
-    setup_seeded_keys(layout, total_nodes, users, Arc::clone(&opts.seed)).await?;
+    let derived_accounts =
+        setup_seeded_keys(layout, total_nodes, users, Arc::clone(&opts.seed)).await?;
 
     setup_chainspec(
         layout,
@@ -315,7 +318,7 @@ pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<(
     )
     .await?;
 
-    setup_accounts(layout, total_nodes, genesis_nodes, users).await?;
+    setup_accounts(layout, total_nodes, genesis_nodes, users, &derived_accounts).await?;
 
     setup_node_configs(
         layout,
@@ -341,6 +344,56 @@ pub async fn teardown(layout: &AssetsLayout) -> Result<()> {
         tokio_fs::remove_dir_all(dumps).await?;
     }
     Ok(())
+}
+
+/// Remove consensus secret keys for the provided node IDs.
+pub async fn remove_consensus_keys(layout: &AssetsLayout, node_ids: &[u32]) -> Result<usize> {
+    let mut removed = 0;
+    for node_id in node_ids {
+        let path = layout.node_dir(*node_id).join("keys").join(SECRET_KEY_PEM);
+        match tokio_fs::remove_file(&path).await {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(removed)
+}
+
+/// Ensure consensus secret keys are present for all nodes.
+pub async fn ensure_consensus_keys(layout: &AssetsLayout, seed: Arc<str>) -> Result<usize> {
+    let total_nodes = layout.count_nodes().await?;
+    if total_nodes == 0 {
+        return Ok(0);
+    }
+    let seed_for_root = seed.to_string();
+    let root = spawn_blocking_result(move || unsafe_root_from_seed(&seed_for_root)).await?;
+    let mut restored = 0;
+
+    for node_id in 1..=total_nodes {
+        let key_path = layout.node_dir(node_id).join("keys").join(SECRET_KEY_PEM);
+        if is_file(&key_path).await {
+            continue;
+        }
+        if let Some(parent) = key_path.parent() {
+            tokio_fs::create_dir_all(parent).await?;
+        }
+        let path =
+            DerivationPath::from_str(&format!("{}/{}", DERIVATION_PATH_PREFIX, node_id - 1))?;
+        let secret_key_pem = spawn_blocking_result({
+            let root = root.clone();
+            move || {
+                let child = derive_xprv_from_path(&root, &path)?;
+                let secret_key = SecretKey::secp256k1_from_bytes(child.to_bytes())?;
+                Ok(secret_key.to_pem()?)
+            }
+        })
+        .await?;
+        tokio_fs::write(&key_path, secret_key_pem).await?;
+        restored += 1;
+    }
+
+    Ok(restored)
 }
 
 pub fn parse_protocol_version(raw: &str) -> Result<Version> {
@@ -720,7 +773,6 @@ fn default_target() -> String {
 async fn setup_directories(
     layout: &AssetsLayout,
     total_nodes: u32,
-    users: u32,
     protocol_version_fs: &str,
 ) -> Result<()> {
     let net_dir = layout.net_dir();
@@ -728,7 +780,6 @@ async fn setup_directories(
     let chainspec_dir = net_dir.join("chainspec");
     let daemon_dir = net_dir.join("daemon");
     let nodes_dir = net_dir.join("nodes");
-    let users_dir = net_dir.join("users");
 
     tokio_fs::create_dir_all(bin_dir).await?;
     tokio_fs::create_dir_all(chainspec_dir).await?;
@@ -736,7 +787,6 @@ async fn setup_directories(
     tokio_fs::create_dir_all(daemon_dir.join("logs")).await?;
     tokio_fs::create_dir_all(daemon_dir.join("socket")).await?;
     tokio_fs::create_dir_all(&nodes_dir).await?;
-    tokio_fs::create_dir_all(&users_dir).await?;
 
     for node_id in 1..=total_nodes {
         let node_dir = layout.node_dir(node_id);
@@ -745,10 +795,6 @@ async fn setup_directories(
         tokio_fs::create_dir_all(node_dir.join("keys")).await?;
         tokio_fs::create_dir_all(node_dir.join("logs")).await?;
         tokio_fs::create_dir_all(node_dir.join("storage")).await?;
-    }
-
-    for user_id in 1..=users {
-        tokio_fs::create_dir_all(users_dir.join(format!("user-{}", user_id))).await?;
     }
 
     Ok(())
@@ -870,7 +916,6 @@ fn derive_account_material(
     let secret_key = SecretKey::secp256k1_from_bytes(child.to_bytes())?;
     let public_key = PublicKey::from(&secret_key);
     let public_key_hex = public_key.to_hex();
-    let public_key_pem = public_key.to_pem()?;
     let account_hash = AccountHash::from(&public_key).to_hex_string();
     let secret_key_pem = if write_secret {
         Some(secret_key.to_pem()?)
@@ -881,19 +926,16 @@ fn derive_account_material(
     Ok(DerivedAccountMaterial {
         path: path.clone(),
         public_key_hex,
-        public_key_pem,
         account_hash,
         secret_key_pem,
     })
 }
 
-async fn write_account_keys(dir: &Path, account: &DerivedAccountMaterial) -> Result<()> {
+async fn write_node_keys(dir: &Path, account: &DerivedAccountMaterial) -> Result<()> {
     tokio_fs::create_dir_all(dir).await?;
-    tokio_fs::write(dir.join(PUBLIC_KEY_HEX), &account.public_key_hex).await?;
     if let Some(secret_key_pem) = &account.secret_key_pem {
         tokio_fs::write(dir.join(SECRET_KEY_PEM), secret_key_pem).await?;
     }
-    tokio_fs::write(dir.join(PUBLIC_KEY_PEM), &account.public_key_pem).await?;
     Ok(())
 }
 
@@ -902,11 +944,14 @@ async fn setup_seeded_keys(
     total_nodes: u32,
     users: u32,
     seed: Arc<str>,
-) -> Result<()> {
-    let seed = seed.to_string();
-    let seed_for_root = seed.clone();
+) -> Result<DerivedAccounts> {
+    let seed_for_root = seed.to_string();
     let root = spawn_blocking_result(move || unsafe_root_from_seed(&seed_for_root)).await?;
     let mut summary = Vec::new();
+    let mut derived = DerivedAccounts {
+        nodes: Vec::new(),
+        users: Vec::new(),
+    };
 
     for node_id in 1..=total_nodes {
         let path =
@@ -917,15 +962,19 @@ async fn setup_seeded_keys(
             move || derive_account_material(&root, &path, true)
         })
         .await?;
-        write_account_keys(&layout.node_dir(node_id).join("keys"), &account).await?;
+        write_node_keys(&layout.node_dir(node_id).join("keys"), &account).await?;
 
-        summary.push(DerivedAccountInfo {
-            role: "validator",
-            label: format!("node-{}", node_id),
+        let info = DerivedAccountInfo {
+            kind: "validator",
+            name: format!("node-{}", node_id),
+            id: node_id,
             path: account.path.clone(),
+            public_key_hex: account.public_key_hex.clone(),
             account_hash: account.account_hash.clone(),
             balance_motes: DEVNET_INITIAL_BALANCE_VALIDATOR,
-        });
+        };
+        summary.push(info.clone());
+        derived.nodes.push(info);
     }
 
     for user_id in 1..=users {
@@ -940,26 +989,22 @@ async fn setup_seeded_keys(
             move || derive_account_material(&root, &path, false)
         })
         .await?;
-        write_account_keys(
-            &layout
-                .net_dir()
-                .join("users")
-                .join(format!("user-{}", user_id)),
-            &account,
-        )
-        .await?;
-        summary.push(DerivedAccountInfo {
-            role: "user",
-            label: format!("user-{}", user_id),
+        let info = DerivedAccountInfo {
+            kind: "user",
+            name: format!("user-{}", user_id),
+            id: user_id,
             path: account.path.clone(),
+            public_key_hex: account.public_key_hex.clone(),
             account_hash: account.account_hash.clone(),
             balance_motes: DEVNET_INITIAL_BALANCE_USER,
-        });
+        };
+        summary.push(info.clone());
+        derived.users.push(info);
     }
 
-    write_derived_accounts_summary(layout, &seed, &summary).await?;
+    write_derived_accounts_summary(layout, &summary).await?;
 
-    Ok(())
+    Ok(derived)
 }
 
 async fn setup_chainspec(
@@ -1003,6 +1048,7 @@ async fn setup_accounts(
     total_nodes: u32,
     genesis_nodes: u32,
     users: u32,
+    derived_accounts: &DerivedAccounts,
 ) -> Result<()> {
     let accounts_path = layout.net_dir().join("chainspec/accounts.toml");
     struct NodeAccount {
@@ -1017,36 +1063,47 @@ async fn setup_accounts(
         validator_key: Option<String>,
     }
 
+    if derived_accounts.nodes.len() != total_nodes as usize {
+        return Err(anyhow!(
+            "expected {} validator accounts, got {}",
+            total_nodes,
+            derived_accounts.nodes.len()
+        ));
+    }
+    if derived_accounts.users.len() != users as usize {
+        return Err(anyhow!(
+            "expected {} user accounts, got {}",
+            users,
+            derived_accounts.users.len()
+        ));
+    }
+
     let mut node_accounts = Vec::new();
     let mut user_accounts = Vec::new();
 
-    for node_id in 1..=total_nodes {
-        let public_key =
-            read_key(&layout.node_dir(node_id).join("keys").join(PUBLIC_KEY_HEX)).await?;
+    for node in &derived_accounts.nodes {
         node_accounts.push(NodeAccount {
-            node_id,
-            public_key,
-            is_genesis: node_id <= genesis_nodes,
+            node_id: node.id,
+            public_key: node.public_key_hex.clone(),
+            is_genesis: node.id <= genesis_nodes,
         });
     }
 
-    for user_id in 1..=users {
-        let public_key = read_key(
-            &layout
-                .net_dir()
-                .join("users")
-                .join(format!("user-{}", user_id))
-                .join(PUBLIC_KEY_HEX),
-        )
-        .await?;
-        let validator_key = if user_id <= genesis_nodes {
-            Some(read_key(&layout.node_dir(user_id).join("keys").join(PUBLIC_KEY_HEX)).await?)
+    for user in &derived_accounts.users {
+        let validator_key = if user.id <= genesis_nodes {
+            Some(
+                derived_accounts
+                    .nodes
+                    .get((user.id - 1) as usize)
+                    .map(|node| node.public_key_hex.clone())
+                    .ok_or_else(|| anyhow!("missing validator key for node {}", user.id))?,
+            )
         } else {
             None
         };
         user_accounts.push(UserAccount {
-            user_id,
-            public_key,
+            user_id: user.id,
+            public_key: user.public_key_hex.clone(),
             validator_key,
         });
     }
@@ -1286,10 +1343,6 @@ fn genesis_timestamp(delay_seconds: u64) -> Result<String> {
     Ok(ts.format(&Rfc3339)?)
 }
 
-async fn read_key(path: &Path) -> Result<String> {
-    Ok(tokio_fs::read_to_string(path).await?.trim().to_string())
-}
-
 fn format_cspr(motes: u128) -> String {
     let whole = motes / MOTE_PER_CSPR;
     let rem = motes % MOTE_PER_CSPR;
@@ -1307,11 +1360,10 @@ fn derived_accounts_path(layout: &AssetsLayout) -> PathBuf {
 
 async fn write_derived_accounts_summary(
     layout: &AssetsLayout,
-    seed: &str,
     accounts: &[DerivedAccountInfo],
 ) -> Result<()> {
     let mut lines = Vec::new();
-    lines.push(format!("seed: {}", seed));
+    lines.push("kind,name,bip32_path,account_hash,balance".to_string());
     for account in accounts {
         lines.push(account.line());
     }
