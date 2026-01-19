@@ -118,6 +118,12 @@ Start a devnet:
 casper-devnet start
 ```
 
+Check whether a devnet has produced blocks (useful for CI):
+
+```bash
+casper-devnet is-ready
+```
+
 Create assets without starting processes:
 
 ```bash

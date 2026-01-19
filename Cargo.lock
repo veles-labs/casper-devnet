@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "casper-devnet"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "backoff",
@@ -301,6 +301,7 @@ dependencies = [
  "sha2",
  "spinners",
  "tar",
+ "tempfile",
  "time",
  "tokio",
  "toml 0.8.23",

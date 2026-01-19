@@ -17,6 +17,13 @@ Semantic Versioning.
 
 ### Security
 
+## [0.6.0] - 2026-01-19
+### Added
+- Add `is-ready` for CI readiness checks, validating process status/PIDs, REST health, `reactor_state` (`Validate`), and non-null `last_block_height`.
+
+### Fixed
+- Write `state.json` atomically to reduce corruption during updates.
+
 ## [0.5.2] - 2026-01-19
 ### Changed
 - `most_recent_bundle_version` now returns `Result<Option<Version>>` for empty stores.
@@ -110,7 +117,8 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.4.1...v0.5.0

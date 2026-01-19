@@ -1,6 +1,6 @@
 use crate::assets::{self, AssetsLayout, SetupOptions};
 use crate::process::{self, ProcessHandle, RunningProcess, StartPlan};
-use crate::state::{ProcessKind, ProcessRecord, ProcessStatus, State};
+use crate::state::{ProcessKind, ProcessRecord, ProcessStatus, STATE_FILE_NAME, State};
 use anyhow::{Result, anyhow};
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
@@ -10,12 +10,18 @@ use casper_types::execution::ExecutionResult;
 use clap::{Args, Parser, Subcommand};
 use directories::BaseDirs;
 use futures::StreamExt;
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
+use serde::Deserialize;
 use spinners::{Spinner, Spinners};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::fs as tokio_fs;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use veles_casper_rust_sdk::sse::event::SseEvent;
@@ -40,6 +46,8 @@ enum Command {
     Start(StartArgs),
     /// Manage assets bundles.
     Assets(AssetsArgs),
+    /// Check whether a network has observed a block yet.
+    IsReady(IsReadyArgs),
 }
 
 /// Arguments for `nctl start`.
@@ -128,12 +136,25 @@ struct AssetsPullArgs {
     force: bool,
 }
 
+/// Arguments for `nctl is-ready`.
+#[derive(Args, Clone)]
+struct IsReadyArgs {
+    /// Network name used in assets paths and configs.
+    #[arg(long, default_value = "casper-dev")]
+    network_name: String,
+
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
+}
+
 /// Parses CLI and runs the selected subcommand.
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Start(args) => run_start(args).await,
         Command::Assets(args) => run_assets(args).await,
+        Command::IsReady(args) => run_is_ready(args).await,
     }
 }
 
@@ -180,7 +201,7 @@ async fn run_start(args: StartArgs) -> Result<()> {
 
     let plan = StartPlan { rust_log };
 
-    let state_path = layout.net_dir().join("state.json");
+    let state_path = layout.net_dir().join(STATE_FILE_NAME);
     let state = Arc::new(Mutex::new(State::new(state_path).await?));
     let started = {
         let mut state = state.lock().await;
@@ -936,12 +957,59 @@ fn looks_like_url(path: &Path) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+async fn is_dir(path: &Path) -> bool {
+    tokio_fs::metadata(path)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
 async fn run_assets(args: AssetsArgs) -> Result<()> {
     match args.command {
         AssetsCommand::Add(add) => run_assets_add(add).await,
         AssetsCommand::Pull(pull) => run_assets_pull(pull).await,
         AssetsCommand::List => run_assets_list().await,
     }
+}
+
+async fn run_is_ready(args: IsReadyArgs) -> Result<()> {
+    let assets_root = match &args.net_path {
+        Some(path) => path.clone(),
+        None => assets::default_assets_root()?,
+    };
+    let layout = AssetsLayout::new(assets_root, args.network_name);
+    let argv0 = std::env::args()
+        .next()
+        .unwrap_or_else(|| "casper-devnet".to_string());
+    let setup_cmd = format!("{} start --setup-only", argv0);
+    let net_dir = layout.net_dir();
+    if !is_dir(&net_dir).await {
+        return Err(anyhow!(
+            "assets for {} not found; run `{}`",
+            layout.network_name(),
+            setup_cmd
+        ));
+    }
+
+    let state_path = net_dir.join(STATE_FILE_NAME);
+    let contents = match tokio_fs::read_to_string(&state_path).await {
+        Ok(contents) => contents,
+        Err(_) => return Err(anyhow!("network is not ready yet")),
+    };
+    let state =
+        match tokio::task::spawn_blocking(move || serde_json::from_str::<State>(&contents)).await {
+            Ok(Ok(state)) => state,
+            _ => return Err(anyhow!("network is not ready yet")),
+        };
+
+    ensure_processes_running(&state)?;
+
+    if state.last_block_height.is_none() {
+        return Err(anyhow!("network is not ready yet"));
+    }
+
+    ensure_rest_ready(&state).await?;
+    Ok(())
 }
 
 async fn run_assets_add(args: AssetsAddArgs) -> Result<()> {
@@ -1011,6 +1079,129 @@ async fn resolve_protocol_version(candidate: &Option<String>) -> Result<String> 
         .max()
         .expect("non-empty assets versions");
     Ok(version.to_string())
+}
+
+fn ensure_processes_running(state: &State) -> Result<()> {
+    if state.processes.is_empty() {
+        return Err(anyhow!("network is not ready yet"));
+    }
+    for process in &state.processes {
+        if !matches!(process.last_status, ProcessStatus::Running) {
+            return Err(anyhow!("network is not ready yet"));
+        }
+        let pid = match process.pid {
+            Some(pid) => pid,
+            None => return Err(anyhow!("network is not ready yet")),
+        };
+        if !is_pid_running(pid) {
+            return Err(anyhow!("network is not ready yet"));
+        }
+    }
+    Ok(())
+}
+
+fn is_pid_running(pid: u32) -> bool {
+    let pid = Pid::from_raw(pid as i32);
+    match kill(pid, None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+async fn ensure_rest_ready(state: &State) -> Result<()> {
+    let node_ids: HashSet<u32> = state
+        .processes
+        .iter()
+        .filter_map(|process| {
+            if matches!(process.kind, ProcessKind::Node) {
+                Some(process.node_id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if node_ids.is_empty() {
+        return Err(anyhow!("network is not ready yet"));
+    }
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    for node_id in node_ids {
+        let url = format!("{}/status", assets::rest_endpoint(node_id));
+        let response = match client.get(&url).send().await {
+            Ok(response) => response,
+            Err(_) => return Err(anyhow!("network is not ready yet")),
+        };
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(anyhow!("network is not ready yet"));
+        }
+        let status = match response.json::<NodeStatus>().await {
+            Ok(status) => status,
+            Err(_) => return Err(anyhow!("network is not ready yet")),
+        };
+        if !status
+            .reactor_state
+            .as_deref()
+            .map(is_ready_reactor_state)
+            .unwrap_or(false)
+        {
+            return Err(anyhow!("network is not ready yet"));
+        }
+    }
+    Ok(())
+}
+
+fn is_ready_reactor_state(state: &str) -> bool {
+    state == "Validate"
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "snake_case")]
+struct NodeStatus {
+    peers: Option<Vec<NodePeer>>,
+    api_version: Option<String>,
+    build_version: Option<String>,
+    chainspec_name: Option<String>,
+    starting_state_root_hash: Option<String>,
+    last_added_block_info: Option<serde_json::Value>,
+    our_public_signing_key: Option<String>,
+    round_length: Option<serde_json::Value>,
+    next_upgrade: Option<serde_json::Value>,
+    uptime: Option<String>,
+    reactor_state: Option<String>,
+    last_progress: Option<String>,
+    available_block_range: Option<BlockRange>,
+    block_sync: Option<BlockSync>,
+    latest_switch_block_hash: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "snake_case")]
+struct NodePeer {
+    node_id: Option<String>,
+    address: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "snake_case")]
+struct BlockRange {
+    low: Option<u64>,
+    high: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+#[serde(rename_all = "snake_case")]
+struct BlockSync {
+    historical: Option<serde_json::Value>,
+    forward: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
