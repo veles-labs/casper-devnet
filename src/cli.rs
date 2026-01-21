@@ -1,4 +1,5 @@
 use crate::assets::{self, AssetsLayout, SetupOptions};
+use crate::diagnostics_port;
 use crate::process::{self, ProcessHandle, RunningProcess, StartPlan};
 use crate::state::{ProcessKind, ProcessRecord, ProcessStatus, STATE_FILE_NAME, State};
 use anyhow::{Result, anyhow};
@@ -217,6 +218,13 @@ async fn run_start(args: StartArgs) -> Result<()> {
     let health = Arc::new(Mutex::new(SseHealth::new(node_ids.clone(), details)));
     start_sse_spinner(&health).await;
     spawn_sse_listeners(layout.clone(), &node_ids, health, Arc::clone(&state)).await;
+    let mut diagnostics_proxy = match diagnostics_port::spawn(&layout).await {
+        Ok(proxy) => Some(proxy),
+        Err(err) => {
+            eprintln!("warning: failed to start diagnostics proxy: {}", err);
+            None
+        }
+    };
 
     let (event_tx, mut event_rx) = unbounded_channel();
     spawn_ctrlc_listener(event_tx.clone());
@@ -225,6 +233,9 @@ async fn run_start(args: StartArgs) -> Result<()> {
     if let Some(event) = event_rx.recv().await {
         match event {
             RunEvent::CtrlC => {
+                if let Some(proxy) = diagnostics_proxy.take() {
+                    proxy.shutdown();
+                }
                 let mut state = state.lock().await;
                 process::stop(&mut state).await?;
             }
@@ -234,6 +245,9 @@ async fn run_start(args: StartArgs) -> Result<()> {
                 code,
                 signal,
             } => {
+                if let Some(proxy) = diagnostics_proxy.take() {
+                    proxy.shutdown();
+                }
                 let mut state = state.lock().await;
                 update_exited_process(&mut state, &id, code, signal).await?;
                 log_exit(&id, pid, code, signal);
@@ -365,6 +379,14 @@ async fn format_network_details(layout: &AssetsLayout, processes: &[RunningProce
         lines.push(format!("      sse:    {}", assets::sse_endpoint(node_id)));
         lines.push(format!("      rpc:    {}", assets::rpc_endpoint(node_id)));
         lines.push(format!("      binary: {}", assets::binary_address(node_id)));
+        lines.push(format!(
+            "      diagnostics: {}",
+            assets::diagnostics_socket_path(layout.network_name(), node_id)
+        ));
+        lines.push(format!(
+            "      diagnostics-ws: {}",
+            assets::diagnostics_ws_endpoint(node_id)
+        ));
         lines.push(format!(
             "      gossip: {}",
             assets::network_address(node_id)

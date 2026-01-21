@@ -46,7 +46,7 @@ Run a devnet with the default data location (persist assets and network state wi
 
 ```bash
 docker run --rm -it \
-  -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 \
+  -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 -p 32000:32000 \
   -v "$(pwd)/casper-devnet-data:/opt/casper-devnet-data" \
   ghcr.io/veles-labs/casper-devnet
 ```
@@ -57,12 +57,46 @@ Use a custom data directory by overriding `XDG_DATA_HOME` and mounting it:
 docker run --rm -it \
   -e XDG_DATA_HOME=/data \
   -v "$(pwd)/casper-devnet-data:/data" \
-  -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 \
+  -p 11101:11101 -p 14101:14101 -p 18101:18101 -p 22101:22101 -p 28101:28101 -p 32000:32000 \
   ghcr.io/veles-labs/casper-devnet
 ```
 
 The exposed ports map to node-1 services: RPC (11101), REST (14101), SSE (18101), network gossip
-(22101), and binary protocol (28101).
+(22101), binary protocol (28101), and diagnostics websocket proxy
+(ws://127.0.0.1:32000/diagnostics/node-1/). The diagnostics proxy also accepts HTTP POST requests
+to `/diagnostics/node-1/` for non-websocket clients and streams NDJSON responses.
+
+## Diagnostics HTTP Proxy
+
+The diagnostics proxy is useful in environments where you cannot or do not want to keep a
+websocket connection open. It accepts plain HTTP POST requests, forwards them to the node's
+diagnostics Unix socket, and returns line-delimited JSON responses. This is handy for automation
+or for setting failure points and collecting detailed runtime state.
+
+Set a failure point (stop at a specific block height):
+
+```bash
+curl -v -XPOST --data 'stop --at block:250' http://127.0.0.1:32000/diagnostics/node-1/
+```
+
+Dump network info:
+
+```bash
+curl -v -XPOST --data 'net-info' http://127.0.0.1:32000/diagnostics/node-1/
+```
+
+Dump queues:
+
+```bash
+curl -v -XPOST --data 'dump-queues' http://127.0.0.1:32000/diagnostics/node-1/
+```
+
+For interactive workflows, use websockets so you can send commands and immediately see responses
+without re-establishing connections:
+
+```bash
+wscat -c ws://127.0.0.1:32000/diagnostics/node-1/
+```
 
 ## Usage
 

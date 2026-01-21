@@ -6,8 +6,11 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
+- Show diagnostics socket paths in network endpoints output.
+- Add a diagnostics websocket proxy on port 32000 with `/diagnostics/node-<id>/` paths with HTTP POST fallback.
 
 ### Changed
+- Diagnostics port sockets now use the system temp directory with `<network>-<node>.sock` filenames.
 
 ### Deprecated
 
