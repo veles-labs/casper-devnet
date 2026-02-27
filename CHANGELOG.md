@@ -17,6 +17,8 @@ Semantic Versioning.
 ### Removed
 
 ### Fixed
+- Make `assets list` and default protocol resolution tolerate bundle directory/chainspec
+  version mismatches by warning and continuing with the directory version.
 
 ### Security
 

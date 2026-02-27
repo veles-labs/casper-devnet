@@ -554,22 +554,28 @@ pub async fn list_bundle_versions() -> Result<Vec<Version>> {
         if !name.starts_with('v') {
             continue;
         }
+        let dir_version = match parse_protocol_version(&name) {
+            Ok(version) => version,
+            Err(err) => {
+                eprintln!("warning: skipping assets bundle {}: {}", name, err);
+                continue;
+            }
+        };
         let dir_path = entry.path();
         let chainspec_path = dir_path.join("chainspec.toml");
         if !is_file(&chainspec_path).await {
             continue;
         }
         let contents = tokio_fs::read_to_string(&chainspec_path).await?;
-        let version = spawn_blocking_result(move || parse_chainspec_version(&contents)).await?;
-        let expected_dir = format!("v{}", version);
-        if name != expected_dir {
-            return Err(anyhow!(
-                "bundle directory {} does not match chainspec protocol version {}",
-                name,
-                version
-            ));
+        let chainspec_version =
+            spawn_blocking_result(move || parse_chainspec_version(&contents)).await?;
+        if chainspec_version != dir_version {
+            eprintln!(
+                "warning: bundle directory {} does not match chainspec protocol version {}; using directory version {}",
+                name, chainspec_version, dir_version
+            );
         }
-        versions.push(version);
+        versions.push(dir_version);
     }
     Ok(versions)
 }
