@@ -85,7 +85,7 @@ pub async fn stop(state: &mut State) -> Result<()> {
         }
 
         if let Some(pid) = current_pid(record) {
-            println!(
+            eprintln!(
                 "sending {} to {} (pid {})",
                 signal_name(Signal::SIGTERM),
                 record.id,
@@ -110,7 +110,7 @@ pub async fn stop(state: &mut State) -> Result<()> {
                 sleep(Duration::from_millis(200)).await;
             }
             if process_alive(pid as i32) {
-                println!(
+                eprintln!(
                     "sending {} to {} (pid {})",
                     signal_name(Signal::SIGKILL),
                     record.id,

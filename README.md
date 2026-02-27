@@ -152,6 +152,18 @@ Start a devnet:
 casper-devnet start
 ```
 
+Run MCP control plane server (STDIO + HTTP):
+
+```bash
+casper-devnet mcp
+```
+
+Run MCP in HTTP-only mode:
+
+```bash
+casper-devnet mcp --transport http --http-bind 127.0.0.1:32100 --http-path /mcp
+```
+
 Check whether a devnet has produced blocks (useful for CI):
 
 ```bash
@@ -172,6 +184,24 @@ Rebuild assets:
 casper-devnet start --force-setup
 ```
 
+## MCP workflow
+
+`casper-devnet mcp` does not auto-start a network. Use MCP tools in this order:
+
+1. `spawn_network` (defaults to `force_setup=true` for fresh setup; set `force_setup=false` to resume existing assets).
+2. `wait_network_ready` (waits for running processes, healthy `/status`, `reactor_state=Validate`, and first observed block).
+3. Call network tools (RPC/status/block/log/SSE/transactions).
+
+MCP server defaults:
+
+- `transport=both`
+- `http_bind=127.0.0.1:32100`
+- `http_path=/mcp`
+
+MCP tools require `network_name`; node-scoped tools also require `node_id`.
+Managed networks are stopped automatically when the MCP server exits.
+Use `managed_processes` to inspect managed node/sidecar processes, with optional process-name filtering and `running_only` control.
+
 ## Common flags
 
 - `--protocol-version <version>`: Protocol version to use from the assets store (defaults to newest bundle)
@@ -185,6 +215,13 @@ casper-devnet start --force-setup
 - `--setup-only`: Build assets and exit
 - `--force-setup`: Rebuild assets even if they exist
 - `--seed <string>`: Seed for deterministic devnet keys (default: `default`)
+
+`casper-devnet mcp` flags:
+
+- `--transport <stdio|http|both>`: MCP transport mode (default: `both`)
+- `--http-bind <addr:port>`: HTTP bind address for streamable MCP (default: `127.0.0.1:32100`)
+- `--http-path <path>`: HTTP mount path for MCP endpoint (default: `/mcp`)
+- `--net-path <path>`: Override network runtime root (same behavior as `start`)
 
 ## Assets bundle layout
 

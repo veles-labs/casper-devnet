@@ -1,5 +1,6 @@
 use crate::assets::{self, AssetsLayout, SetupOptions};
 use crate::diagnostics_port;
+use crate::mcp::{self, McpArgs};
 use crate::process::{self, ProcessHandle, RunningProcess, StartPlan};
 use crate::state::{ProcessKind, ProcessRecord, ProcessStatus, STATE_FILE_NAME, State};
 use anyhow::{Result, anyhow};
@@ -45,6 +46,8 @@ pub struct Cli {
 enum Command {
     /// Setup assets (if needed) and start the devnet.
     Start(StartArgs),
+    /// Run MCP control plane server.
+    Mcp(McpArgs),
     /// Manage assets bundles.
     Assets(AssetsArgs),
     /// Check whether a network has observed a block yet.
@@ -154,6 +157,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Start(args) => run_start(args).await,
+        Command::Mcp(args) => mcp::run(args).await,
         Command::Assets(args) => run_assets(args).await,
         Command::IsReady(args) => run_is_ready(args).await,
     }

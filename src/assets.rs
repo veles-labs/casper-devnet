@@ -56,6 +56,13 @@ struct DerivedAccountMaterial {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct DerivedPathMaterial {
+    pub public_key_hex: String,
+    pub account_hash: String,
+    pub secret_key_pem: String,
+}
+
+#[derive(Debug, Clone)]
 struct DerivedAccountInfo {
     kind: &'static str,
     name: String,
@@ -1384,6 +1391,29 @@ pub async fn derived_accounts_summary(layout: &AssetsLayout) -> Option<String> {
     tokio_fs::read_to_string(derived_accounts_path(layout))
         .await
         .ok()
+}
+
+pub(crate) async fn derive_account_from_seed_path(
+    seed: Arc<str>,
+    path: &str,
+) -> Result<DerivedPathMaterial> {
+    let seed_for_root = seed.to_string();
+    let path_for_parse = path.to_string();
+    spawn_blocking_result(move || {
+        let root = unsafe_root_from_seed(&seed_for_root)?;
+        let path = DerivationPath::from_str(&path_for_parse)?;
+        let material = derive_account_material(&root, &path, true)?;
+        let secret_key_pem = material
+            .secret_key_pem
+            .ok_or_else(|| anyhow!("missing secret key material for {}", path_for_parse))?;
+
+        Ok(DerivedPathMaterial {
+            public_key_hex: material.public_key_hex,
+            account_hash: material.account_hash,
+            secret_key_pem,
+        })
+    })
+    .await
 }
 
 async fn copy_file(src: &Path, dest: &Path) -> Result<()> {

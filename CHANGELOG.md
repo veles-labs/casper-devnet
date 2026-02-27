@@ -8,9 +8,16 @@ Semantic Versioning.
 ### Added
 - Show diagnostics socket paths in network endpoints output.
 - Add a diagnostics websocket proxy on port 32000 with `/diagnostics/node-<id>/` paths with HTTP POST fallback.
+- Add `casper-devnet mcp` command with MCP server transports (`stdio`, `http`, `both`), default HTTP endpoint `127.0.0.1:32100/mcp`, and multi-network runtime management.
+- Add MCP tools for network lifecycle (`spawn_network`, `wait_network_ready`, `despawn_network`, `list_networks`), managed process inspection (`managed_processes`), RPC/status/block queries, log pagination, SSE wait/history, derived account listing, transaction submission/signing, token transfers, session wasm submission, and transaction execution waiting.
+- Add per-network SSE collection with sequence-based history and filtering.
+- Add deterministic seed/path derivation helper API in `assets` for MCP signing workflows.
 
 ### Changed
 - Diagnostics port sockets now use the system temp directory with `<network>-<node>.sock` filenames.
+- MCP-managed network spawns now enforce sidecar binary/config preflight checks.
+- Process shutdown signal messages are emitted to stderr for MCP stdio protocol safety.
+- Document MCP workflow and flags in README.
 
 ### Deprecated
 
