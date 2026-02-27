@@ -202,6 +202,7 @@ MCP tools require `network_name`; node-scoped tools also require `node_id`.
 Managed networks are stopped automatically when the MCP server exits.
 Use `managed_processes` to inspect managed node/sidecar processes, with optional process-name filtering and `running_only` control.
 `rpc_query_global_state` auto-resolves the latest block hash when both `block_id` and `state_root_hash` are omitted.
+For transaction construction, use MCP tools (`make_transaction_package_call`, `make_transaction_contract_call`, `make_transaction_session_wasm`) with `send_transaction_signed` instead of invoking external `casper-client` binaries.
 
 Codex CLI stdio MCP example (`~/.codex/config.toml`):
 

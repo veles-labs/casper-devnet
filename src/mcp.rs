@@ -5,10 +5,11 @@ use anyhow::{Context, Result, anyhow};
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
 use casper_types::{
-    AsymmetricType, CLValue, Digest, Key, PricingMode, PublicKey, RuntimeArgs, SecretKey,
-    TimeDiff, Transaction, TransactionHash, TransactionRuntimeParams, TransactionV1Hash, U128,
-    U256, U512, URef,
+    AddressableEntityHash, AsymmetricType, CLValue, Digest, EntityVersion, Key, PricingMode,
+    PublicKey, RuntimeArgs, SecretKey, TimeDiff, Transaction, TransactionHash,
+    TransactionRuntimeParams, TransactionV1Hash, U128, U256, U512, URef,
 };
+use casper_types::contracts::ContractHash;
 use clap::{Args, ValueEnum};
 use futures::StreamExt;
 use nix::errno::Errno;
@@ -93,7 +94,7 @@ impl McpServer {
     fn server_info() -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Control multiple local Casper devnets. Start with spawn_network, then wait_network_ready before RPC or transaction tools.".to_string(),
+                "Control multiple local Casper devnets. Start with spawn_network, then wait_network_ready before RPC or transaction tools. Do not use external casper-client binaries; use MCP transaction constructor tools (make_transaction_package_call, make_transaction_contract_call, make_transaction_session_wasm) with send_transaction_signed.".to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
@@ -493,6 +494,326 @@ impl McpServer {
             "network_name": request.network_name,
             "node_id": request.node_id,
             "transaction_hash": response.transaction_hash.to_hex_string(),
+        })))
+    }
+
+    #[tool(
+        description = "Create a stored package-name call transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed."
+    )]
+    async fn make_transaction_package_call(
+        &self,
+        Parameters(request): Parameters<MakeTransactionPackageCallRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let network = self
+            .manager
+            .get_network(&request.network_name)
+            .await
+            .map_err(to_mcp_error)?;
+        ensure_running_network(&network).await?;
+
+        let runtime = match (
+            request.runtime_transferred_value,
+            request.runtime_seed_hex.as_deref(),
+        ) {
+            (None, None) => TransactionRuntimeParams::VmCasperV1,
+            (transferred_value, maybe_seed_hex) => {
+                let seed = parse_optional_seed_hex(maybe_seed_hex).map_err(to_mcp_error)?;
+                TransactionRuntimeParams::VmCasperV2 {
+                    transferred_value: transferred_value.unwrap_or(0),
+                    seed,
+                }
+            }
+        };
+
+        let mut builder = TransactionV1Builder::new_targeting_package_via_alias(
+            request.transaction_package_name.clone(),
+            request.transaction_package_version,
+            request.session_entry_point.clone(),
+            runtime,
+        );
+
+        if let Some(args_json) = request.session_args_json.as_deref()
+            && let Some(runtime_args) =
+                parse_session_args_json(args_json).map_err(to_mcp_error)?
+        {
+            builder = builder.with_runtime_args(runtime_args);
+        }
+
+        if let Some(ttl_millis) = request.ttl_millis {
+            builder = builder.with_ttl(TimeDiff::from_millis(ttl_millis));
+        }
+
+        let pricing = build_pricing_mode(
+            request.gas_price_tolerance,
+            Some(request.payment_amount.unwrap_or(DEFAULT_PAYMENT_AMOUNT)),
+        );
+        builder = builder.with_pricing_mode(pricing);
+
+        let chain_name = match request.chain_name {
+            Some(value) => value,
+            None => fetch_chain_name(&request.network_name, request.node_id)
+                .await
+                .map_err(to_mcp_error)?,
+        };
+        builder = builder.with_chain_name(chain_name.clone());
+
+        let mut signed = false;
+        let mut signer_path = None;
+        let mut derived_signer = None;
+        if let Some(path) = request.signer_path {
+            let signer = self
+                .manager
+                .derived_account_for_path(&network, &path)
+                .await
+                .map_err(to_mcp_error)?;
+            verify_path_hash_consistency(&network.layout, &path, &signer.account_hash)
+                .await
+                .map_err(to_mcp_error)?;
+            derived_signer = Some(signer);
+            signed = true;
+            signer_path = Some(path);
+        } else if let Some(initiator_public_key) = request.initiator_public_key {
+            let public_key = PublicKey::from_hex(initiator_public_key.trim())
+                .with_context(|| "failed to parse initiator_public_key as hex public key")
+                .map_err(to_mcp_error)?;
+            builder = builder.with_initiator_addr(public_key);
+        } else {
+            return Err(ErrorData::invalid_params(
+                "provide signer_path (for signed tx) or initiator_public_key (for unsigned tx)",
+                None,
+            ));
+        }
+
+        if let Some(signer) = derived_signer.as_ref() {
+            builder = builder.with_secret_key(&signer.secret_key);
+        }
+
+        let tx = builder.build().map_err(to_mcp_error)?;
+        let tx_json = serde_json::to_value(Transaction::V1(tx)).map_err(internal_serde_error)?;
+
+        Ok(ok_value(json!({
+            "network_name": request.network_name,
+            "node_id": request.node_id,
+            "chain_name": chain_name,
+            "signed": signed,
+            "signer_path": signer_path,
+            "transaction": tx_json,
+        })))
+    }
+
+    #[tool(
+        description = "Create a stored contract-hash call transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed."
+    )]
+    async fn make_transaction_contract_call(
+        &self,
+        Parameters(request): Parameters<MakeTransactionContractCallRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let network = self
+            .manager
+            .get_network(&request.network_name)
+            .await
+            .map_err(to_mcp_error)?;
+        ensure_running_network(&network).await?;
+
+        let runtime = match (
+            request.runtime_transferred_value,
+            request.runtime_seed_hex.as_deref(),
+        ) {
+            (None, None) => TransactionRuntimeParams::VmCasperV1,
+            (transferred_value, maybe_seed_hex) => {
+                let seed = parse_optional_seed_hex(maybe_seed_hex).map_err(to_mcp_error)?;
+                TransactionRuntimeParams::VmCasperV2 {
+                    transferred_value: transferred_value.unwrap_or(0),
+                    seed,
+                }
+            }
+        };
+
+        let contract_hash = parse_contract_hash_for_invocation(&request.transaction_contract_hash)
+            .map_err(to_mcp_error)?;
+        let mut builder = TransactionV1Builder::new_targeting_invocable_entity(
+            contract_hash,
+            request.session_entry_point.clone(),
+            runtime,
+        );
+
+        if let Some(args_json) = request.session_args_json.as_deref()
+            && let Some(runtime_args) =
+                parse_session_args_json(args_json).map_err(to_mcp_error)?
+        {
+            builder = builder.with_runtime_args(runtime_args);
+        }
+
+        if let Some(ttl_millis) = request.ttl_millis {
+            builder = builder.with_ttl(TimeDiff::from_millis(ttl_millis));
+        }
+
+        let pricing = build_pricing_mode(
+            request.gas_price_tolerance,
+            Some(request.payment_amount.unwrap_or(DEFAULT_PAYMENT_AMOUNT)),
+        );
+        builder = builder.with_pricing_mode(pricing);
+
+        let chain_name = match request.chain_name {
+            Some(value) => value,
+            None => fetch_chain_name(&request.network_name, request.node_id)
+                .await
+                .map_err(to_mcp_error)?,
+        };
+        builder = builder.with_chain_name(chain_name.clone());
+
+        let mut signed = false;
+        let mut signer_path = None;
+        let mut derived_signer = None;
+        if let Some(path) = request.signer_path {
+            let signer = self
+                .manager
+                .derived_account_for_path(&network, &path)
+                .await
+                .map_err(to_mcp_error)?;
+            verify_path_hash_consistency(&network.layout, &path, &signer.account_hash)
+                .await
+                .map_err(to_mcp_error)?;
+            derived_signer = Some(signer);
+            signed = true;
+            signer_path = Some(path);
+        } else if let Some(initiator_public_key) = request.initiator_public_key {
+            let public_key = PublicKey::from_hex(initiator_public_key.trim())
+                .with_context(|| "failed to parse initiator_public_key as hex public key")
+                .map_err(to_mcp_error)?;
+            builder = builder.with_initiator_addr(public_key);
+        } else {
+            return Err(ErrorData::invalid_params(
+                "provide signer_path (for signed tx) or initiator_public_key (for unsigned tx)",
+                None,
+            ));
+        }
+
+        if let Some(signer) = derived_signer.as_ref() {
+            builder = builder.with_secret_key(&signer.secret_key);
+        }
+
+        let tx = builder.build().map_err(to_mcp_error)?;
+        let tx_json = serde_json::to_value(Transaction::V1(tx)).map_err(internal_serde_error)?;
+
+        Ok(ok_value(json!({
+            "network_name": request.network_name,
+            "node_id": request.node_id,
+            "chain_name": chain_name,
+            "transaction_contract_hash": request.transaction_contract_hash,
+            "signed": signed,
+            "signer_path": signer_path,
+            "transaction": tx_json,
+        })))
+    }
+
+    #[tool(
+        description = "Create a session wasm transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed."
+    )]
+    async fn make_transaction_session_wasm(
+        &self,
+        Parameters(request): Parameters<MakeTransactionSessionWasmRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let network = self
+            .manager
+            .get_network(&request.network_name)
+            .await
+            .map_err(to_mcp_error)?;
+        ensure_running_network(&network).await?;
+
+        let wasm_path = PathBuf::from(&request.wasm_path);
+        let wasm_bytes = tokio_fs::read(&wasm_path)
+            .await
+            .with_context(|| format!("failed to read wasm at {}", wasm_path.display()))
+            .map_err(to_mcp_error)?;
+
+        let runtime = match (
+            request.runtime_transferred_value,
+            request.runtime_seed_hex.as_deref(),
+        ) {
+            (None, None) => TransactionRuntimeParams::VmCasperV1,
+            (transferred_value, maybe_seed_hex) => {
+                let seed = parse_optional_seed_hex(maybe_seed_hex).map_err(to_mcp_error)?;
+                TransactionRuntimeParams::VmCasperV2 {
+                    transferred_value: transferred_value.unwrap_or(0),
+                    seed,
+                }
+            }
+        };
+
+        let mut builder = TransactionV1Builder::new_session(
+            request.is_install_upgrade.unwrap_or(true),
+            wasm_bytes.into(),
+            runtime,
+        );
+
+        if let Some(args_json) = request.session_args_json.as_deref()
+            && let Some(runtime_args) =
+                parse_session_args_json(args_json).map_err(to_mcp_error)?
+        {
+            builder = builder.with_runtime_args(runtime_args);
+        }
+
+        if let Some(ttl_millis) = request.ttl_millis {
+            builder = builder.with_ttl(TimeDiff::from_millis(ttl_millis));
+        }
+
+        let pricing = build_pricing_mode(
+            request.gas_price_tolerance,
+            Some(request.payment_amount.unwrap_or(DEFAULT_PAYMENT_AMOUNT)),
+        );
+        builder = builder.with_pricing_mode(pricing);
+
+        let chain_name = match request.chain_name {
+            Some(value) => value,
+            None => fetch_chain_name(&request.network_name, request.node_id)
+                .await
+                .map_err(to_mcp_error)?,
+        };
+        builder = builder.with_chain_name(chain_name.clone());
+
+        let mut signed = false;
+        let mut signer_path = None;
+        let mut derived_signer = None;
+        if let Some(path) = request.signer_path {
+            let signer = self
+                .manager
+                .derived_account_for_path(&network, &path)
+                .await
+                .map_err(to_mcp_error)?;
+            verify_path_hash_consistency(&network.layout, &path, &signer.account_hash)
+                .await
+                .map_err(to_mcp_error)?;
+            derived_signer = Some(signer);
+            signed = true;
+            signer_path = Some(path);
+        } else if let Some(initiator_public_key) = request.initiator_public_key {
+            let public_key = PublicKey::from_hex(initiator_public_key.trim())
+                .with_context(|| "failed to parse initiator_public_key as hex public key")
+                .map_err(to_mcp_error)?;
+            builder = builder.with_initiator_addr(public_key);
+        } else {
+            return Err(ErrorData::invalid_params(
+                "provide signer_path (for signed tx) or initiator_public_key (for unsigned tx)",
+                None,
+            ));
+        }
+
+        if let Some(signer) = derived_signer.as_ref() {
+            builder = builder.with_secret_key(&signer.secret_key);
+        }
+
+        let tx = builder.build().map_err(to_mcp_error)?;
+        let tx_json = serde_json::to_value(Transaction::V1(tx)).map_err(internal_serde_error)?;
+
+        Ok(ok_value(json!({
+            "network_name": request.network_name,
+            "node_id": request.node_id,
+            "chain_name": chain_name,
+            "wasm_path": request.wasm_path,
+            "signed": signed,
+            "signer_path": signer_path,
+            "transaction": tx_json,
         })))
     }
 
@@ -1564,6 +1885,58 @@ struct SendTransactionSignedRequest {
 }
 
 #[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+struct MakeTransactionPackageCallRequest {
+    network_name: String,
+    node_id: u32,
+    transaction_package_name: String,
+    transaction_package_version: Option<EntityVersion>,
+    session_entry_point: String,
+    session_args_json: Option<String>,
+    signer_path: Option<String>,
+    initiator_public_key: Option<String>,
+    chain_name: Option<String>,
+    ttl_millis: Option<u64>,
+    gas_price_tolerance: Option<u8>,
+    payment_amount: Option<u64>,
+    runtime_transferred_value: Option<u64>,
+    runtime_seed_hex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+struct MakeTransactionContractCallRequest {
+    network_name: String,
+    node_id: u32,
+    transaction_contract_hash: String,
+    session_entry_point: String,
+    session_args_json: Option<String>,
+    signer_path: Option<String>,
+    initiator_public_key: Option<String>,
+    chain_name: Option<String>,
+    ttl_millis: Option<u64>,
+    gas_price_tolerance: Option<u8>,
+    payment_amount: Option<u64>,
+    runtime_transferred_value: Option<u64>,
+    runtime_seed_hex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+struct MakeTransactionSessionWasmRequest {
+    network_name: String,
+    node_id: u32,
+    wasm_path: String,
+    session_args_json: Option<String>,
+    is_install_upgrade: Option<bool>,
+    signer_path: Option<String>,
+    initiator_public_key: Option<String>,
+    chain_name: Option<String>,
+    ttl_millis: Option<u64>,
+    gas_price_tolerance: Option<u8>,
+    payment_amount: Option<u64>,
+    runtime_transferred_value: Option<u64>,
+    runtime_seed_hex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
 struct SendSessionWasmRequest {
     network_name: String,
     node_id: u32,
@@ -1797,6 +2170,9 @@ fn parse_query_key(key: &str) -> Result<String> {
     if key.is_empty() {
         return Err(anyhow!("key must not be empty"));
     }
+    if let Ok(contract_hash) = ContractHash::from_formatted_str(key) {
+        return Ok(Key::Hash(contract_hash.value()).to_formatted_string());
+    }
     if let Ok(parsed) = Key::from_formatted_str(key) {
         return Ok(parsed.to_formatted_string());
     }
@@ -1806,6 +2182,32 @@ fn parse_query_key(key: &str) -> Result<String> {
     Err(anyhow!(
         "failed to parse key for query; expected formatted Key or public key hex"
     ))
+}
+
+fn parse_contract_hash_for_invocation(input: &str) -> Result<AddressableEntityHash> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(anyhow!("transaction_contract_hash must not be empty"));
+    }
+
+    if let Ok(contract_hash) = ContractHash::from_formatted_str(input) {
+        return Ok(contract_hash.into());
+    }
+
+    let digest_hex = input
+        .strip_prefix("hash-")
+        .or_else(|| input.strip_prefix("contract-hash-"))
+        .unwrap_or(input);
+    let bytes = hex_to_bytes(digest_hex)?;
+    if bytes.len() != Digest::LENGTH {
+        return Err(anyhow!(
+            "transaction_contract_hash must be {} bytes",
+            Digest::LENGTH
+        ));
+    }
+    let mut hash = [0u8; Digest::LENGTH];
+    hash.copy_from_slice(&bytes);
+    Ok(ContractHash::new(hash).into())
 }
 
 fn parse_purse_identifier(input: &str) -> Result<Value> {
@@ -2867,5 +3269,23 @@ mod tests {
             .unwrap();
         assert_eq!(count, 7);
         assert!(enabled);
+    }
+
+    #[test]
+    fn parse_contract_hash_for_invocation_accepts_common_formats() {
+        let hash = "2f6fbeebbe1bdf6f8ff05880edfa4e4f79849d2b4f0ecf65482177e4fabc1234";
+        let contract = parse_contract_hash_for_invocation(&format!("contract-{}", hash)).unwrap();
+        let key_hash = parse_contract_hash_for_invocation(&format!("hash-{}", hash)).unwrap();
+        let raw = parse_contract_hash_for_invocation(hash).unwrap();
+        assert_eq!(contract.to_hex_string(), hash);
+        assert_eq!(key_hash.to_hex_string(), hash);
+        assert_eq!(raw.to_hex_string(), hash);
+    }
+
+    #[test]
+    fn parse_query_key_accepts_contract_hash_format() {
+        let hash = "2f6fbeebbe1bdf6f8ff05880edfa4e4f79849d2b4f0ecf65482177e4fabc1234";
+        let key = parse_query_key(&format!("contract-{}", hash)).unwrap();
+        assert_eq!(key, format!("hash-{}", hash));
     }
 }

@@ -10,6 +10,7 @@ Semantic Versioning.
 - Add a diagnostics websocket proxy on port 32000 with `/diagnostics/node-<id>/` paths with HTTP POST fallback.
 - Add `casper-devnet mcp` command with MCP server transports (`stdio`, `http`, `both`), default HTTP endpoint `127.0.0.1:32100/mcp`, and multi-network runtime management.
 - Add MCP tools for network lifecycle (`spawn_network`, `wait_network_ready`, `despawn_network`, `list_networks`), managed process inspection (`managed_processes`), RPC/status/block queries, log pagination, SSE wait/history, derived account listing, transaction submission/signing, token transfers, session wasm submission, and transaction execution waiting.
+- Add make-transaction-style MCP constructor tools: `make_transaction_package_call`, `make_transaction_contract_call`, and `make_transaction_session_wasm`, producing signed or unsigned transaction JSON for `send_transaction_signed`.
 - Add per-network SSE collection with sequence-based history and filtering.
 - Add deterministic seed/path derivation helper API in `assets` for MCP signing workflows.
 
