@@ -22,6 +22,8 @@ Semantic Versioning.
 - Add Codex CLI stdio MCP configuration examples (TOML and `codex mcp add`) to README, with a Claude CLI note.
 - Refactor MCP RPC/transaction paths to use `veles_casper_rust_sdk::jsonrpc::CasperClient`
   instead of direct `casper_client` usage in `mcp.rs`.
+- Expand `session_args_json` parsing in MCP transaction tools to full CLType support
+  (including nested CLTypes and aliases), with strict value parsing by declared type.
 
 ### Deprecated
 

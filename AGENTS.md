@@ -52,6 +52,7 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - Prefer concise user-facing logs.
 - Default target for assets is the build target (from `build.rs`).
 - For network interactions, do **not** use `casper_client` directly; use `veles_casper_rust_sdk::jsonrpc::CasperClient` instead.
+- For MCP transaction construction, do **not** shell out to `casper-client` CLI binaries; use MCP constructor tools and pass `session_args_json` with full CLType strings (`Option<List<U512>>`, `Map<String,U64>`, tuples, `ByteArray[32]`, etc.). Composite values should be provided as hex bytes (`0x...`), while scalar values may be strings/numbers/bools (and `null` for `Option<T>` None).
 - Keep `README.md` updated with CLI defaults/flags whenever code changes.
 - Before finishing a task, run `cargo clippy --all --all-targets --all-features --tests` only if any `.rs` code is changed, and report failures.
 - Update `CHANGELOG.md` for user-facing changes; list them under `[Unreleased]` in the appropriate section.

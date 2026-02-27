@@ -1,15 +1,16 @@
+use self::args_parser::parse_session_args_json;
 use crate::assets::{self, AssetsLayout, SetupOptions};
 use crate::process::{self, StartPlan};
 use crate::state::{ProcessKind, ProcessStatus, STATE_FILE_NAME, State};
 use anyhow::{Context, Result, anyhow};
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
-use casper_types::{
-    AddressableEntityHash, AsymmetricType, CLValue, Digest, EntityVersion, Key, PricingMode,
-    PublicKey, RuntimeArgs, SecretKey, TimeDiff, Transaction, TransactionHash,
-    TransactionRuntimeParams, TransactionV1Hash, U128, U256, U512, URef,
-};
 use casper_types::contracts::ContractHash;
+use casper_types::{
+    AddressableEntityHash, AsymmetricType, Digest, EntityVersion, Key, PricingMode, PublicKey,
+    SecretKey, TimeDiff, Transaction, TransactionHash, TransactionRuntimeParams, TransactionV1Hash,
+    URef,
+};
 use clap::{Args, ValueEnum};
 use futures::StreamExt;
 use nix::errno::Errno;
@@ -53,6 +54,8 @@ const DEFAULT_LOG_PAGE_SIZE: usize = 200;
 const DEFAULT_SSE_PAGE_SIZE: usize = 200;
 const DEFAULT_SSE_HISTORY_CAPACITY: usize = 20_000;
 const DEFAULT_PAYMENT_AMOUNT: u64 = 100_000_000_000;
+
+mod args_parser;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -243,7 +246,9 @@ impl McpServer {
             .raw_rpc_query(request.node_id, "query_balance", Some(params))
             .await
             .map_err(to_mcp_error)?;
-        Ok(ok_value(extract_rpc_result(response).map_err(to_mcp_error)?))
+        Ok(ok_value(
+            extract_rpc_result(response).map_err(to_mcp_error)?,
+        ))
     }
 
     #[tool(
@@ -281,7 +286,9 @@ impl McpServer {
             .await
             .map_err(to_mcp_error)?;
 
-        Ok(ok_value(extract_rpc_result(response).map_err(to_mcp_error)?))
+        Ok(ok_value(
+            extract_rpc_result(response).map_err(to_mcp_error)?,
+        ))
     }
 
     #[tool(description = "Get current block height using typed chain_get_block RPC.")]
@@ -488,7 +495,10 @@ impl McpServer {
         transaction.sign(&signer.secret_key);
 
         let rpc = mcp_rpc_client(&request.network_name, request.node_id).map_err(to_mcp_error)?;
-        let response = rpc.put_transaction(transaction).await.map_err(to_mcp_error)?;
+        let response = rpc
+            .put_transaction(transaction)
+            .await
+            .map_err(to_mcp_error)?;
 
         Ok(ok_value(json!({
             "network_name": request.network_name,
@@ -533,8 +543,7 @@ impl McpServer {
         );
 
         if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) =
-                parse_session_args_json(args_json).map_err(to_mcp_error)?
+            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -638,8 +647,7 @@ impl McpServer {
         );
 
         if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) =
-                parse_session_args_json(args_json).map_err(to_mcp_error)?
+            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -748,8 +756,7 @@ impl McpServer {
         );
 
         if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) =
-                parse_session_args_json(args_json).map_err(to_mcp_error)?
+            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -867,8 +874,7 @@ impl McpServer {
         );
 
         if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) =
-                parse_session_args_json(args_json).map_err(to_mcp_error)?
+            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -948,13 +954,9 @@ impl McpServer {
             .with_context(|| "failed to parse derived recipient public key")
             .map_err(to_mcp_error)?;
 
-        let mut builder = TransactionV1Builder::new_transfer(
-            amount,
-            None,
-            to_public_key,
-            request.transfer_id,
-        )
-        .map_err(to_mcp_error)?;
+        let mut builder =
+            TransactionV1Builder::new_transfer(amount, None, to_public_key, request.transfer_id)
+                .map_err(to_mcp_error)?;
 
         if let Some(ttl_millis) = request.ttl_millis {
             builder = builder.with_ttl(TimeDiff::from_millis(ttl_millis));
@@ -2039,8 +2041,17 @@ fn parse_transaction_hash_input(input: &str) -> Result<TransactionHash> {
 }
 
 fn mcp_rpc_client(network_name: &str, node_id: u32) -> Result<CasperClient> {
-    CasperClient::new(network_name.to_string(), vec![assets::rpc_endpoint(node_id)])
-        .map_err(|err| anyhow!("failed to initialize rpc client for node {}: {}", node_id, err))
+    CasperClient::new(
+        network_name.to_string(),
+        vec![assets::rpc_endpoint(node_id)],
+    )
+    .map_err(|err| {
+        anyhow!(
+            "failed to initialize rpc client for node {}: {}",
+            node_id,
+            err
+        )
+    })
 }
 
 fn extract_rpc_result(response: Value) -> Result<Value> {
@@ -2243,175 +2254,6 @@ fn parse_purse_identifier(input: &str) -> Result<Value> {
     Ok(json!({
         "main_purse_under_public_key": public_key.to_hex_string(),
     }))
-}
-
-#[derive(Debug, Deserialize)]
-struct SessionArgInput {
-    name: String,
-    #[serde(rename = "type")]
-    arg_type: String,
-    value: Value,
-}
-
-fn parse_session_args_json(input: &str) -> Result<Option<RuntimeArgs>> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Ok(None);
-    }
-
-    if let Ok(runtime_args) = serde_json::from_str::<RuntimeArgs>(input) {
-        return Ok(Some(runtime_args));
-    }
-
-    let args = serde_json::from_str::<Vec<SessionArgInput>>(input)
-        .map_err(|err| anyhow!("invalid session_args_json: {}", err))?;
-    let mut runtime_args = RuntimeArgs::new();
-    for arg in args {
-        let cl_value = parse_session_cl_value(&arg.arg_type, arg.value)
-            .with_context(|| format!("invalid session arg '{}'", arg.name))?;
-        runtime_args.insert_cl_value(arg.name, cl_value);
-    }
-    Ok(Some(runtime_args))
-}
-
-fn parse_session_cl_value(arg_type: &str, value: Value) -> Result<CLValue> {
-    let normalized = arg_type.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "bool" => cl_value_from_t(value_as_bool(&value, arg_type)?),
-        "i32" => cl_value_from_t(value_as_i32(&value, arg_type)?),
-        "i64" => cl_value_from_t(value_as_i64(&value, arg_type)?),
-        "u8" => cl_value_from_t(value_as_u8(&value, arg_type)?),
-        "u32" => cl_value_from_t(value_as_u32(&value, arg_type)?),
-        "u64" => cl_value_from_t(value_as_u64(&value, arg_type)?),
-        "u128" => cl_value_from_t(
-            U128::from_dec_str(&value_as_numeric_string(&value, arg_type)?)
-                .map_err(|err| anyhow!("invalid U128 value: {}", err))?,
-        ),
-        "u256" => cl_value_from_t(
-            U256::from_dec_str(&value_as_numeric_string(&value, arg_type)?)
-                .map_err(|err| anyhow!("invalid U256 value: {}", err))?,
-        ),
-        "u512" => cl_value_from_t(
-            U512::from_dec_str(&value_as_numeric_string(&value, arg_type)?)
-                .map_err(|err| anyhow!("invalid U512 value: {}", err))?,
-        ),
-        "string" => cl_value_from_t(
-            value
-                .as_str()
-                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?
-                .to_string(),
-        ),
-        "key" => {
-            let value = value
-                .as_str()
-                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?;
-            cl_value_from_t(
-                Key::from_formatted_str(value)
-                    .map_err(|err| anyhow!("invalid Key formatted string: {}", err))?,
-            )
-        }
-        "publickey" => {
-            let value = value
-                .as_str()
-                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?;
-            cl_value_from_t(
-                PublicKey::from_hex(value)
-                    .map_err(|err| anyhow!("invalid PublicKey hex string: {}", err))?,
-            )
-        }
-        "uref" => {
-            let value = value
-                .as_str()
-                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?;
-            cl_value_from_t(
-                URef::from_formatted_str(value)
-                    .map_err(|err| anyhow!("invalid URef formatted string: {}", err))?,
-            )
-        }
-        _ => Err(anyhow!(
-            "unsupported session arg type '{}'; provide RuntimeArgs JSON for advanced CL types",
-            arg_type
-        )),
-    }
-}
-
-fn cl_value_from_t<T: casper_types::CLTyped + casper_types::bytesrepr::ToBytes>(
-    value: T,
-) -> Result<CLValue> {
-    CLValue::from_t(value).map_err(|err| anyhow!("failed to convert value to CLValue: {:?}", err))
-}
-
-fn value_as_numeric_string(value: &Value, arg_type: &str) -> Result<String> {
-    match value {
-        Value::String(v) => Ok(v.to_string()),
-        Value::Number(v) => Ok(v.to_string()),
-        _ => Err(anyhow!(
-            "{} value must be a JSON string or number",
-            arg_type
-        )),
-    }
-}
-
-fn value_as_bool(value: &Value, arg_type: &str) -> Result<bool> {
-    value
-        .as_bool()
-        .ok_or_else(|| anyhow!("{} value must be a JSON bool", arg_type))
-}
-
-fn value_as_i32(value: &Value, arg_type: &str) -> Result<i32> {
-    if let Some(number) = value.as_i64() {
-        return i32::try_from(number)
-            .map_err(|_| anyhow!("{} value is out of i32 range", arg_type));
-    }
-    if let Some(text) = value.as_str() {
-        return text
-            .parse::<i32>()
-            .map_err(|err| anyhow!("invalid {} value: {}", arg_type, err));
-    }
-    Err(anyhow!(
-        "{} value must be a JSON string or integer",
-        arg_type
-    ))
-}
-
-fn value_as_i64(value: &Value, arg_type: &str) -> Result<i64> {
-    if let Some(number) = value.as_i64() {
-        return Ok(number);
-    }
-    if let Some(text) = value.as_str() {
-        return text
-            .parse::<i64>()
-            .map_err(|err| anyhow!("invalid {} value: {}", arg_type, err));
-    }
-    Err(anyhow!(
-        "{} value must be a JSON string or integer",
-        arg_type
-    ))
-}
-
-fn value_as_u8(value: &Value, arg_type: &str) -> Result<u8> {
-    let value = value_as_u64(value, arg_type)?;
-    u8::try_from(value).map_err(|_| anyhow!("{} value is out of u8 range", arg_type))
-}
-
-fn value_as_u32(value: &Value, arg_type: &str) -> Result<u32> {
-    let value = value_as_u64(value, arg_type)?;
-    u32::try_from(value).map_err(|_| anyhow!("{} value is out of u32 range", arg_type))
-}
-
-fn value_as_u64(value: &Value, arg_type: &str) -> Result<u64> {
-    if let Some(number) = value.as_u64() {
-        return Ok(number);
-    }
-    if let Some(text) = value.as_str() {
-        return text
-            .parse::<u64>()
-            .map_err(|err| anyhow!("invalid {} value: {}", arg_type, err));
-    }
-    Err(anyhow!(
-        "{} value must be a JSON string or unsigned integer",
-        arg_type
-    ))
 }
 
 fn build_pricing_mode(gas_price_tolerance: Option<u8>, payment_amount: Option<u64>) -> PricingMode {
@@ -3250,25 +3092,7 @@ mod tests {
                 "BlockHash": "2f6fbeebbe1bdf6f8ff05880edfa4e4f79849d2b4f0ecf65482177e4fabc1234"
             }))
         );
-        assert_eq!(
-            parse_state_identifier("", "").unwrap(),
-            None,
-        );
-    }
-
-    #[test]
-    fn parse_session_args_json_common_types() {
-        let input = r#"[{"name":"count","type":"U64","value":"7"},{"name":"enabled","type":"Bool","value":true}]"#;
-        let args = parse_session_args_json(input).unwrap().unwrap();
-        let count = args.get("count").unwrap().clone().into_t::<u64>().unwrap();
-        let enabled = args
-            .get("enabled")
-            .unwrap()
-            .clone()
-            .into_t::<bool>()
-            .unwrap();
-        assert_eq!(count, 7);
-        assert!(enabled);
+        assert_eq!(parse_state_identifier("", "").unwrap(), None,);
     }
 
     #[test]
