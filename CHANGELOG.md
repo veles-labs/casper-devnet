@@ -6,6 +6,19 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.8.1] - 2026-02-27
+### Added
 - Show diagnostics socket paths in network endpoints output.
 - Add a diagnostics websocket proxy on port 32000 with `/diagnostics/node-<id>/` paths with HTTP POST fallback.
 - Add `casper-devnet mcp` command with MCP server transports (`stdio`, `http`, `both`), default HTTP endpoint `127.0.0.1:32100/mcp`, and multi-network runtime management.
@@ -149,7 +162,8 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.0...v0.8.1
 [0.6.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.0...v0.5.1
