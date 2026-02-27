@@ -203,7 +203,15 @@ Managed networks are stopped automatically when the MCP server exits.
 Use `managed_processes` to inspect managed node/sidecar processes, with optional process-name filtering and `running_only` control.
 `rpc_query_global_state` auto-resolves the latest block hash when both `block_id` and `state_root_hash` are omitted.
 For transaction construction, use MCP tools (`make_transaction_package_call`, `make_transaction_contract_call`, `make_transaction_session_wasm`) with `send_transaction_signed` instead of invoking external `casper-client` binaries.
-`session_args_json` supports full CLType strings (including nested types such as `Option<List<U512>>`, `Map<String,U64>`, tuples, and `ByteArray[32]`). Scalars can be passed as string/number/bool, `null` maps to `None` for `Option<T>`, and composite values should be provided as hex bytes (`0x...`).
+`session_args` supports full CLType strings (including nested types such as `Option<List<U512>>`, `Map<String,U64>`, tuples, and `ByteArray[32]`). Scalars can be passed as string/number/bool, `null` maps to `None` for `Option<T>`, and composite values should be provided as hex bytes (`0x...`). Pass this field as JSON (array/object), not an escaped JSON string. Legacy `session_args_json` is still accepted for compatibility.
+`send_transaction_signed.transaction` should be a typed JSON object. Field name `transaction_json` is not accepted, and encoded JSON strings are not supported.
+Use MCP transaction query tools (`get_transaction`, `wait_transaction`) instead of shelling out to `curl` for `info_get_transaction` calls.
+Valid `session_args` examples:
+- `[{"name":"value","type":"I32","value":"1"}]`
+- `[{"name":"items","type":"List<U64>","value":"0x03000000010000000000000002000000000000000300000000000000"}]`
+Unsupported formats:
+- `{"value":1}` (object shorthand)
+- `["value:i32=1"]` (casper-client CLI arg string format)
 
 Codex CLI stdio MCP example (`~/.codex/config.toml`):
 

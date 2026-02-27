@@ -1,4 +1,4 @@
-use self::args_parser::parse_session_args_json;
+use self::args_parser::parse_session_args;
 use crate::assets::{self, AssetsLayout, SetupOptions};
 use crate::process::{self, StartPlan};
 use crate::state::{ProcessKind, ProcessStatus, STATE_FILE_NAME, State};
@@ -97,7 +97,7 @@ impl McpServer {
     fn server_info() -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Control multiple local Casper devnets. Start with spawn_network, then wait_network_ready before RPC or transaction tools. Do not use external casper-client binaries; use MCP transaction constructor tools (make_transaction_package_call, make_transaction_contract_call, make_transaction_session_wasm) with send_transaction_signed.".to_string(),
+                "Control multiple local Casper devnets. Start with spawn_network, then wait_network_ready before RPC or transaction tools. Do not use external casper-client binaries or curl; use MCP tools directly (for example get_transaction, wait_transaction, make_transaction_package_call, make_transaction_contract_call, make_transaction_session_wasm, send_transaction_signed).".to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
@@ -309,8 +309,30 @@ impl McpServer {
             request.node_id,
             request.block_id.as_deref(),
         )
-        .await
-        .map_err(to_mcp_error)?;
+        .await;
+        let value = match value {
+            Ok(value) => value,
+            Err(err) => {
+                if request.block_id.is_none()
+                    && let Some((low, high)) =
+                        parse_no_such_block_range_from_error(&err.to_string())
+                {
+                    return Ok(ok_value(json!({
+                        "network_name": request.network_name,
+                        "node_id": request.node_id,
+                        "height": high,
+                        "block": Value::Null,
+                        "pending": true,
+                        "available_block_range": {
+                            "low": low,
+                            "high": high,
+                        },
+                        "message": "latest block is not yet queryable; retry shortly",
+                    })));
+                }
+                return Err(to_mcp_error(err));
+            }
+        };
         let height = extract_block_height(&value).ok_or_else(|| {
             ErrorData::internal_error("missing block height in RPC response", None)
         })?;
@@ -469,7 +491,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Submit signed or unsigned transaction JSON. Signer key is derived from signer_path for this managed network."
+        description = "Submit signed or unsigned transaction JSON. Signer key is derived from signer_path for this managed network. transaction must be a typed Transaction JSON object."
     )]
     async fn send_transaction_signed(
         &self,
@@ -491,7 +513,7 @@ impl McpServer {
             .await
             .map_err(to_mcp_error)?;
 
-        let mut transaction = parse_transaction_json(request.transaction_json)?;
+        let mut transaction = parse_transaction_json(request.transaction)?;
         transaction.sign(&signer.secret_key);
 
         let rpc = mcp_rpc_client(&request.network_name, request.node_id).map_err(to_mcp_error)?;
@@ -508,7 +530,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Create a stored package-name call transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed."
+        description = "Create a stored package-name call transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed. session_args accepts either: (1) array of {name,type,value} objects, e.g. [{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}], or (2) full RuntimeArgs JSON object. Legacy field name session_args_json is accepted as an alias, but values must be typed JSON (not encoded JSON strings). Not supported: object shorthand like {\"value\":1} or casper-client string args like [\"value:i32=1\"]. For composite CLTypes (List/Map/Tuple/Result/ByteArray), value must be hex bytes (0x...)."
     )]
     async fn make_transaction_package_call(
         &self,
@@ -542,8 +564,8 @@ impl McpServer {
             runtime,
         );
 
-        if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
+        if let Some(args_json) = request.session_args.as_ref()
+            && let Some(runtime_args) = parse_session_args(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -611,7 +633,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Create a stored contract-hash call transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed."
+        description = "Create a stored contract-hash call transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed. session_args accepts either: (1) array of {name,type,value} objects, e.g. [{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}], or (2) full RuntimeArgs JSON object. Legacy field name session_args_json is accepted as an alias, but values must be typed JSON (not encoded JSON strings). Not supported: object shorthand like {\"value\":1} or casper-client string args like [\"value:i32=1\"]. For composite CLTypes (List/Map/Tuple/Result/ByteArray), value must be hex bytes (0x...)."
     )]
     async fn make_transaction_contract_call(
         &self,
@@ -646,8 +668,8 @@ impl McpServer {
             runtime,
         );
 
-        if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
+        if let Some(args_json) = request.session_args.as_ref()
+            && let Some(runtime_args) = parse_session_args(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -716,7 +738,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Create a session wasm transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed."
+        description = "Create a session wasm transaction (make-transaction style). Returns transaction JSON for follow-up submission with send_transaction_signed. session_args accepts either: (1) array of {name,type,value} objects, e.g. [{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}], or (2) full RuntimeArgs JSON object. Legacy field name session_args_json is accepted as an alias, but values must be typed JSON (not encoded JSON strings). Not supported: object shorthand like {\"value\":1} or casper-client string args like [\"value:i32=1\"]. For composite CLTypes (List/Map/Tuple/Result/ByteArray), value must be hex bytes (0x...)."
     )]
     async fn make_transaction_session_wasm(
         &self,
@@ -755,8 +777,8 @@ impl McpServer {
             runtime,
         );
 
-        if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
+        if let Some(args_json) = request.session_args.as_ref()
+            && let Some(runtime_args) = parse_session_args(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -825,7 +847,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Build, sign and submit a session wasm transaction from a derived account path."
+        description = "Build, sign and submit a session wasm transaction from a derived account path. session_args accepts either: (1) array of {name,type,value} objects, e.g. [{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}], or (2) full RuntimeArgs JSON object. Legacy field name session_args_json is accepted as an alias, but values must be typed JSON (not encoded JSON strings). Not supported: object shorthand like {\"value\":1} or casper-client string args like [\"value:i32=1\"]. For composite CLTypes (List/Map/Tuple/Result/ByteArray), value must be hex bytes (0x...)."
     )]
     async fn send_session_wasm(
         &self,
@@ -873,8 +895,8 @@ impl McpServer {
             runtime,
         );
 
-        if let Some(args_json) = request.session_args_json.as_deref()
-            && let Some(runtime_args) = parse_session_args_json(args_json).map_err(to_mcp_error)?
+        if let Some(args_json) = request.session_args.as_ref()
+            && let Some(runtime_args) = parse_session_args(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -1041,6 +1063,30 @@ impl McpServer {
 
             tokio::time::sleep(poll).await;
         }
+    }
+
+    #[tool(
+        description = "Get transaction details via info_get_transaction (non-waiting). Returns typed JSON response from node."
+    )]
+    async fn get_transaction(
+        &self,
+        Parameters(request): Parameters<GetTransactionRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let network = self
+            .manager
+            .get_network(&request.network_name)
+            .await
+            .map_err(to_mcp_error)?;
+        ensure_running_network(&network).await?;
+
+        let tx_hash =
+            parse_transaction_hash_input(&request.transaction_hash).map_err(to_mcp_error)?;
+        let rpc = mcp_rpc_client(&request.network_name, request.node_id).map_err(to_mcp_error)?;
+        let response = rpc.get_transaction(tx_hash).await.map_err(to_mcp_error)?;
+
+        Ok(ok_value(
+            serde_json::to_value(response).map_err(internal_serde_error)?,
+        ))
     }
 }
 
@@ -1883,7 +1929,7 @@ struct SendTransactionSignedRequest {
     network_name: String,
     node_id: u32,
     signer_path: String,
-    transaction_json: Value,
+    transaction: Value,
 }
 
 #[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
@@ -1893,7 +1939,8 @@ struct MakeTransactionPackageCallRequest {
     transaction_package_name: String,
     transaction_package_version: Option<EntityVersion>,
     session_entry_point: String,
-    session_args_json: Option<String>,
+    #[serde(alias = "session_args_json")]
+    session_args: Option<Value>,
     signer_path: Option<String>,
     initiator_public_key: Option<String>,
     chain_name: Option<String>,
@@ -1910,7 +1957,8 @@ struct MakeTransactionContractCallRequest {
     node_id: u32,
     transaction_contract_hash: String,
     session_entry_point: String,
-    session_args_json: Option<String>,
+    #[serde(alias = "session_args_json")]
+    session_args: Option<Value>,
     signer_path: Option<String>,
     initiator_public_key: Option<String>,
     chain_name: Option<String>,
@@ -1926,7 +1974,8 @@ struct MakeTransactionSessionWasmRequest {
     network_name: String,
     node_id: u32,
     wasm_path: String,
-    session_args_json: Option<String>,
+    #[serde(alias = "session_args_json")]
+    session_args: Option<Value>,
     is_install_upgrade: Option<bool>,
     signer_path: Option<String>,
     initiator_public_key: Option<String>,
@@ -1944,7 +1993,8 @@ struct SendSessionWasmRequest {
     node_id: u32,
     signer_path: String,
     wasm_path: String,
-    session_args_json: Option<String>,
+    #[serde(alias = "session_args_json")]
+    session_args: Option<Value>,
     chain_name: Option<String>,
     is_install_upgrade: Option<bool>,
     ttl_millis: Option<u64>,
@@ -1977,6 +2027,13 @@ struct WaitTransactionRequest {
     poll_interval_millis: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+struct GetTransactionRequest {
+    network_name: String,
+    node_id: u32,
+    transaction_hash: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct RestStatusProbe {
@@ -1996,18 +2053,24 @@ fn ok_value(value: Value) -> rmcp::model::CallToolResult {
 }
 
 fn parse_transaction_json(value: Value) -> std::result::Result<Transaction, ErrorData> {
+    if let Value::String(encoded) = &value {
+        let _ = encoded;
+        return Err(ErrorData::invalid_params(
+            "invalid transaction payload: encoded JSON strings are not supported. Provide transaction as a typed JSON object",
+            None,
+        ));
+    }
+
     if let Ok(transaction) = serde_json::from_value::<Transaction>(value.clone()) {
         return Ok(transaction);
     }
 
-    if let Some(inner) = value.get("transaction")
-        && let Ok(transaction) = serde_json::from_value::<Transaction>(inner.clone())
-    {
-        return Ok(transaction);
+    if let Some(inner) = value.get("transaction") {
+        return parse_transaction_json(inner.clone());
     }
 
     Err(ErrorData::invalid_params(
-        "failed to parse transaction JSON; expected Transaction or { transaction: Transaction }",
+        "failed to parse transaction JSON; expected Transaction object or { transaction: Transaction }, with typed JSON values only.",
         None,
     ))
 }
@@ -2795,6 +2858,28 @@ fn find_first_height(value: &Value) -> Option<u64> {
     }
 }
 
+fn parse_no_such_block_range_from_error(error_text: &str) -> Option<(u64, u64)> {
+    let start = error_text.find('{')?;
+    let payload = &error_text[start..];
+    let value: Value = serde_json::from_str(payload).ok()?;
+
+    let code = value.get("code").and_then(Value::as_i64)?;
+    let message = value.get("message").and_then(Value::as_str)?;
+    if code != -32001 || !message.eq_ignore_ascii_case("No such block") {
+        return None;
+    }
+
+    let low = value
+        .pointer("/data/available_block_range/low")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let high = value
+        .pointer("/data/available_block_range/high")
+        .and_then(Value::as_u64)
+        .unwrap_or(low);
+    Some((low, high))
+}
+
 async fn read_log_page(path: &Path, before_line: Option<usize>, limit: usize) -> Result<LogPage> {
     let contents = tokio_fs::read_to_string(path)
         .await
@@ -3111,5 +3196,93 @@ mod tests {
         let hash = "2f6fbeebbe1bdf6f8ff05880edfa4e4f79849d2b4f0ecf65482177e4fabc1234";
         let key = parse_query_key(&format!("contract-{}", hash)).unwrap();
         assert_eq!(key, format!("hash-{}", hash));
+    }
+
+    #[test]
+    fn parse_transaction_json_rejects_escaped_string_payload() {
+        let tx_json = json!({
+            "Version1": {
+                "hash": "7eeb092361e31b4cc9885e3621f1470f29631338ecc703643c22da1d38fd81a9",
+                "payload": {
+                    "initiator_addr": {
+                        "PublicKey": "0202f9bae6a6c5a8345c2aa8339b54ff3fcf82d2f6a9cce1732e765c2cc403b3be9f"
+                    },
+                    "timestamp": "2026-02-27T18:03:18.541Z",
+                    "ttl": "30m",
+                    "chain_name": "casper-devnet",
+                    "pricing_mode": {
+                        "PaymentLimited": {
+                            "payment_amount": 100000000000u64,
+                            "gas_price_tolerance": 5,
+                            "standard_payment": true
+                        }
+                    },
+                    "fields": {
+                        "args": {"Named": []},
+                        "entry_point": {"Custom": "counter_inc"},
+                        "scheduling": "Standard",
+                        "target": {
+                            "Stored": {
+                                "id": {
+                                    "ByPackageName": {
+                                        "name": "counter_package_name",
+                                        "version": null
+                                    }
+                                },
+                                "runtime": "VmCasperV1"
+                            }
+                        }
+                    }
+                },
+                "approvals": [{
+                    "signer": "0202f9bae6a6c5a8345c2aa8339b54ff3fcf82d2f6a9cce1732e765c2cc403b3be9f",
+                    "signature": "02c64336e5ed2832bdb84adb3f334d585548ee096066aa9d0797c11ab3f074ec9d7bd396994bc9b9c239342be801bc385a9c5083779bace4dfe0b400d4a13c07db"
+                }]
+            }
+        });
+        let direct = parse_transaction_json(tx_json.clone()).unwrap();
+        let wrapped = parse_transaction_json(json!({ "transaction": tx_json })).unwrap();
+        let encoded = serde_json::to_string(&direct).unwrap();
+        let from_string_err = parse_transaction_json(Value::String(encoded.clone()));
+        let wrapped_string_err = parse_transaction_json(json!({
+            "transaction": encoded
+        }));
+
+        assert_eq!(
+            direct.hash().to_hex_string(),
+            wrapped.hash().to_hex_string()
+        );
+        assert!(from_string_err.is_err());
+        assert!(wrapped_string_err.is_err());
+    }
+
+    #[test]
+    fn parse_no_such_block_range_from_error_extracts_bounds() {
+        let error = "casper client error: response for rpc-id 1 chain_get_block is json-rpc error: {\"code\":-32001,\"message\":\"No such block\",\"data\":{\"message\":\"no block found for the provided identifier\",\"available_block_range\":{\"low\":0,\"high\":0}}}";
+        let range = parse_no_such_block_range_from_error(error).unwrap();
+        assert_eq!(range, (0, 0));
+    }
+
+    #[test]
+    fn send_transaction_signed_request_requires_transaction_field() {
+        let payload = json!({
+            "network_name": "casper-devnet",
+            "node_id": 1,
+            "signer_path": "m/44'/506'/0'/0/100",
+            "transaction": { "Version1": { "hash": "abc" } }
+        });
+        let request: SendTransactionSignedRequest = serde_json::from_value(payload).unwrap();
+        assert!(request.transaction.get("Version1").is_some());
+
+        let legacy_payload = json!({
+            "network_name": "casper-devnet",
+            "node_id": 1,
+            "signer_path": "m/44'/506'/0'/0/100",
+            "transaction_json": { "Version1": { "hash": "def" } }
+        });
+        let legacy_err = serde_json::from_value::<SendTransactionSignedRequest>(legacy_payload)
+            .unwrap_err()
+            .to_string();
+        assert!(legacy_err.contains("missing field `transaction`"));
     }
 }

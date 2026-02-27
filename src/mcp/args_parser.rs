@@ -16,25 +16,45 @@ struct SessionArgInput {
     value: Value,
 }
 
-pub(super) fn parse_session_args_json(input: &str) -> Result<Option<RuntimeArgs>> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Ok(None);
-    }
+pub(super) fn parse_session_args(input: &Value) -> Result<Option<RuntimeArgs>> {
+    let json_value = match input {
+        Value::Null => return Ok(None),
+        Value::String(_) => {
+            return Err(anyhow!(
+                "invalid session_args payload: encoded JSON strings are not supported. Pass typed JSON directly as array [{{\"name\":\"arg\",\"type\":\"I32\",\"value\":\"1\"}}] or RuntimeArgs object"
+            ));
+        }
+        other => other.clone(),
+    };
 
-    if let Ok(runtime_args) = serde_json::from_str::<RuntimeArgs>(input) {
+    if let Ok(runtime_args) = serde_json::from_value::<RuntimeArgs>(json_value.clone()) {
         return Ok(Some(runtime_args));
     }
 
-    let args = serde_json::from_str::<Vec<SessionArgInput>>(input)
-        .map_err(|err| anyhow!("invalid session_args_json: {}", err))?;
-    let mut runtime_args = RuntimeArgs::new();
-    for arg in args {
-        let cl_value = parse_session_cl_value(&arg.arg_type, arg.value)
-            .with_context(|| format!("invalid session arg '{}'", arg.name))?;
-        runtime_args.insert_cl_value(arg.name, cl_value);
+    match json_value {
+        Value::Array(entries) => {
+            let args = serde_json::from_value::<Vec<SessionArgInput>>(Value::Array(entries))
+                .map_err(|err| {
+                    anyhow!(
+                        "invalid session_args: array entries must be objects {{name,type,value}}; {}. Example: [{{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}}]",
+                        err
+                    )
+                })?;
+            let mut runtime_args = RuntimeArgs::new();
+            for arg in args {
+                let cl_value = parse_session_cl_value(&arg.arg_type, arg.value)
+                    .with_context(|| format!("invalid session arg '{}'", arg.name))?;
+                runtime_args.insert_cl_value(arg.name, cl_value);
+            }
+            Ok(Some(runtime_args))
+        }
+        Value::Object(_) => Err(anyhow!(
+            "invalid session_args: object shorthand is not supported (for example {{\"value\":1}}). Use array format [{{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}}] or full RuntimeArgs JSON object"
+        )),
+        _ => Err(anyhow!(
+            "invalid session_args: expected JSON array [{{\"name\":\"arg\",\"type\":\"I32\",\"value\":\"1\"}}] or full RuntimeArgs JSON object"
+        )),
     }
-    Ok(Some(runtime_args))
 }
 
 fn parse_session_cl_value(arg_type: &str, value: Value) -> Result<CLValue> {
@@ -1044,14 +1064,18 @@ fn consume_from_bytes<T: FromBytes>(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_session_args_json;
+    use super::parse_session_args;
     use casper_types::bytesrepr::ToBytes;
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     #[test]
-    fn parse_session_args_json_common_types() {
-        let input = r#"[{"name":"count","type":"U64","value":"7"},{"name":"enabled","type":"Bool","value":true}]"#;
-        let args = parse_session_args_json(input).unwrap().unwrap();
+    fn parse_session_args_common_types() {
+        let input = json!([
+            {"name":"count","type":"U64","value":"7"},
+            {"name":"enabled","type":"Bool","value":true}
+        ]);
+        let args = parse_session_args(&input).unwrap().unwrap();
         let count = args.get("count").unwrap().clone().into_t::<u64>().unwrap();
         let enabled = args
             .get("enabled")
@@ -1064,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_args_json_supports_nested_cltypes_with_hex() {
+    fn parse_session_args_supports_nested_cltypes_with_hex() {
         let list_hex = {
             let bytes = vec![1u64, 2u64, 3u64].to_bytes().unwrap();
             format!(
@@ -1087,11 +1111,11 @@ mod tests {
                     .collect::<String>()
             )
         };
-        let input = format!(
-            r#"[{{"name":"items","type":"List<U64>","value":"{}"}},{{"name":"lookup","type":"Map<String,U64>","value":"{}"}}]"#,
-            list_hex, map_hex
-        );
-        let args = parse_session_args_json(&input).unwrap().unwrap();
+        let input = json!([
+            {"name":"items","type":"List<U64>","value":list_hex},
+            {"name":"lookup","type":"Map<String,U64>","value":map_hex}
+        ]);
+        let args = parse_session_args(&input).unwrap().unwrap();
         let items = args
             .get("items")
             .unwrap()
@@ -1109,9 +1133,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_args_json_supports_option_none_and_aliases() {
-        let input = r#"[{"name":"maybe_count","type":"Option<U64>","value":null},{"name":"account","type":"account_hash","value":"0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}]"#;
-        let args = parse_session_args_json(input).unwrap().unwrap();
+    fn parse_session_args_supports_option_none_and_aliases() {
+        let input = json!([
+            {"name":"maybe_count","type":"Option<U64>","value":null},
+            {"name":"account","type":"account_hash","value":"0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}
+        ]);
+        let args = parse_session_args(&input).unwrap().unwrap();
         let maybe_count = args
             .get("maybe_count")
             .unwrap()
@@ -1127,5 +1154,30 @@ mod tests {
         assert_eq!(maybe_count, None);
         assert_eq!(account[0], 0x00);
         assert_eq!(account[31], 0x1f);
+    }
+
+    #[test]
+    fn parse_session_args_rejects_object_shorthand_with_guidance() {
+        let err = parse_session_args(&json!({"value":1}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("object shorthand is not supported"));
+        assert!(err.contains("{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}"));
+    }
+
+    #[test]
+    fn parse_session_args_rejects_casper_client_style_strings_with_guidance() {
+        let err = parse_session_args(&json!(["value:i32=1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("array entries must be objects"));
+        assert!(err.contains("{\"name\":\"value\",\"type\":\"I32\",\"value\":\"1\"}"));
+    }
+
+    #[test]
+    fn parse_session_args_rejects_json_string_payload() {
+        let input = json!(r#"[{"name":"count","type":"U64","value":"7"}]"#);
+        let err = parse_session_args(&input).unwrap_err().to_string();
+        assert!(err.contains("encoded JSON strings are not supported"));
     }
 }

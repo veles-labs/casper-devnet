@@ -52,7 +52,9 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - Prefer concise user-facing logs.
 - Default target for assets is the build target (from `build.rs`).
 - For network interactions, do **not** use `casper_client` directly; use `veles_casper_rust_sdk::jsonrpc::CasperClient` instead.
-- For MCP transaction construction, do **not** shell out to `casper-client` CLI binaries; use MCP constructor tools and pass `session_args_json` with full CLType strings (`Option<List<U512>>`, `Map<String,U64>`, tuples, `ByteArray[32]`, etc.). Composite values should be provided as hex bytes (`0x...`), while scalar values may be strings/numbers/bools (and `null` for `Option<T>` None).
+- For MCP transaction construction, do **not** shell out to `casper-client` CLI binaries; use MCP constructor tools and pass `session_args` as structured JSON (not escaped text), using either full `RuntimeArgs` JSON or an array of `{name,type,value}` objects (example: `[{"name":"value","type":"I32","value":"1"}]`). Composite values (`List`, `Map`, tuples, `Result`, `ByteArray`) should use hex bytes (`0x...`). Do not use object shorthand (`{"value":1}`) or casper-client string-arg syntax (`["value:i32=1"]`). Legacy `session_args_json` is accepted only for compatibility.
+- For `send_transaction_signed`, provide `transaction` as typed JSON (`transaction: {...}`); encoded JSON strings are not supported, and `transaction_json` is not accepted.
+- Do not use `curl` for JSON-RPC transaction lookups; use MCP `get_transaction` (single fetch) or `wait_transaction` (poll-until-executed) tools instead.
 - Keep `README.md` updated with CLI defaults/flags whenever code changes.
 - Before finishing a task, run `cargo clippy --all --all-targets --all-features --tests` only if any `.rs` code is changed, and report failures.
 - Update `CHANGELOG.md` for user-facing changes; list them under `[Unreleased]` in the appropriate section.

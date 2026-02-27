@@ -11,6 +11,7 @@ Semantic Versioning.
 - Add `casper-devnet mcp` command with MCP server transports (`stdio`, `http`, `both`), default HTTP endpoint `127.0.0.1:32100/mcp`, and multi-network runtime management.
 - Add MCP tools for network lifecycle (`spawn_network`, `wait_network_ready`, `despawn_network`, `list_networks`), managed process inspection (`managed_processes`), RPC/status/block queries, log pagination, SSE wait/history, derived account listing, transaction submission/signing, token transfers, session wasm submission, and transaction execution waiting.
 - Add make-transaction-style MCP constructor tools: `make_transaction_package_call`, `make_transaction_contract_call`, and `make_transaction_session_wasm`, producing signed or unsigned transaction JSON for `send_transaction_signed`.
+- Add `get_transaction` MCP tool for direct typed `info_get_transaction` lookups without external `curl`.
 - Add per-network SSE collection with sequence-based history and filtering.
 - Add deterministic seed/path derivation helper API in `assets` for MCP signing workflows.
 
@@ -22,8 +23,14 @@ Semantic Versioning.
 - Add Codex CLI stdio MCP configuration examples (TOML and `codex mcp add`) to README, with a Claude CLI note.
 - Refactor MCP RPC/transaction paths to use `veles_casper_rust_sdk::jsonrpc::CasperClient`
   instead of direct `casper_client` usage in `mcp.rs`.
-- Expand `session_args_json` parsing in MCP transaction tools to full CLType support
+- Expand transaction argument parsing in MCP transaction tools to full CLType support
   (including nested CLTypes and aliases), with strict value parsing by declared type.
+- Clarify MCP transaction tool documentation with explicit `session_args` examples and unsupported formats.
+- Change MCP transaction request schema to use `session_args` as the primary field name,
+  accepting structured JSON values directly (array/object), while still accepting legacy
+  `session_args_json` payloads for compatibility.
+- Change `send_transaction_signed` request schema to require `transaction` as the
+  field name (typed JSON object).
 
 ### Deprecated
 
@@ -34,6 +41,11 @@ Semantic Versioning.
   version mismatches by warning and continuing with the directory version.
 - Make `rpc_query_global_state` fall back to the latest block hash when
   `block_id` and `state_root_hash` are not provided.
+- Improve `session_args` validation errors to clearly explain expected array/object formats and common invalid inputs.
+- Enforce typed JSON-only payloads for `send_transaction_signed` transaction body:
+  encoded JSON strings are rejected and `transaction_json` is not accepted.
+- Make `current_block_height` return a pending response (with available block range)
+  instead of failing when latest block is temporarily unavailable.
 
 ### Security
 
