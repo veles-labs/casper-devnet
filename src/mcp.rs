@@ -4,10 +4,10 @@ use crate::state::{ProcessKind, ProcessStatus, STATE_FILE_NAME, State};
 use anyhow::{Context, Result, anyhow};
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
-use casper_client::cli;
 use casper_types::{
-    AsymmetricType, PricingMode, PublicKey, SecretKey, TimeDiff, Transaction,
-    TransactionRuntimeParams,
+    AsymmetricType, CLValue, Digest, Key, PricingMode, PublicKey, RuntimeArgs, SecretKey,
+    TimeDiff, Transaction, TransactionHash, TransactionRuntimeParams, TransactionV1Hash, U128,
+    U256, U512, URef,
 };
 use clap::{Args, ValueEnum};
 use futures::StreamExt;
@@ -34,6 +34,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex, Notify};
+use veles_casper_rust_sdk::TransactionV1Builder;
+use veles_casper_rust_sdk::jsonrpc::CasperClient;
 use veles_casper_rust_sdk::sse::event::SseEvent;
 use veles_casper_rust_sdk::sse::{self, config::ListenerConfig};
 
@@ -230,26 +232,21 @@ impl McpServer {
             .map_err(to_mcp_error)?;
         ensure_running_network(&network).await?;
 
-        let block_id = request.block_id.unwrap_or_default();
-        let state_root_hash = request.state_root_hash.unwrap_or_default();
-        let endpoint = assets::rpc_endpoint(request.node_id);
-        let response = cli::query_balance(
-            "",
-            &endpoint,
-            0,
-            &block_id,
-            &state_root_hash,
-            &request.purse_identifier,
-        )
-        .await
-        .map_err(to_mcp_error)?;
-        Ok(ok_value(
-            serde_json::to_value(response.result).map_err(internal_serde_error)?,
-        ))
+        let block_id = normalize_optional_identifier(request.block_id.as_deref());
+        let state_root_hash = normalize_optional_identifier(request.state_root_hash.as_deref());
+        let params =
+            build_query_balance_params(&request.purse_identifier, &block_id, &state_root_hash)
+                .map_err(to_mcp_error)?;
+        let response = self
+            .manager
+            .raw_rpc_query(request.node_id, "query_balance", Some(params))
+            .await
+            .map_err(to_mcp_error)?;
+        Ok(ok_value(extract_rpc_result(response).map_err(to_mcp_error)?))
     }
 
     #[tool(
-        description = "Typed global state query by key + optional path + optional block/state-root identifier."
+        description = "Typed global state query by key + optional path + optional block/state-root identifier. If no identifier is provided, the latest block hash is used."
     )]
     async fn rpc_query_global_state(
         &self,
@@ -262,26 +259,28 @@ impl McpServer {
             .map_err(to_mcp_error)?;
         ensure_running_network(&network).await?;
 
-        let block_id = request.block_id.unwrap_or_default();
-        let state_root_hash = request.state_root_hash.unwrap_or_default();
-        let path = request.path.unwrap_or_default().join("/");
-
-        let endpoint = assets::rpc_endpoint(request.node_id);
-        let response = cli::query_global_state(
-            "",
-            &endpoint,
-            0,
-            &block_id,
-            &state_root_hash,
-            &request.key,
-            &path,
+        let (block_id, state_root_hash) = resolve_global_state_identifier(
+            &request.network_name,
+            request.node_id,
+            request.block_id.as_deref(),
+            request.state_root_hash.as_deref(),
         )
         .await
         .map_err(to_mcp_error)?;
+        let params = build_query_global_state_params(
+            &request.key,
+            request.path.unwrap_or_default(),
+            &block_id,
+            &state_root_hash,
+        )
+        .map_err(to_mcp_error)?;
+        let response = self
+            .manager
+            .raw_rpc_query(request.node_id, "query_global_state", Some(params))
+            .await
+            .map_err(to_mcp_error)?;
 
-        Ok(ok_value(
-            serde_json::to_value(response.result).map_err(internal_serde_error)?,
-        ))
+        Ok(ok_value(extract_rpc_result(response).map_err(to_mcp_error)?))
     }
 
     #[tool(description = "Get current block height using typed chain_get_block RPC.")]
@@ -296,12 +295,14 @@ impl McpServer {
             .map_err(to_mcp_error)?;
         ensure_running_network(&network).await?;
 
-        let endpoint = assets::rpc_endpoint(request.node_id);
-        let block_id = request.block_id.unwrap_or_default();
-        let response = cli::get_block("", &endpoint, 0, &block_id)
-            .await
-            .map_err(to_mcp_error)?;
-        let value = serde_json::to_value(response.result).map_err(internal_serde_error)?;
+        let value = fetch_block_result(
+            &self.manager,
+            &request.network_name,
+            request.node_id,
+            request.block_id.as_deref(),
+        )
+        .await
+        .map_err(to_mcp_error)?;
         let height = extract_block_height(&value).ok_or_else(|| {
             ErrorData::internal_error("missing block height in RPC response", None)
         })?;
@@ -326,14 +327,15 @@ impl McpServer {
             .map_err(to_mcp_error)?;
         ensure_running_network(&network).await?;
 
-        let endpoint = assets::rpc_endpoint(request.node_id);
-        let block_id = request.block_id.unwrap_or_default();
-        let response = cli::get_block("", &endpoint, 0, &block_id)
-            .await
-            .map_err(to_mcp_error)?;
-        Ok(ok_value(
-            serde_json::to_value(response.result).map_err(internal_serde_error)?,
-        ))
+        let value = fetch_block_result(
+            &self.manager,
+            &request.network_name,
+            request.node_id,
+            request.block_id.as_deref(),
+        )
+        .await
+        .map_err(to_mcp_error)?;
+        Ok(ok_value(value))
     }
 
     #[tool(description = "Get paginated node stdout/stderr logs from on-disk files.")]
@@ -484,20 +486,13 @@ impl McpServer {
         let mut transaction = parse_transaction_json(request.transaction_json)?;
         transaction.sign(&signer.secret_key);
 
-        let endpoint = assets::rpc_endpoint(request.node_id);
-        let response = casper_client::put_transaction(
-            casper_client::JsonRpcId::Number(1),
-            &endpoint,
-            casper_client::Verbosity::Low,
-            transaction,
-        )
-        .await
-        .map_err(to_mcp_error)?;
+        let rpc = mcp_rpc_client(&request.network_name, request.node_id).map_err(to_mcp_error)?;
+        let response = rpc.put_transaction(transaction).await.map_err(to_mcp_error)?;
 
         Ok(ok_value(json!({
             "network_name": request.network_name,
             "node_id": request.node_id,
-            "transaction_hash": response.result.transaction_hash.to_hex_string(),
+            "transaction_hash": response.transaction_hash.to_hex_string(),
         })))
     }
 
@@ -544,7 +539,7 @@ impl McpServer {
             }
         };
 
-        let mut builder = cli::TransactionV1Builder::new_session(
+        let mut builder = TransactionV1Builder::new_session(
             request.is_install_upgrade.unwrap_or(true),
             wasm_bytes.into(),
             runtime,
@@ -552,7 +547,7 @@ impl McpServer {
 
         if let Some(args_json) = request.session_args_json.as_deref()
             && let Some(runtime_args) =
-                cli::arg_json_session_parse(args_json).map_err(to_mcp_error)?
+                parse_session_args_json(args_json).map_err(to_mcp_error)?
         {
             builder = builder.with_runtime_args(runtime_args);
         }
@@ -569,7 +564,7 @@ impl McpServer {
 
         let chain_name = match request.chain_name {
             Some(value) => value,
-            None => fetch_chain_name(request.node_id)
+            None => fetch_chain_name(&request.network_name, request.node_id)
                 .await
                 .map_err(to_mcp_error)?,
         };
@@ -580,20 +575,16 @@ impl McpServer {
             .build()
             .map_err(to_mcp_error)?;
 
-        let endpoint = assets::rpc_endpoint(request.node_id);
-        let response = casper_client::put_transaction(
-            casper_client::JsonRpcId::Number(1),
-            &endpoint,
-            casper_client::Verbosity::Low,
-            Transaction::V1(tx),
-        )
-        .await
-        .map_err(to_mcp_error)?;
+        let rpc = mcp_rpc_client(&request.network_name, request.node_id).map_err(to_mcp_error)?;
+        let response = rpc
+            .put_transaction(Transaction::V1(tx))
+            .await
+            .map_err(to_mcp_error)?;
 
         Ok(ok_value(json!({
             "network_name": request.network_name,
             "node_id": request.node_id,
-            "transaction_hash": response.result.transaction_hash.to_hex_string(),
+            "transaction_hash": response.transaction_hash.to_hex_string(),
         })))
     }
 
@@ -636,7 +627,7 @@ impl McpServer {
             .with_context(|| "failed to parse derived recipient public key")
             .map_err(to_mcp_error)?;
 
-        let mut builder = cli::TransactionV1Builder::new_transfer(
+        let mut builder = TransactionV1Builder::new_transfer(
             amount,
             None,
             to_public_key,
@@ -656,7 +647,7 @@ impl McpServer {
 
         let chain_name = match request.chain_name {
             Some(value) => value,
-            None => fetch_chain_name(request.node_id)
+            None => fetch_chain_name(&request.network_name, request.node_id)
                 .await
                 .map_err(to_mcp_error)?,
         };
@@ -667,20 +658,16 @@ impl McpServer {
             .build()
             .map_err(to_mcp_error)?;
 
-        let endpoint = assets::rpc_endpoint(request.node_id);
-        let response = casper_client::put_transaction(
-            casper_client::JsonRpcId::Number(1),
-            &endpoint,
-            casper_client::Verbosity::Low,
-            Transaction::V1(tx),
-        )
-        .await
-        .map_err(to_mcp_error)?;
+        let rpc = mcp_rpc_client(&request.network_name, request.node_id).map_err(to_mcp_error)?;
+        let response = rpc
+            .put_transaction(Transaction::V1(tx))
+            .await
+            .map_err(to_mcp_error)?;
 
         Ok(ok_value(json!({
             "network_name": request.network_name,
             "node_id": request.node_id,
-            "transaction_hash": response.result.transaction_hash.to_hex_string(),
+            "transaction_hash": response.transaction_hash.to_hex_string(),
             "from_path": request.from_path,
             "to_path": request.to_path,
             "amount": request.amount,
@@ -703,21 +690,19 @@ impl McpServer {
 
         let timeout = Duration::from_secs(request.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECS));
         let poll = Duration::from_millis(request.poll_interval_millis.unwrap_or(1_000));
-        let endpoint = assets::rpc_endpoint(request.node_id);
         let tx_hash =
-            normalize_transaction_hash_input(&request.transaction_hash).map_err(to_mcp_error)?;
+            parse_transaction_hash_input(&request.transaction_hash).map_err(to_mcp_error)?;
+        let rpc = mcp_rpc_client(&request.network_name, request.node_id).map_err(to_mcp_error)?;
         let deadline = Instant::now() + timeout;
 
         loop {
-            let response = cli::get_transaction("", &endpoint, 0, &tx_hash, false)
-                .await
-                .map_err(to_mcp_error)?;
+            let response = rpc.get_transaction(tx_hash).await.map_err(to_mcp_error)?;
 
-            if let Some(exec_info) = response.result.execution_info.clone()
+            if let Some(exec_info) = response.execution_info.clone()
                 && exec_info.execution_result.is_some()
             {
                 return Ok(ok_value(
-                    serde_json::to_value(response.result).map_err(internal_serde_error)?,
+                    serde_json::to_value(response).map_err(internal_serde_error)?,
                 ));
             }
 
@@ -1652,7 +1637,7 @@ fn parse_transaction_json(value: Value) -> std::result::Result<Transaction, Erro
     ))
 }
 
-fn normalize_transaction_hash_input(input: &str) -> Result<String> {
+fn parse_transaction_hash_input(input: &str) -> Result<TransactionHash> {
     let value = input.trim();
     if value.is_empty() {
         return Err(anyhow!("transaction_hash must not be empty"));
@@ -1674,10 +1659,357 @@ fn normalize_transaction_hash_input(input: &str) -> Result<String> {
         ));
     }
 
-    Ok(unwrapped
-        .strip_prefix("0x")
-        .unwrap_or(unwrapped)
-        .to_string())
+    let normalized = unwrapped.strip_prefix("0x").unwrap_or(unwrapped);
+    let digest = Digest::from_hex(normalized)
+        .map_err(|err| anyhow!("failed to parse transaction hash digest: {}", err))?;
+    Ok(TransactionHash::from(TransactionV1Hash::from(digest)))
+}
+
+fn mcp_rpc_client(network_name: &str, node_id: u32) -> Result<CasperClient> {
+    CasperClient::new(network_name.to_string(), vec![assets::rpc_endpoint(node_id)])
+        .map_err(|err| anyhow!("failed to initialize rpc client for node {}: {}", node_id, err))
+}
+
+fn extract_rpc_result(response: Value) -> Result<Value> {
+    if let Some(error) = response.get("error") {
+        return Err(anyhow!("rpc request failed: {}", error));
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow!("rpc response missing result field"))
+}
+
+async fn fetch_block_result(
+    manager: &NetworkManager,
+    network_name: &str,
+    node_id: u32,
+    block_id: Option<&str>,
+) -> Result<Value> {
+    let block_id = normalize_optional_identifier(block_id);
+    if block_id.is_empty() {
+        let rpc = mcp_rpc_client(network_name, node_id)?;
+        let result = rpc.get_block().await?;
+        return serde_json::to_value(result).map_err(Into::into);
+    }
+
+    let block_identifier = parse_block_identifier_value(&block_id)?;
+    let response = manager
+        .raw_rpc_query(
+            node_id,
+            "chain_get_block",
+            Some(json!({
+                "block_identifier": block_identifier
+            })),
+        )
+        .await?;
+    extract_rpc_result(response)
+}
+
+fn build_query_global_state_params(
+    key: &str,
+    path: Vec<String>,
+    block_id: &str,
+    state_root_hash: &str,
+) -> Result<Value> {
+    let key = parse_query_key(key)?;
+    let state_identifier = parse_state_identifier(block_id, state_root_hash)?;
+    let mut params = serde_json::Map::new();
+    params.insert("key".to_string(), Value::String(key));
+    params.insert(
+        "path".to_string(),
+        Value::Array(path.into_iter().map(Value::String).collect()),
+    );
+    if let Some(state_identifier) = state_identifier {
+        params.insert("state_identifier".to_string(), state_identifier);
+    }
+    Ok(Value::Object(params))
+}
+
+fn build_query_balance_params(
+    purse_identifier: &str,
+    block_id: &str,
+    state_root_hash: &str,
+) -> Result<Value> {
+    let purse_identifier = parse_purse_identifier(purse_identifier)?;
+    let state_identifier = parse_state_identifier(block_id, state_root_hash)?;
+    let mut params = serde_json::Map::new();
+    params.insert("purse_identifier".to_string(), purse_identifier);
+    if let Some(state_identifier) = state_identifier {
+        params.insert("state_identifier".to_string(), state_identifier);
+    }
+    Ok(Value::Object(params))
+}
+
+fn parse_state_identifier(block_id: &str, state_root_hash: &str) -> Result<Option<Value>> {
+    let block_id = block_id.trim();
+    if !block_id.is_empty() {
+        if block_id.len() == Digest::LENGTH * 2 {
+            Digest::from_hex(block_id)
+                .map_err(|err| anyhow!("invalid block hash digest in block_id: {}", err))?;
+            return Ok(Some(json!({
+                "BlockHash": block_id,
+            })));
+        }
+
+        let height = block_id
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid block height in block_id: {}", err))?;
+        return Ok(Some(json!({
+            "BlockHeight": height,
+        })));
+    }
+
+    let state_root_hash = state_root_hash.trim();
+    if state_root_hash.is_empty() {
+        return Ok(None);
+    }
+    Digest::from_hex(state_root_hash)
+        .map_err(|err| anyhow!("invalid state_root_hash digest: {}", err))?;
+    Ok(Some(json!({
+        "StateRootHash": state_root_hash,
+    })))
+}
+
+fn parse_block_identifier_value(block_id: &str) -> Result<Value> {
+    let block_id = block_id.trim();
+    if block_id.is_empty() {
+        return Err(anyhow!("block identifier must not be empty"));
+    }
+    if block_id.len() == Digest::LENGTH * 2 {
+        Digest::from_hex(block_id)
+            .map_err(|err| anyhow!("invalid block hash digest in block_id: {}", err))?;
+        Ok(json!({
+            "Hash": block_id,
+        }))
+    } else {
+        let height = block_id
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid block height in block_id: {}", err))?;
+        Ok(json!({
+            "Height": height,
+        }))
+    }
+}
+
+fn parse_query_key(key: &str) -> Result<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("key must not be empty"));
+    }
+    if let Ok(parsed) = Key::from_formatted_str(key) {
+        return Ok(parsed.to_formatted_string());
+    }
+    if let Ok(public_key) = PublicKey::from_hex(key) {
+        return Ok(Key::Account(public_key.to_account_hash()).to_formatted_string());
+    }
+    Err(anyhow!(
+        "failed to parse key for query; expected formatted Key or public key hex"
+    ))
+}
+
+fn parse_purse_identifier(input: &str) -> Result<Value> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(anyhow!("purse_identifier must not be empty"));
+    }
+
+    if input.starts_with("account-hash-") {
+        casper_types::account::AccountHash::from_formatted_str(input)
+            .map_err(|err| anyhow!("invalid account hash purse identifier: {}", err))?;
+        return Ok(json!({
+            "main_purse_under_account_hash": input,
+        }));
+    }
+
+    if input.starts_with("entity-") {
+        return Ok(json!({
+            "main_purse_under_entity_addr": input,
+        }));
+    }
+
+    if input.starts_with("uref-") {
+        URef::from_formatted_str(input)
+            .map_err(|err| anyhow!("invalid uref purse identifier: {}", err))?;
+        return Ok(json!({
+            "purse_uref": input,
+        }));
+    }
+
+    let public_key = PublicKey::from_hex(input)
+        .map_err(|err| anyhow!("invalid public key purse identifier: {}", err))?;
+    Ok(json!({
+        "main_purse_under_public_key": public_key.to_hex_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionArgInput {
+    name: String,
+    #[serde(rename = "type")]
+    arg_type: String,
+    value: Value,
+}
+
+fn parse_session_args_json(input: &str) -> Result<Option<RuntimeArgs>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+
+    if let Ok(runtime_args) = serde_json::from_str::<RuntimeArgs>(input) {
+        return Ok(Some(runtime_args));
+    }
+
+    let args = serde_json::from_str::<Vec<SessionArgInput>>(input)
+        .map_err(|err| anyhow!("invalid session_args_json: {}", err))?;
+    let mut runtime_args = RuntimeArgs::new();
+    for arg in args {
+        let cl_value = parse_session_cl_value(&arg.arg_type, arg.value)
+            .with_context(|| format!("invalid session arg '{}'", arg.name))?;
+        runtime_args.insert_cl_value(arg.name, cl_value);
+    }
+    Ok(Some(runtime_args))
+}
+
+fn parse_session_cl_value(arg_type: &str, value: Value) -> Result<CLValue> {
+    let normalized = arg_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "bool" => cl_value_from_t(value_as_bool(&value, arg_type)?),
+        "i32" => cl_value_from_t(value_as_i32(&value, arg_type)?),
+        "i64" => cl_value_from_t(value_as_i64(&value, arg_type)?),
+        "u8" => cl_value_from_t(value_as_u8(&value, arg_type)?),
+        "u32" => cl_value_from_t(value_as_u32(&value, arg_type)?),
+        "u64" => cl_value_from_t(value_as_u64(&value, arg_type)?),
+        "u128" => cl_value_from_t(
+            U128::from_dec_str(&value_as_numeric_string(&value, arg_type)?)
+                .map_err(|err| anyhow!("invalid U128 value: {}", err))?,
+        ),
+        "u256" => cl_value_from_t(
+            U256::from_dec_str(&value_as_numeric_string(&value, arg_type)?)
+                .map_err(|err| anyhow!("invalid U256 value: {}", err))?,
+        ),
+        "u512" => cl_value_from_t(
+            U512::from_dec_str(&value_as_numeric_string(&value, arg_type)?)
+                .map_err(|err| anyhow!("invalid U512 value: {}", err))?,
+        ),
+        "string" => cl_value_from_t(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?
+                .to_string(),
+        ),
+        "key" => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?;
+            cl_value_from_t(
+                Key::from_formatted_str(value)
+                    .map_err(|err| anyhow!("invalid Key formatted string: {}", err))?,
+            )
+        }
+        "publickey" => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?;
+            cl_value_from_t(
+                PublicKey::from_hex(value)
+                    .map_err(|err| anyhow!("invalid PublicKey hex string: {}", err))?,
+            )
+        }
+        "uref" => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} value must be a JSON string", arg_type))?;
+            cl_value_from_t(
+                URef::from_formatted_str(value)
+                    .map_err(|err| anyhow!("invalid URef formatted string: {}", err))?,
+            )
+        }
+        _ => Err(anyhow!(
+            "unsupported session arg type '{}'; provide RuntimeArgs JSON for advanced CL types",
+            arg_type
+        )),
+    }
+}
+
+fn cl_value_from_t<T: casper_types::CLTyped + casper_types::bytesrepr::ToBytes>(
+    value: T,
+) -> Result<CLValue> {
+    CLValue::from_t(value).map_err(|err| anyhow!("failed to convert value to CLValue: {:?}", err))
+}
+
+fn value_as_numeric_string(value: &Value, arg_type: &str) -> Result<String> {
+    match value {
+        Value::String(v) => Ok(v.to_string()),
+        Value::Number(v) => Ok(v.to_string()),
+        _ => Err(anyhow!(
+            "{} value must be a JSON string or number",
+            arg_type
+        )),
+    }
+}
+
+fn value_as_bool(value: &Value, arg_type: &str) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow!("{} value must be a JSON bool", arg_type))
+}
+
+fn value_as_i32(value: &Value, arg_type: &str) -> Result<i32> {
+    if let Some(number) = value.as_i64() {
+        return i32::try_from(number)
+            .map_err(|_| anyhow!("{} value is out of i32 range", arg_type));
+    }
+    if let Some(text) = value.as_str() {
+        return text
+            .parse::<i32>()
+            .map_err(|err| anyhow!("invalid {} value: {}", arg_type, err));
+    }
+    Err(anyhow!(
+        "{} value must be a JSON string or integer",
+        arg_type
+    ))
+}
+
+fn value_as_i64(value: &Value, arg_type: &str) -> Result<i64> {
+    if let Some(number) = value.as_i64() {
+        return Ok(number);
+    }
+    if let Some(text) = value.as_str() {
+        return text
+            .parse::<i64>()
+            .map_err(|err| anyhow!("invalid {} value: {}", arg_type, err));
+    }
+    Err(anyhow!(
+        "{} value must be a JSON string or integer",
+        arg_type
+    ))
+}
+
+fn value_as_u8(value: &Value, arg_type: &str) -> Result<u8> {
+    let value = value_as_u64(value, arg_type)?;
+    u8::try_from(value).map_err(|_| anyhow!("{} value is out of u8 range", arg_type))
+}
+
+fn value_as_u32(value: &Value, arg_type: &str) -> Result<u32> {
+    let value = value_as_u64(value, arg_type)?;
+    u32::try_from(value).map_err(|_| anyhow!("{} value is out of u32 range", arg_type))
+}
+
+fn value_as_u64(value: &Value, arg_type: &str) -> Result<u64> {
+    if let Some(number) = value.as_u64() {
+        return Ok(number);
+    }
+    if let Some(text) = value.as_str() {
+        return text
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid {} value: {}", arg_type, err));
+    }
+    Err(anyhow!(
+        "{} value must be a JSON string or unsigned integer",
+        arg_type
+    ))
 }
 
 fn build_pricing_mode(gas_price_tolerance: Option<u8>, payment_amount: Option<u64>) -> PricingMode {
@@ -1713,6 +2045,32 @@ fn parse_optional_seed_hex(seed: Option<&str>) -> Result<Option<[u8; 32]>> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Ok(Some(out))
+}
+
+fn normalize_optional_identifier(value: Option<&str>) -> String {
+    value.map(str::trim).unwrap_or_default().to_string()
+}
+
+async fn resolve_global_state_identifier(
+    network_name: &str,
+    node_id: u32,
+    block_id: Option<&str>,
+    state_root_hash: Option<&str>,
+) -> Result<(String, String)> {
+    let block_id = normalize_optional_identifier(block_id);
+    let state_root_hash = normalize_optional_identifier(state_root_hash);
+
+    if !block_id.is_empty() || !state_root_hash.is_empty() {
+        return Ok((block_id, state_root_hash));
+    }
+
+    let rpc = mcp_rpc_client(network_name, node_id)?;
+    let response = rpc.get_block().await?;
+    let latest_block = response
+        .block_with_signatures
+        .ok_or_else(|| anyhow!("latest block was not returned by chain_get_block"))?;
+
+    Ok((latest_block.block.hash().to_hex_string(), String::new()))
 }
 
 fn hex_to_bytes(input: &str) -> Result<Vec<u8>> {
@@ -2141,10 +2499,9 @@ async fn verify_path_hash_consistency(
     Ok(())
 }
 
-async fn fetch_chain_name(node_id: u32) -> Result<String> {
-    let endpoint = assets::rpc_endpoint(node_id);
-    let response = cli::get_node_status("", &endpoint, 0).await?;
-    Ok(response.result.chainspec_name)
+async fn fetch_chain_name(network_name: &str, node_id: u32) -> Result<String> {
+    let rpc = mcp_rpc_client(network_name, node_id)?;
+    rpc.get_network_name().await.map_err(Into::into)
 }
 
 fn extract_block_height(value: &Value) -> Option<u64> {
@@ -2466,5 +2823,49 @@ mod tests {
 
         let result = ensure_sidecar_available(&layout, 1).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_optional_identifier_trims_and_defaults() {
+        assert_eq!(normalize_optional_identifier(None), "");
+        assert_eq!(normalize_optional_identifier(Some("   ")), "");
+        assert_eq!(normalize_optional_identifier(Some(" 123 ")), "123");
+    }
+
+    #[test]
+    fn parse_state_identifier_variants() {
+        assert_eq!(
+            parse_state_identifier("42", "").unwrap(),
+            Some(json!({ "BlockHeight": 42u64 }))
+        );
+        assert_eq!(
+            parse_state_identifier(
+                "2f6fbeebbe1bdf6f8ff05880edfa4e4f79849d2b4f0ecf65482177e4fabc1234",
+                ""
+            )
+            .unwrap(),
+            Some(json!({
+                "BlockHash": "2f6fbeebbe1bdf6f8ff05880edfa4e4f79849d2b4f0ecf65482177e4fabc1234"
+            }))
+        );
+        assert_eq!(
+            parse_state_identifier("", "").unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_session_args_json_common_types() {
+        let input = r#"[{"name":"count","type":"U64","value":"7"},{"name":"enabled","type":"Bool","value":true}]"#;
+        let args = parse_session_args_json(input).unwrap().unwrap();
+        let count = args.get("count").unwrap().clone().into_t::<u64>().unwrap();
+        let enabled = args
+            .get("enabled")
+            .unwrap()
+            .clone()
+            .into_t::<bool>()
+            .unwrap();
+        assert_eq!(count, 7);
+        assert!(enabled);
     }
 }

@@ -51,6 +51,7 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - Use `tokio::fs` for IO and `spawn_blocking` for CPU/TOML operations.
 - Prefer concise user-facing logs.
 - Default target for assets is the build target (from `build.rs`).
+- For network interactions, do **not** use `casper_client` directly; use `veles_casper_rust_sdk::jsonrpc::CasperClient` instead.
 - Keep `README.md` updated with CLI defaults/flags whenever code changes.
 - Before finishing a task, run `cargo clippy --all --all-targets --all-features --tests` only if any `.rs` code is changed, and report failures.
 - Update `CHANGELOG.md` for user-facing changes; list them under `[Unreleased]` in the appropriate section.

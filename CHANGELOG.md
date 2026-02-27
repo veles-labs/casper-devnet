@@ -18,6 +18,9 @@ Semantic Versioning.
 - MCP-managed network spawns now enforce sidecar binary/config preflight checks.
 - Process shutdown signal messages are emitted to stderr for MCP stdio protocol safety.
 - Document MCP workflow and flags in README.
+- Add Codex CLI stdio MCP configuration examples (TOML and `codex mcp add`) to README, with a Claude CLI note.
+- Refactor MCP RPC/transaction paths to use `veles_casper_rust_sdk::jsonrpc::CasperClient`
+  instead of direct `casper_client` usage in `mcp.rs`.
 
 ### Deprecated
 
@@ -26,6 +29,8 @@ Semantic Versioning.
 ### Fixed
 - Make `assets list` and default protocol resolution tolerate bundle directory/chainspec
   version mismatches by warning and continuing with the directory version.
+- Make `rpc_query_global_state` fall back to the latest block hash when
+  `block_id` and `state_root_hash` are not provided.
 
 ### Security
 

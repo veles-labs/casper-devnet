@@ -201,6 +201,24 @@ MCP server defaults:
 MCP tools require `network_name`; node-scoped tools also require `node_id`.
 Managed networks are stopped automatically when the MCP server exits.
 Use `managed_processes` to inspect managed node/sidecar processes, with optional process-name filtering and `running_only` control.
+`rpc_query_global_state` auto-resolves the latest block hash when both `block_id` and `state_root_hash` are omitted.
+
+Codex CLI stdio MCP example (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.casper-devnet]
+command = "casper-devnet"
+args = ["mcp", "--transport", "stdio"]
+```
+
+Or add it via Codex CLI:
+
+```bash
+codex mcp add casper-devnet -- casper-devnet mcp --transport stdio
+```
+
+If `casper-devnet` is not on `PATH`, set `command` to an absolute binary path.
+Claude CLI config example: PRs welcome.
 
 ## Common flags
 
