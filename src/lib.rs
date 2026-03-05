@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod cli;
+pub mod control;
 mod diagnostics_port;
 pub mod mcp;
 mod node_launcher;

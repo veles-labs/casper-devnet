@@ -106,6 +106,17 @@ Add a local assets bundle:
 casper-devnet assets add /path/to/assets-bundle.tar.gz
 ```
 
+Add a custom override asset (symlink-backed local paths):
+
+```bash
+casper-devnet assets add dev \
+  --casper-node /path/to/casper-node \
+  --casper-sidecar /path/to/casper-sidecar \
+  --chainspec /path/to/chainspec.toml \
+  --node-config /path/to/node-config.toml \
+  --sidecar-config /path/to/sidecar-config.toml
+```
+
 Download assets from the latest release:
 
 ```bash
@@ -151,6 +162,22 @@ Start a devnet:
 ```bash
 casper-devnet start
 ```
+
+Stage a protocol upgrade from a custom asset:
+
+```bash
+casper-devnet stage-protocol dev --protocol-version 2.2.0 --activation-point 123
+```
+
+If a managed process is running (from `start` or MCP), staging runs in live mode and restarts
+sidecars. Otherwise, staging runs in offline mode and only writes versioned
+`nodes/node-*/bin/<version>` and `nodes/node-*/config/<version>` assets.
+Live staging control uses a per-network Unix socket at `/tmp/<network-name>.socket`
+for runtime stage requests.
+In live mode, consensus keys are restored from the network seed before staging so
+`migrate-data` can run successfully at the upgrade boundary.
+Node and sidecar log aliases (for example `node-1.stdout`) are atomically repointed to
+versioned log files during protocol transitions; use `tail -F` to follow across alias swaps.
 
 Run MCP control plane server (STDIO + HTTP):
 
@@ -201,6 +228,8 @@ MCP server defaults:
 MCP tools require `network_name`; node-scoped tools also require `node_id`.
 Managed networks are stopped automatically when the MCP server exits.
 Use `managed_processes` to inspect managed node/sidecar processes, with optional process-name filtering and `running_only` control.
+Use `stage_protocol` to stage custom-asset upgrades for managed networks (`live_mode=true`) or
+discovered stopped networks (`live_mode=false`).
 `rpc_query_global_state` auto-resolves the latest block hash when both `block_id` and `state_root_hash` are omitted.
 For transaction construction, use MCP tools (`make_transaction_package_call`, `make_transaction_contract_call`, `make_transaction_session_wasm`) with `send_transaction_signed` instead of invoking external `casper-client` binaries.
 `session_args` supports full CLType strings (including nested types such as `Option<List<U512>>`, `Map<String,U64>`, tuples, and `ByteArray[32]`). Scalars can be passed as string/number/bool, `null` maps to `None` for `Option<T>`, and composite values should be provided as hex bytes (`0x...`). Pass this field as JSON (array/object), not an escaped JSON string. Legacy `session_args_json` is still accepted for compatibility.
@@ -251,6 +280,13 @@ Claude CLI config example: PRs welcome.
 - `--http-path <path>`: HTTP mount path for MCP endpoint (default: `/mcp`)
 - `--net-path <path>`: Override network runtime root (same behavior as `start`)
 
+`casper-devnet stage-protocol` flags:
+
+- `--protocol-version <version>`: Protocol version to stage (required)
+- `--activation-point <era-id>`: Future era id for activation (required)
+- `--network-name <name>`: Network name for runtime paths (default: `casper-dev`)
+- `--net-path <path>`: Override network runtime root (same behavior as `start`)
+
 ## Assets bundle layout
 
 The bundle is extracted into the platform data directory and should include a versioned root with
@@ -263,6 +299,9 @@ v2.1.1/chainspec.toml
 v2.1.1/sidecar-config.toml
 v2.1.1/node-config.toml
 ```
+
+Custom override assets are stored separately under `assets/custom/<name>/` as symlinks to local
+`casper-node`, `casper-sidecar`, `chainspec.toml`, `node-config.toml`, and `sidecar-config.toml`.
 
 For manual rebuilds and bundle scripts, see
 [https://github.com/veles-labs/devnet-launcher-assets/](https://github.com/veles-labs/devnet-launcher-assets/).

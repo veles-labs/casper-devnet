@@ -6,7 +6,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -152,6 +152,88 @@ pub async fn stop(state: &mut State) -> Result<()> {
     }
 }
 
+/// Restart sidecars for all nodes, updating persisted process state.
+pub async fn restart_sidecars(
+    layout: &AssetsLayout,
+    state: &mut State,
+    rust_log: &str,
+) -> Result<Vec<RunningProcess>> {
+    let total_nodes = layout.count_nodes().await?;
+    if total_nodes == 0 {
+        return Err(anyhow!(
+            "no nodes found under {}",
+            layout.nodes_dir().display()
+        ));
+    }
+
+    let mut restarted = Vec::new();
+    let mut errors = Vec::new();
+
+    for node_id in 1..=total_nodes {
+        if let Some(record) = state
+            .processes
+            .iter_mut()
+            .find(|record| record.node_id == node_id && matches!(record.kind, ProcessKind::Sidecar))
+        {
+            if let Some(pid) = current_pid(record) {
+                if let Err(err) = send_signal(pid as i32, Signal::SIGTERM) {
+                    errors.push(format!(
+                        "failed to send {} to {} (pid {}): {}",
+                        signal_name(Signal::SIGTERM),
+                        record.id,
+                        pid,
+                        err
+                    ));
+                } else if !wait_for_process_exit(pid as i32, Duration::from_secs(5)).await
+                    && let Err(err) = send_signal(pid as i32, Signal::SIGKILL)
+                {
+                    errors.push(format!(
+                        "failed to send {} to {} (pid {}): {}",
+                        signal_name(Signal::SIGKILL),
+                        record.id,
+                        pid,
+                        err
+                    ));
+                }
+            }
+            record.last_status = ProcessStatus::Stopped;
+            record.stopped_at = Some(OffsetDateTime::now_utc());
+            record.exit_code = None;
+            record.exit_signal = None;
+            record.pid = None;
+            record.pid_handle = None;
+            record.shutdown_handle = None;
+        }
+
+        match spawn_sidecar(layout, node_id, total_nodes, rust_log).await {
+            Ok(Some(running)) => {
+                if let Some(slot) = state.processes.iter_mut().find(|record| {
+                    record.node_id == node_id && matches!(record.kind, ProcessKind::Sidecar)
+                }) {
+                    *slot = running.record.clone();
+                } else {
+                    state.processes.push(running.record.clone());
+                }
+                restarted.push(running);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                errors.push(format!(
+                    "failed to restart sidecar for node-{}: {}",
+                    node_id, err
+                ));
+            }
+        }
+    }
+
+    state.touch().await?;
+    if errors.is_empty() {
+        Ok(restarted)
+    } else {
+        Err(anyhow!(errors.join("\n")))
+    }
+}
+
 /// Start a single node and optional sidecar.
 async fn start_node(
     layout: &AssetsLayout,
@@ -265,14 +347,17 @@ async fn spawn_sidecar(
     }
 
     let node_dir = layout.node_dir(node_id);
-    let stdout_path = layout.node_logs_dir(node_id).join("sidecar-stdout.log");
-    let stderr_path = layout.node_logs_dir(node_id).join("sidecar-stderr.log");
+    let logs_dir = layout.node_logs_dir(node_id);
+    let stdout_alias_path = logs_dir.join("sidecar-stdout.log");
+    let stderr_alias_path = logs_dir.join("sidecar-stderr.log");
+    let (stdout_target_path, stderr_target_path) =
+        prepare_versioned_log_aliases(&stdout_alias_path, &stderr_alias_path, &version_dir).await?;
     create_log_symlinks(
         layout,
         node_id,
         ProcessKind::Sidecar,
-        &stdout_path,
-        &stderr_path,
+        &stdout_alias_path,
+        &stderr_alias_path,
     )
     .await?;
 
@@ -289,8 +374,8 @@ async fn spawn_sidecar(
         &args,
         &env,
         &node_dir,
-        &stdout_path,
-        &stderr_path,
+        &stdout_target_path,
+        &stderr_target_path,
     )
     .await?;
     let pid = child.id();
@@ -307,8 +392,8 @@ async fn spawn_sidecar(
             pid,
             pid_handle: None,
             shutdown_handle: None,
-            stdout_path: stdout_path.to_string_lossy().to_string(),
-            stderr_path: stderr_path.to_string_lossy().to_string(),
+            stdout_path: stdout_alias_path.to_string_lossy().to_string(),
+            stderr_path: stderr_alias_path.to_string_lossy().to_string(),
             started_at: Some(OffsetDateTime::now_utc()),
             stopped_at: None,
             exit_code: None,
@@ -372,15 +457,77 @@ async fn create_log_symlinks(
 }
 
 async fn create_symlink(link_path: &Path, target_path: &Path) -> Result<()> {
-    if let Ok(metadata) = tokio_fs::symlink_metadata(link_path).await {
+    let parent = link_path
+        .parent()
+        .ok_or_else(|| anyhow!("link path {} has no parent", link_path.display()))?;
+    tokio_fs::create_dir_all(parent).await?;
+
+    if let Ok(metadata) = tokio_fs::symlink_metadata(link_path).await
+        && metadata.is_dir()
+    {
+        tokio_fs::remove_dir_all(link_path).await?;
+    }
+
+    let link_name = link_path
+        .file_name()
+        .ok_or_else(|| anyhow!("link path {} has no file name", link_path.display()))?
+        .to_string_lossy()
+        .to_string();
+    let tmp_link = parent.join(format!(".{link_name}.tmp-{}", std::process::id()));
+    let _ = tokio_fs::remove_file(&tmp_link).await;
+    tokio_fs::symlink(target_path, &tmp_link).await?;
+    tokio_fs::rename(&tmp_link, link_path).await?;
+    Ok(())
+}
+
+fn versioned_log_target(alias_path: &Path, version_fs: &str) -> Result<PathBuf> {
+    let parent = alias_path
+        .parent()
+        .ok_or_else(|| anyhow!("log alias {} has no parent", alias_path.display()))?;
+    let file_name = alias_path
+        .file_name()
+        .ok_or_else(|| anyhow!("log alias {} has no file name", alias_path.display()))?
+        .to_string_lossy()
+        .to_string();
+
+    if let Some((base, ext)) = file_name.rsplit_once('.') {
+        Ok(parent.join(format!("{base}-{version_fs}.{ext}")))
+    } else {
+        Ok(parent.join(format!("{file_name}-{version_fs}")))
+    }
+}
+
+async fn prepare_versioned_log_alias(alias_path: &Path, version_fs: &str) -> Result<PathBuf> {
+    let target_path = versioned_log_target(alias_path, version_fs)?;
+    let parent = alias_path
+        .parent()
+        .ok_or_else(|| anyhow!("log alias {} has no parent", alias_path.display()))?;
+    tokio_fs::create_dir_all(parent).await?;
+
+    if let Ok(metadata) = tokio_fs::symlink_metadata(alias_path).await {
         if metadata.is_dir() {
-            tokio_fs::remove_dir_all(link_path).await?;
-        } else {
-            tokio_fs::remove_file(link_path).await?;
+            tokio_fs::remove_dir_all(alias_path).await?;
+        } else if !metadata.file_type().is_symlink() {
+            if tokio_fs::symlink_metadata(&target_path).await.is_err() {
+                tokio_fs::rename(alias_path, &target_path).await?;
+            } else {
+                tokio_fs::remove_file(alias_path).await?;
+            }
         }
     }
-    tokio_fs::symlink(target_path, link_path).await?;
-    Ok(())
+
+    create_symlink(alias_path, &target_path).await?;
+    Ok(target_path)
+}
+
+async fn prepare_versioned_log_aliases(
+    stdout_alias: &Path,
+    stderr_alias: &Path,
+    version_fs: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let stdout_target = prepare_versioned_log_alias(stdout_alias, version_fs).await?;
+    let stderr_target = prepare_versioned_log_alias(stderr_alias, version_fs).await?;
+    Ok((stdout_target, stderr_target))
 }
 
 fn process_group(node_id: u32, total_nodes: u32) -> ProcessGroup {
@@ -437,6 +584,17 @@ async fn wait_for_pid(pid_handle: &AtomicU32) -> Option<u32> {
         }
         sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    !process_alive(pid)
 }
 
 fn current_pid(record: &ProcessRecord) -> Option<u32> {

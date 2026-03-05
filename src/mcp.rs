@@ -1,5 +1,6 @@
 use self::args_parser::parse_session_args;
-use crate::assets::{self, AssetsLayout, SetupOptions};
+use crate::assets::{self, AssetsLayout, SetupOptions, StageProtocolOptions};
+use crate::control::{ControlRequest, ControlResponse, ControlResult, send_request};
 use crate::process::{self, StartPlan};
 use crate::state::{ProcessKind, ProcessStatus, STATE_FILE_NAME, State};
 use anyhow::{Context, Result, anyhow};
@@ -35,6 +36,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs as tokio_fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify};
 use veles_casper_rust_sdk::TransactionV1Builder;
 use veles_casper_rust_sdk::jsonrpc::CasperClient;
@@ -134,6 +137,28 @@ impl McpServer {
         let result = self
             .manager
             .wait_network_ready(&request.network_name, request.timeout_seconds)
+            .await
+            .map_err(to_mcp_error)?;
+        Ok(ok_value(
+            serde_json::to_value(result).map_err(internal_serde_error)?,
+        ))
+    }
+
+    #[tool(
+        description = "Stage a protocol upgrade from a named custom asset. When the network is running, sidecars are restarted after staging."
+    )]
+    async fn stage_protocol(
+        &self,
+        Parameters(request): Parameters<StageProtocolRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let result = self
+            .manager
+            .stage_protocol(
+                &request.network_name,
+                &request.asset_name,
+                &request.protocol_version,
+                request.activation_point,
+            )
             .await
             .map_err(to_mcp_error)?;
         Ok(ok_value(
@@ -1109,10 +1134,13 @@ struct ManagedNetwork {
     layout: AssetsLayout,
     state: Arc<Mutex<State>>,
     node_count: u32,
+    rust_log: String,
     seed: Arc<str>,
     sse_store: Arc<SseStore>,
     shutdown: Arc<AtomicBool>,
+    control_shutdown: Arc<AtomicBool>,
     sse_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    control_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ManagedNetwork {
@@ -1123,6 +1151,13 @@ impl ManagedNetwork {
 
     async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.control_shutdown.store(true, Ordering::SeqCst);
+
+        if let Some(control_task) = self.control_task.lock().await.take() {
+            control_task.abort();
+            let _ = control_task.await;
+        }
+        let _ = tokio_fs::remove_file(self.layout.control_socket_path()).await;
 
         let tasks = {
             let mut guard = self.sse_tasks.lock().await;
@@ -1251,10 +1286,11 @@ impl NetworkManager {
         let state_path = layout.net_dir().join(STATE_FILE_NAME);
         let mut state = State::new(state_path).await?;
 
+        let rust_log = log_level.clone();
         process::start(
             &layout,
             &StartPlan {
-                rust_log: log_level,
+                rust_log: rust_log.clone(),
             },
             &mut state,
         )
@@ -1264,13 +1300,20 @@ impl NetworkManager {
             layout: layout.clone(),
             state: Arc::new(Mutex::new(state)),
             node_count,
+            rust_log,
             seed,
             sse_store: Arc::new(SseStore::new(DEFAULT_SSE_HISTORY_CAPACITY)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            control_shutdown: Arc::new(AtomicBool::new(false)),
             sse_tasks: Mutex::new(Vec::new()),
+            control_task: Mutex::new(None),
         });
 
         self.spawn_sse_collectors(&managed).await;
+        if let Err(err) = self.spawn_control_server(&managed).await {
+            let _ = managed.stop().await;
+            return Err(err);
+        }
 
         self.managed
             .lock()
@@ -1298,6 +1341,150 @@ impl NetworkManager {
         }
         let mut guard = network.sse_tasks.lock().await;
         guard.extend(tasks);
+    }
+
+    async fn spawn_control_server(&self, network: &Arc<ManagedNetwork>) -> Result<()> {
+        let socket_path = network.layout.control_socket_path();
+        if let Ok(metadata) = tokio_fs::symlink_metadata(&socket_path).await {
+            if metadata.is_dir() {
+                tokio_fs::remove_dir_all(&socket_path).await?;
+            } else {
+                tokio_fs::remove_file(&socket_path).await?;
+            }
+        }
+        if let Some(parent) = socket_path.parent() {
+            tokio_fs::create_dir_all(parent).await?;
+        }
+
+        let listener = UnixListener::bind(&socket_path)?;
+        let network_for_task = Arc::clone(network);
+        let shutdown = Arc::clone(&network_for_task.control_shutdown);
+        let task = tokio::spawn(async move {
+            loop {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let accepted =
+                    tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+                let (mut stream, _) = match accepted {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                };
+
+                let mut request_bytes = Vec::new();
+                let response = match stream.read_to_end(&mut request_bytes).await {
+                    Ok(_) => match serde_json::from_slice::<ControlRequest>(&request_bytes) {
+                        Ok(request) => {
+                            handle_managed_control_request(&network_for_task, request).await
+                        }
+                        Err(err) => ControlResponse::Error {
+                            error: format!("invalid control request: {}", err),
+                        },
+                    },
+                    Err(err) => ControlResponse::Error {
+                        error: format!("failed to read control request: {}", err),
+                    },
+                };
+
+                let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|err| {
+                    format!(
+                        "{{\"status\":\"error\",\"error\":\"failed to serialize control response: {}\"}}",
+                        err
+                    )
+                    .into_bytes()
+                });
+                let _ = stream.write_all(&response_bytes).await;
+                let _ = stream.shutdown().await;
+            }
+
+            let _ = tokio_fs::remove_file(&socket_path).await;
+        });
+        *network.control_task.lock().await = Some(task);
+        Ok(())
+    }
+
+    async fn stage_protocol(
+        &self,
+        network_name: &str,
+        asset_name: &str,
+        protocol_version: &str,
+        activation_point: u64,
+    ) -> Result<StageProtocolResponse> {
+        let managed = {
+            let guard = self.managed.lock().await;
+            guard.get(network_name).cloned()
+        };
+
+        if let Some(network) = managed
+            && network.is_running().await
+        {
+            if let Ok(Some(current_era)) = read_current_era_from_status(1).await
+                && activation_point <= current_era
+            {
+                return Err(anyhow!(
+                    "activation point {} must be greater than current era {}",
+                    activation_point,
+                    current_era
+                ));
+            }
+
+            let request = ControlRequest::StageProtocol {
+                asset_name: asset_name.to_string(),
+                protocol_version: protocol_version.to_string(),
+                activation_point,
+                restart_sidecars: true,
+                rust_log: Some(network.rust_log.clone()),
+            };
+            let socket_path = network.layout.control_socket_path();
+            return match send_request(&socket_path, &request).await {
+                Ok(ControlResponse::Ok { result }) => match result {
+                    ControlResult::StageProtocol {
+                        live_mode,
+                        staged_nodes,
+                        restarted_sidecars,
+                    } => Ok(StageProtocolResponse {
+                        network_name: network_name.to_string(),
+                        live_mode,
+                        staged_nodes,
+                        restarted_sidecars,
+                    }),
+                },
+                Ok(ControlResponse::Error { error }) => Err(anyhow!(error)),
+                Err(err) => Err(anyhow!(
+                    "failed to reach managed control socket {}: {}",
+                    socket_path.display(),
+                    err
+                )),
+            };
+        }
+
+        let layout = AssetsLayout::new(self.assets_root.clone(), network_name.to_string());
+        if !layout.exists().await {
+            return Err(anyhow!(
+                "assets for {} not found under {}",
+                network_name,
+                layout.net_dir().display()
+            ));
+        }
+
+        let staged = assets::stage_protocol(
+            &layout,
+            &StageProtocolOptions {
+                asset_name: asset_name.to_string(),
+                protocol_version: protocol_version.to_string(),
+                activation_point,
+            },
+        )
+        .await?;
+
+        Ok(StageProtocolResponse {
+            network_name: network_name.to_string(),
+            live_mode: false,
+            staged_nodes: staged.staged_nodes,
+            restarted_sidecars: Vec::new(),
+        })
     }
 
     async fn wait_network_ready(
@@ -1567,6 +1754,85 @@ impl NetworkManager {
     }
 }
 
+async fn handle_managed_control_request(
+    network: &Arc<ManagedNetwork>,
+    request: ControlRequest,
+) -> ControlResponse {
+    match request {
+        ControlRequest::StageProtocol {
+            asset_name,
+            protocol_version,
+            activation_point,
+            restart_sidecars,
+            rust_log,
+        } => {
+            if let Err(err) =
+                assets::ensure_consensus_keys(&network.layout, Arc::clone(&network.seed)).await
+            {
+                return ControlResponse::Error {
+                    error: format!("failed to recreate consensus keys: {}", err),
+                };
+            }
+
+            let staged = assets::stage_protocol(
+                &network.layout,
+                &StageProtocolOptions {
+                    asset_name,
+                    protocol_version,
+                    activation_point,
+                },
+            )
+            .await;
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(err) => {
+                    return ControlResponse::Error {
+                        error: err.to_string(),
+                    };
+                }
+            };
+
+            let mut restarted_sidecars = Vec::new();
+            if restart_sidecars {
+                let rust_log = rust_log.unwrap_or_else(|| network.rust_log.clone());
+                let mut state = network.state.lock().await;
+                match process::restart_sidecars(&network.layout, &mut state, &rust_log).await {
+                    Ok(restarted) => {
+                        for proc in restarted {
+                            restarted_sidecars.push(proc.record.node_id);
+                        }
+                    }
+                    Err(err) => {
+                        return ControlResponse::Error {
+                            error: err.to_string(),
+                        };
+                    }
+                }
+            }
+
+            ControlResponse::Ok {
+                result: ControlResult::StageProtocol {
+                    live_mode: true,
+                    staged_nodes: staged.staged_nodes,
+                    restarted_sidecars,
+                },
+            }
+        }
+    }
+}
+
+async fn read_current_era_from_status(node_id: u32) -> Result<Option<u64>> {
+    let value = fetch_rest_status(node_id).await?;
+    Ok(value
+        .get("last_added_block_info")
+        .and_then(|info| info.get("era_id"))
+        .and_then(|era_id| {
+            era_id
+                .as_u64()
+                .or_else(|| era_id.as_str().and_then(|raw| raw.parse::<u64>().ok()))
+        }))
+}
+
 #[derive(Debug)]
 struct SseStore {
     sequence: AtomicU64,
@@ -1757,6 +2023,22 @@ struct WaitReadyResponse {
     node_count: u32,
     rest: HashMap<u32, Value>,
     last_block_height: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+struct StageProtocolRequest {
+    network_name: String,
+    asset_name: String,
+    protocol_version: String,
+    activation_point: u64,
+}
+
+#[derive(Debug, Serialize, rmcp::schemars::JsonSchema)]
+struct StageProtocolResponse {
+    network_name: String,
+    live_mode: bool,
+    staged_nodes: u32,
+    restarted_sidecars: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]

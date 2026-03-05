@@ -46,6 +46,7 @@ const DERIVED_ACCOUNTS_FILE: &str = "derived-accounts.csv";
 const SECRET_KEY_PEM: &str = "secret_key.pem";
 const MOTE_PER_CSPR: u128 = 1_000_000_000;
 const PROGRESS_TICK_MS: u64 = 120;
+const CONTROL_SOCKET_NAME_MAX: usize = 80;
 
 #[derive(Debug)]
 struct DerivedAccountMaterial {
@@ -155,6 +156,11 @@ impl AssetsLayout {
         self.net_dir().join("daemon")
     }
 
+    /// Path to the control socket for runtime operations.
+    pub fn control_socket_path(&self) -> PathBuf {
+        control_socket_path_for_network(&self.network_name)
+    }
+
     /// Returns true if the network's nodes directory exists.
     pub async fn exists(&self) -> bool {
         tokio_fs::metadata(self.nodes_dir())
@@ -232,6 +238,31 @@ impl AssetsLayout {
     }
 }
 
+fn control_socket_path_for_network(network_name: &str) -> PathBuf {
+    let socket_name = format!("{}.socket", normalize_control_socket_name(network_name));
+    std::env::temp_dir().join(socket_name)
+}
+
+fn normalize_control_socket_name(network_name: &str) -> String {
+    let mut normalized = network_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if normalized.is_empty() {
+        normalized.push_str("casper-dev");
+    }
+    if normalized.len() > CONTROL_SOCKET_NAME_MAX {
+        normalized.truncate(CONTROL_SOCKET_NAME_MAX);
+    }
+    normalized
+}
+
 pub fn data_dir() -> Result<PathBuf> {
     let project_dirs = ProjectDirs::from("xyz", "veleslabs", "casper-devnet")
         .ok_or_else(|| anyhow!("unable to resolve data directory"))?;
@@ -244,6 +275,10 @@ pub fn default_assets_root() -> Result<PathBuf> {
 
 pub fn assets_bundle_root() -> Result<PathBuf> {
     Ok(data_dir()?.join("assets"))
+}
+
+pub fn custom_assets_root() -> Result<PathBuf> {
+    Ok(assets_bundle_root()?.join("custom"))
 }
 
 pub fn file_name(path: &Path) -> Option<&OsStr> {
@@ -309,6 +344,25 @@ pub struct SetupOptions {
     pub seed: Arc<str>,
 }
 
+pub struct CustomAssetInstallOptions {
+    pub name: String,
+    pub casper_node: PathBuf,
+    pub casper_sidecar: PathBuf,
+    pub chainspec: PathBuf,
+    pub node_config: PathBuf,
+    pub sidecar_config: PathBuf,
+}
+
+pub struct StageProtocolOptions {
+    pub asset_name: String,
+    pub protocol_version: String,
+    pub activation_point: u64,
+}
+
+pub struct StageProtocolResult {
+    pub staged_nodes: u32,
+}
+
 /// Create or refresh local assets for a devnet.
 pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<()> {
     let genesis_nodes = opts.nodes;
@@ -360,6 +414,211 @@ pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<(
     .await?;
 
     Ok(())
+}
+
+pub async fn install_custom_asset(opts: &CustomAssetInstallOptions) -> Result<()> {
+    validate_custom_asset_name(&opts.name)?;
+
+    let node_src = canonicalize_required_file(&opts.casper_node, "casper-node").await?;
+    let sidecar_src = canonicalize_required_file(&opts.casper_sidecar, "casper-sidecar").await?;
+    let chainspec_src = canonicalize_required_file(&opts.chainspec, "chainspec").await?;
+    let node_config_src = canonicalize_required_file(&opts.node_config, "node-config").await?;
+    let sidecar_config_src =
+        canonicalize_required_file(&opts.sidecar_config, "sidecar-config").await?;
+
+    verify_binary_version(&node_src, "casper-node").await?;
+    verify_binary_version(&sidecar_src, "casper-sidecar").await?;
+
+    let root = custom_assets_root()?;
+    let asset_dir = root.join(&opts.name);
+    if is_dir(&asset_dir).await {
+        tokio_fs::remove_dir_all(&asset_dir).await?;
+    }
+
+    tokio_fs::create_dir_all(asset_dir.join("bin")).await?;
+    symlink_file(&node_src, &asset_dir.join("bin").join("casper-node")).await?;
+    symlink_file(&sidecar_src, &asset_dir.join("bin").join("casper-sidecar")).await?;
+    symlink_file(&chainspec_src, &asset_dir.join("chainspec.toml")).await?;
+    symlink_file(&node_config_src, &asset_dir.join("node-config.toml")).await?;
+    symlink_file(&sidecar_config_src, &asset_dir.join("sidecar-config.toml")).await?;
+
+    Ok(())
+}
+
+pub async fn stage_protocol(
+    layout: &AssetsLayout,
+    opts: &StageProtocolOptions,
+) -> Result<StageProtocolResult> {
+    validate_custom_asset_name(&opts.asset_name)?;
+
+    let protocol_version = parse_protocol_version(&opts.protocol_version)?;
+    let protocol_version_chain = protocol_version.to_string();
+    let protocol_version_fs = protocol_version_chain.replace('.', "_");
+    let custom_asset = load_custom_asset(&opts.asset_name).await?;
+
+    verify_binary_version(&custom_asset.casper_node, "casper-node").await?;
+    verify_binary_version(&custom_asset.casper_sidecar, "casper-sidecar").await?;
+
+    let total_nodes = layout.count_nodes().await?;
+    if total_nodes == 0 {
+        return Err(anyhow!(
+            "no nodes found under {}; run start --setup-only first",
+            layout.nodes_dir().display()
+        ));
+    }
+
+    let node_log_format = detect_current_node_log_format(layout).await?;
+    let accounts_path = layout.net_dir().join("chainspec/accounts.toml");
+
+    for node_id in 1..=total_nodes {
+        let node_bin_version_dir = layout.node_bin_dir(node_id).join(&protocol_version_fs);
+        let node_config_version_dir = layout.node_config_root(node_id).join(&protocol_version_fs);
+
+        if is_dir(&node_bin_version_dir).await {
+            tokio_fs::remove_dir_all(&node_bin_version_dir).await?;
+        }
+        if is_dir(&node_config_version_dir).await {
+            tokio_fs::remove_dir_all(&node_config_version_dir).await?;
+        }
+        tokio_fs::create_dir_all(&node_bin_version_dir).await?;
+        tokio_fs::create_dir_all(&node_config_version_dir).await?;
+
+        symlink_file(
+            &custom_asset.casper_node,
+            &node_bin_version_dir.join("casper-node"),
+        )
+        .await?;
+        symlink_file(
+            &custom_asset.casper_sidecar,
+            &node_bin_version_dir.join("casper-sidecar"),
+        )
+        .await?;
+
+        let chainspec_dest = node_config_version_dir.join("chainspec.toml");
+        copy_file(&custom_asset.chainspec, &chainspec_dest).await?;
+        let staged_chainspec = tokio_fs::read_to_string(&chainspec_dest).await?;
+        let network_name = layout.network_name().to_string();
+        let activation_point = opts.activation_point as i64;
+        let protocol_version_chain = protocol_version_chain.clone();
+        let updated_chainspec = spawn_blocking_result(move || {
+            let mut value: toml::Value = toml::from_str(&staged_chainspec)?;
+            set_integer(
+                &mut value,
+                &["protocol", "activation_point"],
+                activation_point,
+            )?;
+            set_string(&mut value, &["protocol", "version"], protocol_version_chain)?;
+            set_string(&mut value, &["network", "name"], network_name)?;
+            set_integer(&mut value, &["core", "validator_slots"], total_nodes as i64)?;
+            Ok(toml::to_string(&value)?)
+        })
+        .await?;
+        tokio_fs::write(&chainspec_dest, updated_chainspec).await?;
+
+        if is_file(&accounts_path).await {
+            copy_file(
+                &accounts_path,
+                &node_config_version_dir.join("accounts.toml"),
+            )
+            .await?;
+        }
+
+        let node_config_dest = node_config_version_dir.join("config.toml");
+        copy_file(&custom_asset.node_config, &node_config_dest).await?;
+        let config_contents = tokio_fs::read_to_string(&node_config_dest).await?;
+        let bind_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_NETWORK, node_id));
+        let known = known_addresses(node_id, total_nodes);
+        let rest_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_REST, node_id));
+        let sse_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_SSE, node_id));
+        let binary_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_BINARY, node_id));
+        let diagnostics_socket = diagnostics_socket_path(layout.network_name(), node_id);
+        let node_log_format = node_log_format.clone();
+        let updated_config = spawn_blocking_result(move || {
+            let mut config_value: toml::Value = toml::from_str(&config_contents)?;
+            set_string(
+                &mut config_value,
+                &["consensus", "secret_key_path"],
+                "../../keys/secret_key.pem".to_string(),
+            )?;
+            set_string(&mut config_value, &["logging", "format"], node_log_format)?;
+            set_string(
+                &mut config_value,
+                &["network", "bind_address"],
+                bind_address,
+            )?;
+            set_array(&mut config_value, &["network", "known_addresses"], known)?;
+            set_string(
+                &mut config_value,
+                &["storage", "path"],
+                "../../storage".to_string(),
+            )?;
+            set_string(&mut config_value, &["rest_server", "address"], rest_address)?;
+            set_string(
+                &mut config_value,
+                &["event_stream_server", "address"],
+                sse_address,
+            )?;
+            set_string(
+                &mut config_value,
+                &["diagnostics_port", "socket_path"],
+                diagnostics_socket,
+            )?;
+            set_string(
+                &mut config_value,
+                &["binary_port_server", "address"],
+                binary_address,
+            )?;
+            set_bool(
+                &mut config_value,
+                &["binary_port_server", "allow_request_get_trie"],
+                true,
+            )?;
+            set_bool(
+                &mut config_value,
+                &["binary_port_server", "allow_request_speculative_exec"],
+                true,
+            )?;
+            Ok(toml::to_string(&config_value)?)
+        })
+        .await?;
+        tokio_fs::write(&node_config_dest, updated_config).await?;
+
+        let sidecar_dest = node_config_version_dir.join("sidecar.toml");
+        copy_file(&custom_asset.sidecar_config, &sidecar_dest).await?;
+        let sidecar_contents = tokio_fs::read_to_string(&sidecar_dest).await?;
+        let rpc_port = node_port(DEVNET_BASE_PORT_RPC, node_id) as i64;
+        let binary_port = node_port(DEVNET_BASE_PORT_BINARY, node_id) as i64;
+        let updated_sidecar = spawn_blocking_result(move || {
+            let mut sidecar_value: toml::Value = toml::from_str(&sidecar_contents)?;
+            set_string(
+                &mut sidecar_value,
+                &["rpc_server", "main_server", "ip_address"],
+                "0.0.0.0".to_string(),
+            )?;
+            set_integer(
+                &mut sidecar_value,
+                &["rpc_server", "main_server", "port"],
+                rpc_port,
+            )?;
+            set_string(
+                &mut sidecar_value,
+                &["rpc_server", "node_client", "ip_address"],
+                "0.0.0.0".to_string(),
+            )?;
+            set_integer(
+                &mut sidecar_value,
+                &["rpc_server", "node_client", "port"],
+                binary_port,
+            )?;
+            Ok(toml::to_string(&sidecar_value)?)
+        })
+        .await?;
+        tokio_fs::write(&sidecar_dest, updated_sidecar).await?;
+    }
+
+    Ok(StageProtocolResult {
+        staged_nodes: total_nodes,
+    })
 }
 
 /// Remove assets for the given network (and local dumps).
@@ -1416,6 +1675,111 @@ pub(crate) async fn derive_account_from_seed_path(
     .await
 }
 
+struct CustomAssetPaths {
+    casper_node: PathBuf,
+    casper_sidecar: PathBuf,
+    chainspec: PathBuf,
+    node_config: PathBuf,
+    sidecar_config: PathBuf,
+}
+
+async fn detect_current_node_log_format(layout: &AssetsLayout) -> Result<String> {
+    let version_dir = match layout.latest_protocol_version_dir(1).await {
+        Ok(version_dir) => version_dir,
+        Err(_) => return Ok("json".to_string()),
+    };
+    let config_path = layout
+        .node_config_root(1)
+        .join(version_dir)
+        .join("config.toml");
+    if !is_file(&config_path).await {
+        return Ok("json".to_string());
+    }
+
+    let config_contents = tokio_fs::read_to_string(config_path).await?;
+    spawn_blocking_result(move || {
+        let value: toml::Value = toml::from_str(&config_contents)?;
+        let format = value
+            .get("logging")
+            .and_then(|logging| logging.get("format"))
+            .and_then(|format| format.as_str())
+            .unwrap_or("json")
+            .to_string();
+        Ok(format)
+    })
+    .await
+}
+
+async fn load_custom_asset(name: &str) -> Result<CustomAssetPaths> {
+    validate_custom_asset_name(name)?;
+    let asset_dir = custom_assets_root()?.join(name);
+    if !is_dir(&asset_dir).await {
+        return Err(anyhow!(
+            "custom asset '{}' not found at {}",
+            name,
+            asset_dir.display()
+        ));
+    }
+
+    let casper_node =
+        canonicalize_required_file(&asset_dir.join("bin").join("casper-node"), "casper-node")
+            .await?;
+    let casper_sidecar = canonicalize_required_file(
+        &asset_dir.join("bin").join("casper-sidecar"),
+        "casper-sidecar",
+    )
+    .await?;
+    let chainspec =
+        canonicalize_required_file(&asset_dir.join("chainspec.toml"), "chainspec").await?;
+    let node_config =
+        canonicalize_required_file(&asset_dir.join("node-config.toml"), "node-config").await?;
+    let sidecar_config =
+        canonicalize_required_file(&asset_dir.join("sidecar-config.toml"), "sidecar-config")
+            .await?;
+
+    Ok(CustomAssetPaths {
+        casper_node,
+        casper_sidecar,
+        chainspec,
+        node_config,
+        sidecar_config,
+    })
+}
+
+async fn canonicalize_required_file(path: &Path, label: &str) -> Result<PathBuf> {
+    if !is_file(path).await {
+        return Err(anyhow!("missing {} file {}", label, path.display()));
+    }
+    let canonical = tokio_fs::canonicalize(path).await?;
+    if !is_file(&canonical).await {
+        return Err(anyhow!("missing {} file {}", label, canonical.display()));
+    }
+    Ok(canonical)
+}
+
+fn validate_custom_asset_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("custom asset name must not be empty"));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        return Err(anyhow!(
+            "custom asset name '{}' contains forbidden path characters",
+            name
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    {
+        return Err(anyhow!(
+            "custom asset name '{}' must use [A-Za-z0-9._-]",
+            name
+        ));
+    }
+    Ok(())
+}
+
 async fn copy_file(src: &Path, dest: &Path) -> Result<()> {
     if !is_file(src).await {
         return Err(anyhow!("missing source file {}", src.display()));
@@ -1424,6 +1788,24 @@ async fn copy_file(src: &Path, dest: &Path) -> Result<()> {
         tokio_fs::create_dir_all(parent).await?;
     }
     tokio_fs::copy(src, dest).await?;
+    Ok(())
+}
+
+async fn symlink_file(src: &Path, dest: &Path) -> Result<()> {
+    if !is_file(src).await {
+        return Err(anyhow!("missing source file {}", src.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+    if let Ok(metadata) = tokio_fs::symlink_metadata(dest).await {
+        if metadata.is_dir() {
+            tokio_fs::remove_dir_all(dest).await?;
+        } else {
+            tokio_fs::remove_file(dest).await?;
+        }
+    }
+    tokio_fs::symlink(src, dest).await?;
     Ok(())
 }
 
@@ -1514,7 +1896,8 @@ fn ensure_table<'a>(table: &'a mut toml::value::Table, key: &str) -> &'a mut tom
 
 #[cfg(test)]
 mod tests {
-    use super::format_cspr;
+    use super::{AssetsLayout, format_cspr, validate_custom_asset_name};
+    use std::path::PathBuf;
 
     #[test]
     fn format_cspr_handles_whole_and_fractional() {
@@ -1524,5 +1907,34 @@ mod tests {
         assert_eq!(format_cspr(1_000_000_001), "1.000000001");
         assert_eq!(format_cspr(123_000_000_000), "123");
         assert_eq!(format_cspr(123_000_000_456), "123.000000456");
+    }
+
+    #[test]
+    fn custom_asset_name_validation() {
+        assert!(validate_custom_asset_name("dev").is_ok());
+        assert!(validate_custom_asset_name("v2_2_0-local").is_ok());
+        assert!(validate_custom_asset_name("").is_err());
+        assert!(validate_custom_asset_name("../bad").is_err());
+        assert!(validate_custom_asset_name("with space").is_err());
+    }
+
+    #[test]
+    fn control_socket_path_uses_system_temp_dir() {
+        let layout = AssetsLayout::new(PathBuf::from("/tmp/networks"), "casper-dev".to_string());
+        let socket_path = layout.control_socket_path();
+        assert_eq!(socket_path, std::env::temp_dir().join("casper-dev.socket"));
+    }
+
+    #[test]
+    fn control_socket_path_sanitizes_network_name() {
+        let layout = AssetsLayout::new(
+            PathBuf::from("/tmp/networks"),
+            "my/network with spaces".to_string(),
+        );
+        let socket_path = layout.control_socket_path();
+        assert_eq!(
+            socket_path,
+            std::env::temp_dir().join("my_network_with_spaces.socket")
+        );
     }
 }

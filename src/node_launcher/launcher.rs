@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -11,7 +11,10 @@ use std::{
 use anyhow::{Result, bail};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::fs as tokio_fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -328,20 +331,92 @@ impl Launcher {
         }
     }
 
+    fn active_log_version_fs(&self) -> String {
+        match &self.state {
+            State::RunNodeAsValidator(node_info) => node_info.version.to_string().replace('.', "_"),
+            State::MigrateData { new_info, .. } => new_info.version.to_string().replace('.', "_"),
+        }
+    }
+
+    fn versioned_log_target(alias_path: &Path, version_fs: &str) -> Result<PathBuf> {
+        let parent = alias_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("log path {} has no parent", alias_path.display()))?;
+        let file_name = alias_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("log path {} has no file name", alias_path.display()))?;
+        let file_name = file_name.to_string_lossy();
+
+        if let Some((base, ext)) = file_name.rsplit_once('.') {
+            Ok(parent.join(format!("{base}-{version_fs}.{ext}")))
+        } else {
+            Ok(parent.join(format!("{file_name}-{version_fs}")))
+        }
+    }
+
+    async fn replace_symlink_atomic(link_path: &Path, target_path: &Path) -> Result<()> {
+        let parent = link_path.parent().ok_or_else(|| {
+            anyhow::anyhow!("log link path {} has no parent", link_path.display())
+        })?;
+        tokio_fs::create_dir_all(parent).await?;
+
+        let file_name = link_path.file_name().ok_or_else(|| {
+            anyhow::anyhow!("log link path {} has no file name", link_path.display())
+        })?;
+        let file_name = file_name.to_string_lossy();
+        let tmp_link = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+
+        if let Ok(metadata) = tokio_fs::symlink_metadata(link_path).await
+            && metadata.is_dir()
+        {
+            tokio_fs::remove_dir_all(link_path).await?;
+        }
+        let _ = tokio_fs::remove_file(&tmp_link).await;
+        tokio_fs::symlink(target_path, &tmp_link).await?;
+        tokio_fs::rename(&tmp_link, link_path).await?;
+        Ok(())
+    }
+
+    async fn prepare_versioned_log_alias(alias_path: &Path, version_fs: &str) -> Result<PathBuf> {
+        let target_path = Self::versioned_log_target(alias_path, version_fs)?;
+        let parent = alias_path.parent().ok_or_else(|| {
+            anyhow::anyhow!("log alias path {} has no parent", alias_path.display())
+        })?;
+        tokio_fs::create_dir_all(parent).await?;
+
+        if let Ok(metadata) = tokio_fs::symlink_metadata(alias_path).await {
+            if metadata.is_dir() {
+                tokio_fs::remove_dir_all(alias_path).await?;
+            } else if !metadata.file_type().is_symlink() {
+                if tokio_fs::symlink_metadata(&target_path).await.is_err() {
+                    tokio_fs::rename(alias_path, &target_path).await?;
+                } else {
+                    tokio_fs::remove_file(alias_path).await?;
+                }
+            }
+        }
+
+        Self::replace_symlink_atomic(alias_path, &target_path).await?;
+        Ok(target_path)
+    }
+
     async fn configure_command(&self, command: &mut Command) -> Result<()> {
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
         if let (Some(stdout_path), Some(stderr_path)) = (&self.stdout_path, &self.stderr_path) {
+            let version_fs = self.active_log_version_fs();
+            let stdout_target = Self::prepare_versioned_log_alias(stdout_path, &version_fs).await?;
+            let stderr_target = Self::prepare_versioned_log_alias(stderr_path, &version_fs).await?;
             let stdout = tokio_fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(stdout_path)
+                .open(&stdout_target)
                 .await?;
             let stderr = tokio_fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(stderr_path)
+                .open(&stderr_target)
                 .await?;
             let stdout = stdout.into_std().await;
             let stderr = stderr.into_std().await;
@@ -356,6 +431,42 @@ impl Launcher {
         }
 
         Ok(())
+    }
+
+    async fn append_launcher_note(&self, message: impl AsRef<str>) {
+        let Some(stdout_path) = &self.stdout_path else {
+            return;
+        };
+
+        let timestamp = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown-time".to_string());
+        let line = format!("{timestamp} {}\n", message.as_ref());
+
+        let mut file = match tokio_fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(stdout_path)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => {
+                warn!(
+                    path=%stdout_path.display(),
+                    %error,
+                    "failed to open node stdout log for launcher note"
+                );
+                return;
+            }
+        };
+
+        if let Err(error) = file.write_all(line.as_bytes()).await {
+            warn!(
+                path=%stdout_path.display(),
+                %error,
+                "failed to append launcher note to node stdout log"
+            );
+        }
     }
 
     /// Sets `self.state` to a new state corresponding to upgrading the current node version.
@@ -376,10 +487,28 @@ impl Launcher {
                     bail!(msg);
                 }
 
+                info!(
+                    old_version=%old_info.version,
+                    new_version=%next_version,
+                    "detected upgrade boundary from node exit code 0"
+                );
+                self.append_launcher_note(format!(
+                    "launcher detected upgrade boundary (node exited with code 0); migrating {} -> {}",
+                    old_info.version, next_version
+                ))
+                .await;
+
                 let new_info = self.new_node_info(next_version);
                 State::MigrateData { old_info, new_info }
             }
-            State::MigrateData { new_info, .. } => State::RunNodeAsValidator(new_info),
+            State::MigrateData { new_info, .. } => {
+                self.append_launcher_note(format!(
+                    "launcher finished migrate-data; starting validator {}",
+                    new_info.version
+                ))
+                .await;
+                State::RunNodeAsValidator(new_info)
+            }
         };
 
         self.state = new_state;

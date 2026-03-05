@@ -6,14 +6,29 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
+- Add named custom override assets via
+  `assets add <name> --casper-node --casper-sidecar --chainspec --node-config --sidecar-config`.
+- Add `stage-protocol` CLI command for staging a protocol upgrade from a custom asset.
+- Add MCP `stage_protocol` tool with live (managed network) and offline (filesystem-only) modes.
+- Add per-network control socket at `/tmp/<network>.socket` for live staging commands.
 
 ### Changed
+- Protocol staging now writes per-node versioned `bin/<version>` and `config/<version>` trees from
+  custom assets and patches chainspec/node/sidecar configs for the target network.
+- Live staging now restarts sidecars in place instead of requiring a full `start` restart cycle.
+- Runtime supervisor logs now surface upgrade-boundary behavior (launcher upgrade notes, SSE
+  shutdown/disconnect events, and post-reconnect `Network is healthy` API version re-announcement).
+- Node and sidecar log aliases are atomically repointed to versioned log files across protocol
+  transitions and sidecar restarts.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+- Avoid unintended offline fallback on macOS by using short `/tmp` control socket paths.
+- Restore consensus keys from the network seed before live staging so `migrate-data` can complete
+  at upgrade boundaries.
 
 ### Security
 

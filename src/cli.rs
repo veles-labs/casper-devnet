@@ -1,4 +1,7 @@
-use crate::assets::{self, AssetsLayout, SetupOptions};
+use crate::assets::{
+    self, AssetsLayout, CustomAssetInstallOptions, SetupOptions, StageProtocolOptions,
+};
+use crate::control::{ControlRequest, ControlResponse, ControlResult, send_request};
 use crate::diagnostics_port;
 use crate::mcp::{self, McpArgs};
 use crate::process::{self, ProcessHandle, RunningProcess, StartPlan};
@@ -18,12 +21,15 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 use spinners::{Spinner, Spinners};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::fs as tokio_fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use veles_casper_rust_sdk::sse::event::SseEvent;
@@ -50,6 +56,8 @@ enum Command {
     Mcp(McpArgs),
     /// Manage assets bundles.
     Assets(AssetsArgs),
+    /// Stage a protocol upgrade from a custom asset.
+    StageProtocol(StageProtocolArgs),
     /// Check whether a network has observed a block yet.
     IsReady(IsReadyArgs),
 }
@@ -123,9 +131,29 @@ enum AssetsCommand {
 /// Arguments for `nctl assets add`.
 #[derive(Args, Clone)]
 struct AssetsAddArgs {
-    /// Path to a local assets bundle (.tar.gz).
-    #[arg(value_name = "PATH")]
-    path: PathBuf,
+    /// Asset bundle path (tar.gz) or custom asset name when override flags are used.
+    #[arg(value_name = "PATH_OR_NAME")]
+    path_or_name: String,
+
+    /// Local casper-node binary path for custom asset install mode.
+    #[arg(long, value_name = "PATH")]
+    casper_node: Option<PathBuf>,
+
+    /// Local casper-sidecar binary path for custom asset install mode.
+    #[arg(long, value_name = "PATH")]
+    casper_sidecar: Option<PathBuf>,
+
+    /// Local chainspec.toml path for custom asset install mode.
+    #[arg(long, value_name = "PATH")]
+    chainspec: Option<PathBuf>,
+
+    /// Local node-config.toml path for custom asset install mode.
+    #[arg(long, value_name = "PATH")]
+    node_config: Option<PathBuf>,
+
+    /// Local sidecar-config.toml path for custom asset install mode.
+    #[arg(long, value_name = "PATH")]
+    sidecar_config: Option<PathBuf>,
 }
 
 /// Arguments for `nctl assets pull`.
@@ -152,6 +180,30 @@ struct IsReadyArgs {
     net_path: Option<PathBuf>,
 }
 
+/// Arguments for `nctl stage-protocol`.
+#[derive(Args, Clone)]
+struct StageProtocolArgs {
+    /// Asset name in custom assets store.
+    #[arg(value_name = "ASSET_NAME")]
+    asset_name: String,
+
+    /// Protocol version to stage (e.g. 2.2.0).
+    #[arg(long)]
+    protocol_version: String,
+
+    /// Future era id for activation.
+    #[arg(long)]
+    activation_point: u64,
+
+    /// Network name used in assets paths and configs.
+    #[arg(long, default_value = "casper-dev")]
+    network_name: String,
+
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
+}
+
 /// Parses CLI and runs the selected subcommand.
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -159,6 +211,7 @@ pub async fn run() -> Result<()> {
         Command::Start(args) => run_start(args).await,
         Command::Mcp(args) => mcp::run(args).await,
         Command::Assets(args) => run_assets(args).await,
+        Command::StageProtocol(args) => run_stage_protocol(args).await,
         Command::IsReady(args) => run_is_ready(args).await,
     }
 }
@@ -204,7 +257,9 @@ async fn run_start(args: StartArgs) -> Result<()> {
 
     let rust_log = args.log_level.clone();
 
-    let plan = StartPlan { rust_log };
+    let plan = StartPlan {
+        rust_log: rust_log.clone(),
+    };
 
     let state_path = layout.net_dir().join(STATE_FILE_NAME);
     let state = Arc::new(Mutex::new(State::new(state_path).await?));
@@ -232,16 +287,41 @@ async fn run_start(args: StartArgs) -> Result<()> {
 
     let (event_tx, mut event_rx) = unbounded_channel();
     spawn_ctrlc_listener(event_tx.clone());
-    spawn_exit_watchers(started, event_tx);
+    spawn_exit_watchers(started, event_tx.clone());
+    let planned_exits = Arc::new(Mutex::new(HashSet::<(String, u32)>::new()));
+    let mut control_server = match spawn_control_server(
+        layout.clone(),
+        Arc::clone(&state),
+        event_tx.clone(),
+        Arc::clone(&planned_exits),
+        rust_log.clone(),
+        Arc::clone(&args.seed),
+    )
+    .await
+    {
+        Ok(server) => Some(server),
+        Err(err) => {
+            eprintln!(
+                "warning: failed to start control socket server at {}: {}",
+                layout.control_socket_path().display(),
+                err
+            );
+            None
+        }
+    };
 
-    if let Some(event) = event_rx.recv().await {
+    while let Some(event) = event_rx.recv().await {
         match event {
             RunEvent::CtrlC => {
                 if let Some(proxy) = diagnostics_proxy.take() {
                     proxy.shutdown();
                 }
+                if let Some(server) = control_server.take() {
+                    server.shutdown().await;
+                }
                 let mut state = state.lock().await;
                 process::stop(&mut state).await?;
+                break;
             }
             RunEvent::ProcessExit {
                 id,
@@ -249,13 +329,20 @@ async fn run_start(args: StartArgs) -> Result<()> {
                 code,
                 signal,
             } => {
+                if is_planned_process_exit(&planned_exits, &id, pid).await {
+                    continue;
+                }
                 if let Some(proxy) = diagnostics_proxy.take() {
                     proxy.shutdown();
+                }
+                if let Some(server) = control_server.take() {
+                    server.shutdown().await;
                 }
                 let mut state = state.lock().await;
                 update_exited_process(&mut state, &id, code, signal).await?;
                 log_exit(&id, pid, code, signal);
                 process::stop(&mut state).await?;
+                break;
             }
         }
     }
@@ -554,6 +641,18 @@ enum RunEvent {
     },
 }
 
+struct ControlServerHandle {
+    shutdown: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ControlServerHandle {
+    async fn shutdown(self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = self.task.await;
+    }
+}
+
 fn spawn_ctrlc_listener(tx: UnboundedSender<RunEvent>) {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -601,6 +700,196 @@ fn spawn_exit_watchers(processes: Vec<RunningProcess>, tx: UnboundedSender<RunEv
     }
 }
 
+async fn spawn_control_server(
+    layout: AssetsLayout,
+    state: Arc<Mutex<State>>,
+    event_tx: UnboundedSender<RunEvent>,
+    planned_exits: Arc<Mutex<HashSet<(String, u32)>>>,
+    rust_log: String,
+    seed: Arc<str>,
+) -> Result<ControlServerHandle> {
+    let socket_path = layout.control_socket_path();
+    if let Ok(metadata) = tokio_fs::symlink_metadata(&socket_path).await {
+        if metadata.is_dir() {
+            tokio_fs::remove_dir_all(&socket_path).await?;
+        } else {
+            tokio_fs::remove_file(&socket_path).await?;
+        }
+    }
+    if let Some(parent) = socket_path.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+
+    let listener = UnixListener::bind(&socket_path)?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_loop = Arc::clone(&shutdown);
+    let task = tokio::spawn(async move {
+        loop {
+            if shutdown_loop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+            let (mut stream, _) = match accepted {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(err)) => {
+                    eprintln!("warning: control socket accept failed: {}", err);
+                    break;
+                }
+                Err(_) => continue,
+            };
+
+            let mut request_bytes = Vec::new();
+            let response = match stream.read_to_end(&mut request_bytes).await {
+                Ok(_) => match serde_json::from_slice::<ControlRequest>(&request_bytes) {
+                    Ok(request) => {
+                        handle_control_request(
+                            &layout,
+                            &state,
+                            &event_tx,
+                            &planned_exits,
+                            &rust_log,
+                            &seed,
+                            request,
+                        )
+                        .await
+                    }
+                    Err(err) => ControlResponse::Error {
+                        error: format!("invalid control request: {}", err),
+                    },
+                },
+                Err(err) => ControlResponse::Error {
+                    error: format!("failed to read control request: {}", err),
+                },
+            };
+
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|err| {
+                format!(
+                    "{{\"status\":\"error\",\"error\":\"failed to serialize control response: {}\"}}",
+                    err
+                )
+                .into_bytes()
+            });
+            let _ = stream.write_all(&response_bytes).await;
+            let _ = stream.shutdown().await;
+        }
+
+        let _ = tokio_fs::remove_file(&socket_path).await;
+    });
+
+    Ok(ControlServerHandle { shutdown, task })
+}
+
+async fn handle_control_request(
+    layout: &AssetsLayout,
+    state: &Arc<Mutex<State>>,
+    event_tx: &UnboundedSender<RunEvent>,
+    planned_exits: &Arc<Mutex<HashSet<(String, u32)>>>,
+    default_rust_log: &str,
+    seed: &Arc<str>,
+    request: ControlRequest,
+) -> ControlResponse {
+    match request {
+        ControlRequest::StageProtocol {
+            asset_name,
+            protocol_version,
+            activation_point,
+            restart_sidecars,
+            rust_log,
+        } => {
+            match assets::ensure_consensus_keys(layout, Arc::clone(seed)).await {
+                Ok(restored) => {
+                    if restored > 0 {
+                        println!("recreated consensus keys for {} node(s)", restored);
+                    }
+                }
+                Err(err) => {
+                    return ControlResponse::Error {
+                        error: format!("failed to recreate consensus keys: {}", err),
+                    };
+                }
+            }
+
+            let stage = assets::stage_protocol(
+                layout,
+                &StageProtocolOptions {
+                    asset_name,
+                    protocol_version,
+                    activation_point,
+                },
+            )
+            .await;
+            let stage = match stage {
+                Ok(stage) => stage,
+                Err(err) => {
+                    return ControlResponse::Error {
+                        error: err.to_string(),
+                    };
+                }
+            };
+
+            let mut restarted_sidecars = Vec::new();
+            if restart_sidecars {
+                let mut state = state.lock().await;
+                let planned = sidecar_exit_keys(&state);
+                if !planned.is_empty() {
+                    let mut planned_exits = planned_exits.lock().await;
+                    planned_exits.extend(planned);
+                }
+
+                let rust_log = rust_log.unwrap_or_else(|| default_rust_log.to_string());
+                match process::restart_sidecars(layout, &mut state, &rust_log).await {
+                    Ok(restarted) => {
+                        for proc in &restarted {
+                            restarted_sidecars.push(proc.record.node_id);
+                        }
+                        spawn_exit_watchers(restarted, event_tx.clone());
+                    }
+                    Err(err) => {
+                        return ControlResponse::Error {
+                            error: err.to_string(),
+                        };
+                    }
+                }
+            }
+
+            ControlResponse::Ok {
+                result: crate::control::ControlResult::StageProtocol {
+                    live_mode: true,
+                    staged_nodes: stage.staged_nodes,
+                    restarted_sidecars,
+                },
+            }
+        }
+    }
+}
+
+fn sidecar_exit_keys(state: &State) -> Vec<(String, u32)> {
+    state
+        .processes
+        .iter()
+        .filter(|record| {
+            matches!(record.kind, ProcessKind::Sidecar)
+                && matches!(record.last_status, ProcessStatus::Running)
+        })
+        .filter_map(|record| record_pid(record).map(|pid| (record.id.clone(), pid)))
+        .collect()
+}
+
+async fn is_planned_process_exit(
+    planned_exits: &Arc<Mutex<HashSet<(String, u32)>>>,
+    id: &str,
+    pid: Option<u32>,
+) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    let key = (id.to_string(), pid);
+    let mut planned = planned_exits.lock().await;
+    planned.remove(&key)
+}
+
 const SSE_WAIT_MESSAGE: &str = "Waiting for SSE connection...";
 const BLOCK_WAIT_MESSAGE: &str = "Waiting for new blocks...";
 
@@ -609,6 +898,7 @@ struct SseHealth {
     versions: HashMap<u32, String>,
     announced: bool,
     block_seen: bool,
+    last_uniform_version_announced: Option<String>,
     sse_spinner: Option<Spinner>,
     block_spinner: Option<Spinner>,
     details: String,
@@ -621,6 +911,7 @@ impl SseHealth {
             versions: HashMap::new(),
             announced: false,
             block_seen: false,
+            last_uniform_version_announced: None,
             sse_spinner: None,
             block_spinner: None,
             details,
@@ -673,6 +964,7 @@ async fn run_sse_listener(
     layout: AssetsLayout,
 ) {
     let mut backoff = ExponentialBackoff::default();
+    let mut connection_version: Option<String> = None;
 
     loop {
         let config = match ListenerConfig::builder()
@@ -702,12 +994,14 @@ async fn run_sse_listener(
         };
 
         futures::pin_mut!(stream);
-        let mut stream_failed = false;
+        let mut disconnect_reason: Option<String> = None;
         while let Some(event) = stream.next().await {
             match event {
                 Ok(sse_event) => match sse_event {
                     SseEvent::ApiVersion(version) => {
-                        record_api_version(node_id, version.to_string(), &health).await;
+                        let version = version.to_string();
+                        connection_version = Some(version.clone());
+                        record_api_version(node_id, version, &health).await;
                     }
                     SseEvent::BlockAdded { block_hash, block } => {
                         if node_id == 1
@@ -750,48 +1044,94 @@ async fn run_sse_listener(
                             );
                         }
                     }
+                    SseEvent::Shutdown => {
+                        let prefix = timestamp_prefix();
+                        let version = connection_version.as_deref().unwrap_or("unknown");
+                        println!(
+                            "{} node-{} reported shutdown over SSE (api_version={})",
+                            prefix, node_id, version
+                        );
+                        connection_version = None;
+                    }
                     _ => {}
                 },
-                Err(_) => {
-                    stream_failed = true;
+                Err(err) => {
+                    disconnect_reason = Some(format!("stream error: {}", err));
                     break;
                 }
             }
         }
 
-        if stream_failed && !sleep_backoff(&mut backoff).await {
+        if disconnect_reason.is_none() {
+            disconnect_reason = Some("stream closed".to_string());
+        }
+        if let Some(version) = connection_version.as_deref()
+            && let Some(reason) = disconnect_reason.as_deref()
+        {
+            let prefix = timestamp_prefix();
+            println!(
+                "{} node-{} SSE connection lost (api_version={}, reason={})",
+                prefix, node_id, version, reason
+            );
+        }
+        connection_version = None;
+
+        if !sleep_backoff(&mut backoff).await {
             return;
         }
     }
 }
 
 async fn record_api_version(node_id: u32, version: String, health: &Arc<Mutex<SseHealth>>) {
-    let (summary, details, sse_spinner) = {
+    let (summary, details, sse_spinner, should_log) = {
         let mut state = health.lock().await;
         if !state.expected_nodes.contains(&node_id) {
             return;
         }
         state.versions.insert(node_id, version);
-        if state.announced || state.versions.len() != state.expected_nodes.len() {
+        if state.versions.len() != state.expected_nodes.len() {
             return;
         }
 
         let summary = version_summary(&state.versions);
-        let details = state.details.clone();
-        let sse_spinner = state.sse_spinner.take();
-        if state.block_spinner.is_none() {
-            state.block_spinner = Some(start_spinner(BLOCK_WAIT_MESSAGE));
-        }
-        state.announced = true;
-        state.block_seen = false;
-        (summary, details, sse_spinner)
+        let uniform = uniform_network_version(&state.versions);
+        let mut details = None;
+        let mut sse_spinner = None;
+        let should_log = if !state.announced {
+            details = Some(state.details.clone());
+            sse_spinner = state.sse_spinner.take();
+            if state.block_spinner.is_none() {
+                state.block_spinner = Some(start_spinner(BLOCK_WAIT_MESSAGE));
+            }
+            state.announced = true;
+            state.block_seen = false;
+            if let Some(uniform) = uniform {
+                state.last_uniform_version_announced = Some(uniform);
+            }
+            true
+        } else if let Some(uniform) = uniform {
+            if state.last_uniform_version_announced.as_deref() != Some(uniform.as_str()) {
+                state.last_uniform_version_announced = Some(uniform);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        (summary, details, sse_spinner, should_log)
     };
 
-    if let Some(mut spinner) = sse_spinner {
-        spinner.stop_with_message("SSE connection established.".to_string());
+    if should_log {
+        if let Some(mut spinner) = sse_spinner {
+            spinner.stop_with_message("SSE connection established.".to_string());
+        }
+        println!("Network is healthy ({})", summary);
+        if let Some(details) = details {
+            println!("{}", details);
+        }
     }
-    println!("Network is healthy ({})", summary);
-    println!("{}", details);
 }
 
 async fn mark_block_seen(health: &Arc<Mutex<SseHealth>>, layout: &AssetsLayout) {
@@ -841,6 +1181,17 @@ fn version_summary(versions: &HashMap<u32, String>) -> String {
         format!("version {}", unique[0])
     } else {
         format!("versions {}", unique.join(", "))
+    }
+}
+
+fn uniform_network_version(versions: &HashMap<u32, String>) -> Option<String> {
+    let mut unique: Vec<String> = versions.values().cloned().collect();
+    unique.sort();
+    unique.dedup();
+    if unique.len() == 1 {
+        unique.into_iter().next()
+    } else {
+        None
     }
 }
 
@@ -1039,12 +1390,55 @@ async fn run_is_ready(args: IsReadyArgs) -> Result<()> {
 }
 
 async fn run_assets_add(args: AssetsAddArgs) -> Result<()> {
-    if looks_like_url(&args.path) {
+    if is_custom_asset_add_requested(&args) {
+        let mut missing = Vec::new();
+        if args.casper_node.is_none() {
+            missing.push("--casper-node");
+        }
+        if args.casper_sidecar.is_none() {
+            missing.push("--casper-sidecar");
+        }
+        if args.chainspec.is_none() {
+            missing.push("--chainspec");
+        }
+        if args.node_config.is_none() {
+            missing.push("--node-config");
+        }
+        if args.sidecar_config.is_none() {
+            missing.push("--sidecar-config");
+        }
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "custom asset mode requires: {}",
+                missing.join(", ")
+            ));
+        }
+
+        let opts = CustomAssetInstallOptions {
+            name: args.path_or_name.clone(),
+            casper_node: args.casper_node.expect("checked above"),
+            casper_sidecar: args.casper_sidecar.expect("checked above"),
+            chainspec: args.chainspec.expect("checked above"),
+            node_config: args.node_config.expect("checked above"),
+            sidecar_config: args.sidecar_config.expect("checked above"),
+        };
+        assets::install_custom_asset(&opts).await?;
+        println!(
+            "custom asset '{}' installed into {}",
+            opts.name,
+            assets::custom_assets_root()?.display()
+        );
+        return Ok(());
+    }
+
+    let path = PathBuf::from(&args.path_or_name);
+    if looks_like_url(&path) {
         return Err(anyhow!(
             "assets URL is not supported yet; provide a local .tar.gz path"
         ));
     }
-    assets::install_assets_bundle(&args.path).await?;
+
+    assets::install_assets_bundle(&path).await?;
     println!(
         "assets installed into {}",
         assets::assets_bundle_root()?.display()
@@ -1067,6 +1461,107 @@ async fn run_assets_list() -> Result<()> {
         println!("{}", version);
     }
     Ok(())
+}
+
+async fn run_stage_protocol(args: StageProtocolArgs) -> Result<()> {
+    let assets_root = match &args.net_path {
+        Some(path) => path.clone(),
+        None => assets::default_assets_root()?,
+    };
+    let layout = AssetsLayout::new(assets_root, args.network_name.clone());
+    if !layout.exists().await {
+        return Err(anyhow!(
+            "assets for {} not found under {}; run `start --setup-only` first",
+            layout.network_name(),
+            shorten_home_path(&layout.net_dir().display().to_string())
+        ));
+    }
+
+    let request = ControlRequest::StageProtocol {
+        asset_name: args.asset_name.clone(),
+        protocol_version: args.protocol_version.clone(),
+        activation_point: args.activation_point,
+        restart_sidecars: true,
+        rust_log: None,
+    };
+    let socket_path = layout.control_socket_path();
+    if is_control_socket(&socket_path).await {
+        if let Ok(Some(current_era)) = read_current_era_from_status(1).await
+            && args.activation_point <= current_era
+        {
+            return Err(anyhow!(
+                "activation point {} must be greater than current era {}",
+                args.activation_point,
+                current_era
+            ));
+        }
+
+        return match send_request(&socket_path, &request).await {
+            Ok(ControlResponse::Ok { result }) => {
+                let (staged_nodes, restarted_sidecars, live_mode) = match result {
+                    ControlResult::StageProtocol {
+                        live_mode,
+                        staged_nodes,
+                        restarted_sidecars,
+                    } => (staged_nodes, restarted_sidecars, live_mode),
+                };
+                println!(
+                    "staged protocol {} from custom asset '{}' for {} node(s) (live_mode={})",
+                    args.protocol_version, args.asset_name, staged_nodes, live_mode
+                );
+                if restarted_sidecars.is_empty() {
+                    println!("restarted sidecars: none");
+                } else {
+                    let mut ids = restarted_sidecars;
+                    ids.sort_unstable();
+                    println!(
+                        "restarted sidecars: {}",
+                        ids.into_iter()
+                            .map(|id| format!("node-{}", id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                Ok(())
+            }
+            Ok(ControlResponse::Error { error }) => Err(anyhow!(error)),
+            Err(err) => Err(anyhow!(
+                "failed to stage protocol via live control socket {}: {}",
+                socket_path.display(),
+                err
+            )),
+        };
+    }
+
+    let staged = assets::stage_protocol(
+        &layout,
+        &StageProtocolOptions {
+            asset_name: args.asset_name.clone(),
+            protocol_version: args.protocol_version.clone(),
+            activation_point: args.activation_point,
+        },
+    )
+    .await?;
+    println!(
+        "staged protocol {} from custom asset '{}' for {} node(s) (offline mode; sidecars not restarted)",
+        args.protocol_version, args.asset_name, staged.staged_nodes
+    );
+    Ok(())
+}
+
+async fn is_control_socket(path: &Path) -> bool {
+    tokio_fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+fn is_custom_asset_add_requested(args: &AssetsAddArgs) -> bool {
+    args.casper_node.is_some()
+        || args.casper_sidecar.is_some()
+        || args.chainspec.is_some()
+        || args.node_config.is_some()
+        || args.sidecar_config.is_some()
 }
 
 async fn resolve_protocol_version(candidate: &Option<String>) -> Result<String> {
@@ -1133,6 +1628,31 @@ fn is_pid_running(pid: u32) -> bool {
         Err(Errno::ESRCH) => false,
         Err(_) => true,
     }
+}
+
+async fn read_current_era_from_status(node_id: u32) -> Result<Option<u64>> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let url = format!("{}/status", assets::rest_endpoint(node_id));
+    let response = client.get(&url).send().await?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Ok(None);
+    }
+    let status = response.json::<NodeStatus>().await?;
+    Ok(extract_era_id(status.last_added_block_info.as_ref()))
+}
+
+fn extract_era_id(value: Option<&serde_json::Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(era_id) = value.get("era_id").and_then(|era_id| era_id.as_u64()) {
+        return Some(era_id);
+    }
+    value
+        .get("era_id")
+        .and_then(|era_id| era_id.as_str())
+        .and_then(|era_id| era_id.parse::<u64>().ok())
 }
 
 async fn ensure_rest_ready(state: &State) -> Result<()> {
@@ -1232,10 +1752,13 @@ struct BlockSync {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_hex, format_cspr_u512, format_message_payload, shorten_home_path};
+    use super::{
+        encode_hex, extract_era_id, format_cspr_u512, format_message_payload, shorten_home_path,
+    };
     use casper_types::U512;
     use casper_types::contract_messages::MessagePayload;
     use directories::BaseDirs;
+    use serde_json::json;
 
     #[test]
     fn format_cspr_u512_handles_whole_and_fractional() {
@@ -1286,5 +1809,13 @@ mod tests {
     fn shorten_home_path_keeps_relative_paths() {
         let input = "relative/path";
         assert_eq!(shorten_home_path(input), input);
+    }
+
+    #[test]
+    fn extract_era_id_from_status_payload() {
+        assert_eq!(extract_era_id(Some(&json!({"era_id": 123}))), Some(123));
+        assert_eq!(extract_era_id(Some(&json!({"era_id": "456"}))), Some(456));
+        assert_eq!(extract_era_id(Some(&json!({"era_id": "abc"}))), None);
+        assert_eq!(extract_era_id(None), None);
     }
 }
