@@ -43,3 +43,4 @@ axum = { version = "0.8.8", features = ["ws"] }
 casper-client = "5.0.0"
 rmcp = { version = "0.16.0", features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
 schemars = { version = "1", features = ["derive"] }
+dialoguer = "0.12.0"

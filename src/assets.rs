@@ -281,6 +281,19 @@ pub fn custom_assets_root() -> Result<PathBuf> {
     Ok(assets_bundle_root()?.join("custom"))
 }
 
+pub async fn custom_asset_path(name: &str) -> Result<PathBuf> {
+    validate_custom_asset_name(name)?;
+    let asset_dir = custom_assets_root()?.join(name);
+    if !is_dir(&asset_dir).await {
+        return Err(anyhow!(
+            "custom asset '{}' not found at {}",
+            name,
+            asset_dir.display()
+        ));
+    }
+    Ok(asset_dir)
+}
+
 pub fn file_name(path: &Path) -> Option<&OsStr> {
     path.file_name()
 }
@@ -844,6 +857,27 @@ pub async fn list_bundle_versions() -> Result<Vec<Version>> {
         versions.push(dir_version);
     }
     Ok(versions)
+}
+
+pub async fn list_custom_asset_names() -> Result<Vec<String>> {
+    let root = custom_assets_root()?;
+    if !is_dir(&root).await {
+        return Ok(Vec::new());
+    }
+
+    let mut names = Vec::new();
+    let mut entries = tokio_fs::read_dir(&root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if validate_custom_asset_name(&name).is_ok() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn parse_chainspec_version(contents: &str) -> Result<Version> {
@@ -1711,15 +1745,7 @@ async fn detect_current_node_log_format(layout: &AssetsLayout) -> Result<String>
 }
 
 async fn load_custom_asset(name: &str) -> Result<CustomAssetPaths> {
-    validate_custom_asset_name(name)?;
-    let asset_dir = custom_assets_root()?.join(name);
-    if !is_dir(&asset_dir).await {
-        return Err(anyhow!(
-            "custom asset '{}' not found at {}",
-            name,
-            asset_dir.display()
-        ));
-    }
+    let asset_dir = custom_asset_path(name).await?;
 
     let casper_node =
         canonicalize_required_file(&asset_dir.join("bin").join("casper-node"), "casper-node")

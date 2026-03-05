@@ -13,6 +13,7 @@ use casper_types::U512;
 use casper_types::contract_messages::MessagePayload;
 use casper_types::execution::ExecutionResult;
 use clap::{Args, Parser, Subcommand};
+use dialoguer::Confirm;
 use directories::BaseDirs;
 use futures::StreamExt;
 use nix::errno::Errno;
@@ -56,6 +57,8 @@ enum Command {
     Mcp(McpArgs),
     /// Manage assets bundles.
     Assets(AssetsArgs),
+    /// Manage local network directories.
+    Networks(NetworksArgs),
     /// Stage a protocol upgrade from a custom asset.
     StageProtocol(StageProtocolArgs),
     /// Check whether a network has observed a block yet.
@@ -124,8 +127,10 @@ enum AssetsCommand {
     Add(AssetsAddArgs),
     /// Download assets bundles from the upstream release.
     Pull(AssetsPullArgs),
-    /// List available protocol versions in the assets store.
+    /// List available protocol versions and custom assets in the assets store.
     List,
+    /// Print absolute path to a named custom asset directory.
+    Path(AssetsPathArgs),
 }
 
 /// Arguments for `nctl assets add`.
@@ -166,6 +171,54 @@ struct AssetsPullArgs {
     /// Re-download and replace any existing assets.
     #[arg(long)]
     force: bool,
+}
+
+/// Arguments for `nctl assets path`.
+#[derive(Args, Clone)]
+struct AssetsPathArgs {
+    /// Custom asset name.
+    #[arg(value_name = "ASSET_NAME")]
+    asset_name: String,
+}
+
+/// Network directory management arguments.
+#[derive(Args)]
+struct NetworksArgs {
+    #[command(subcommand)]
+    command: NetworksCommand,
+}
+
+/// Network directory management subcommands.
+#[derive(Subcommand)]
+enum NetworksCommand {
+    /// List managed network names.
+    List(NetworksListArgs),
+    /// Remove a managed network from disk.
+    Rm(NetworksRmArgs),
+}
+
+/// Arguments for `nctl networks list`.
+#[derive(Args, Clone)]
+struct NetworksListArgs {
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
+}
+
+/// Arguments for `nctl networks rm`.
+#[derive(Args, Clone)]
+struct NetworksRmArgs {
+    /// Managed network name.
+    #[arg(value_name = "NETWORK_NAME")]
+    network_name: String,
+
+    /// Remove without interactive confirmation.
+    #[arg(short = 'y', long)]
+    yes: bool,
+
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
 }
 
 /// Arguments for `nctl is-ready`.
@@ -211,6 +264,7 @@ pub async fn run() -> Result<()> {
         Command::Start(args) => run_start(args).await,
         Command::Mcp(args) => mcp::run(args).await,
         Command::Assets(args) => run_assets(args).await,
+        Command::Networks(args) => run_networks(args).await,
         Command::StageProtocol(args) => run_stage_protocol(args).await,
         Command::IsReady(args) => run_is_ready(args).await,
     }
@@ -1346,6 +1400,14 @@ async fn run_assets(args: AssetsArgs) -> Result<()> {
         AssetsCommand::Add(add) => run_assets_add(add).await,
         AssetsCommand::Pull(pull) => run_assets_pull(pull).await,
         AssetsCommand::List => run_assets_list().await,
+        AssetsCommand::Path(path) => run_assets_path(path).await,
+    }
+}
+
+async fn run_networks(args: NetworksArgs) -> Result<()> {
+    match args.command {
+        NetworksCommand::List(list) => run_networks_list(list).await,
+        NetworksCommand::Rm(remove) => run_networks_rm(remove).await,
     }
 }
 
@@ -1453,13 +1515,83 @@ async fn run_assets_pull(args: AssetsPullArgs) -> Result<()> {
 
 async fn run_assets_list() -> Result<()> {
     let mut versions = assets::list_bundle_versions().await?;
-    if versions.is_empty() {
-        return Err(anyhow!("no assets bundles found"));
+    let custom_assets = assets::list_custom_asset_names().await?;
+    if versions.is_empty() && custom_assets.is_empty() {
+        return Err(anyhow!("no assets bundles or custom assets found"));
     }
     versions.sort_by(|a, b| b.cmp(a));
     for version in versions {
         println!("{}", version);
     }
+    for name in custom_assets {
+        println!("custom/{}", name);
+    }
+    Ok(())
+}
+
+async fn run_assets_path(args: AssetsPathArgs) -> Result<()> {
+    let path = assets::custom_asset_path(&args.asset_name).await?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+async fn run_networks_list(args: NetworksListArgs) -> Result<()> {
+    let networks_root = match args.net_path {
+        Some(path) => path,
+        None => assets::default_assets_root()?,
+    };
+    if !is_dir(&networks_root).await {
+        return Ok(());
+    }
+
+    let mut names = Vec::new();
+    let mut entries = tokio_fs::read_dir(&networks_root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        names.push(entry.file_name().to_string_lossy().to_string());
+    }
+    names.sort();
+    for name in names {
+        println!("{}", name);
+    }
+    Ok(())
+}
+
+async fn run_networks_rm(args: NetworksRmArgs) -> Result<()> {
+    let networks_root = match args.net_path {
+        Some(path) => path,
+        None => assets::default_assets_root()?,
+    };
+    let net_dir = networks_root.join(&args.network_name);
+    if !is_dir(&net_dir).await {
+        return Err(anyhow!(
+            "managed network '{}' not found at {}",
+            args.network_name,
+            net_dir.display()
+        ));
+    }
+
+    let confirmed = if args.yes {
+        true
+    } else {
+        Confirm::new()
+            .with_prompt(format!(
+                "Remove managed network '{}' from disk?",
+                args.network_name
+            ))
+            .default(false)
+            .interact()?
+    };
+
+    if !confirmed {
+        println!("aborted");
+        return Ok(());
+    }
+
+    tokio_fs::remove_dir_all(&net_dir).await?;
+    println!("removed {}", net_dir.display());
     Ok(())
 }
 

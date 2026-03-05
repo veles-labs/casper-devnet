@@ -117,6 +117,32 @@ casper-devnet assets add dev \
   --sidecar-config /path/to/sidecar-config.toml
 ```
 
+List installed protocol bundles and custom assets:
+
+```bash
+casper-devnet assets list
+```
+
+Print absolute path to a custom asset directory (shell-substitution friendly):
+
+```bash
+casper-devnet assets path dev
+vim "$(casper-devnet assets path dev)/chainspec.toml"
+```
+
+List managed network directories:
+
+```bash
+casper-devnet networks list
+```
+
+Remove a managed network directory from disk:
+
+```bash
+casper-devnet networks rm casper-dev
+casper-devnet networks rm casper-dev --yes
+```
+
 Download assets from the latest release:
 
 ```bash

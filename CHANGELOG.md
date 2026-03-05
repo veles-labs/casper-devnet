@@ -6,20 +6,22 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
-- Add named custom override assets via
-  `assets add <name> --casper-node --casper-sidecar --chainspec --node-config --sidecar-config`.
-- Add `stage-protocol` CLI command for staging a protocol upgrade from a custom asset.
-- Add MCP `stage_protocol` tool with live (managed network) and offline (filesystem-only) modes.
-- Add per-network control socket at `/tmp/<network>.socket` for live staging commands.
+- Add custom override assets and protocol staging workflows across CLI and MCP:
+  `assets add <name> --casper-node --casper-sidecar --chainspec --node-config --sidecar-config`,
+  `stage-protocol`, MCP `stage_protocol`, and per-network live control sockets
+  (`/tmp/<network>.socket`).
+- Add asset and network management helpers:
+  `assets path <name>`, `assets list` custom-asset visibility, `networks list`, and
+  `networks rm <name>` (interactive confirmation or `--yes`).
 
 ### Changed
-- Protocol staging now writes per-node versioned `bin/<version>` and `config/<version>` trees from
-  custom assets and patches chainspec/node/sidecar configs for the target network.
-- Live staging now restarts sidecars in place instead of requiring a full `start` restart cycle.
-- Runtime supervisor logs now surface upgrade-boundary behavior (launcher upgrade notes, SSE
-  shutdown/disconnect events, and post-reconnect `Network is healthy` API version re-announcement).
-- Node and sidecar log aliases are atomically repointed to versioned log files across protocol
-  transitions and sidecar restarts.
+- Protocol staging now writes per-node versioned `bin/<version>` and `config/<version>` trees,
+  patches chainspec/node/sidecar configs for the target network, and restarts sidecars in live
+  mode without requiring a full `start` restart cycle.
+- Runtime supervisor logs now make upgrade transitions explicit (launcher upgrade notes,
+  SSE shutdown/disconnect visibility, and post-reconnect `Network is healthy` API re-announcement).
+- Node and sidecar log aliases are atomically repointed to active versioned log files across
+  protocol transitions and sidecar restarts.
 
 ### Deprecated
 
