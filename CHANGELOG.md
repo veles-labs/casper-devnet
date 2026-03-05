@@ -13,15 +13,23 @@ Semantic Versioning.
 - Add asset and network management helpers:
   `assets path <name>`, `assets list` custom-asset visibility, `networks list`, and
   `networks rm <name>` (interactive confirmation or `--yes`).
+- Add custom-asset hook scaffolding under `assets/custom/<name>/hooks/` with executable
+  `pre-stage-protocol.sample` and `post-stage-protocol.sample` templates.
 
 ### Changed
 - Protocol staging now writes per-node versioned `bin/<version>` and `config/<version>` trees,
   patches chainspec/node/sidecar configs for the target network, and restarts sidecars in live
   mode without requiring a full `start` restart cycle.
+- Protocol staging now runs optional custom-asset hooks: `pre-stage-protocol` before any staging
+  mutation and `post-stage-protocol` once at the real upgrade boundary after the launcher starts
+  the target validator version. Hook stdout/stderr are captured under
+  `networks/<network>/daemon/hooks/logs/`.
 - Runtime supervisor logs now make upgrade transitions explicit (launcher upgrade notes,
   SSE shutdown/disconnect visibility, and post-reconnect `Network is healthy` API re-announcement).
 - Node and sidecar log aliases are atomically repointed to active versioned log files across
   protocol transitions and sidecar restarts.
+- Custom `assets add <name> ...` installs are now write-once: reusing an existing custom asset
+  name fails instead of replacing that directory in place.
 
 ### Deprecated
 

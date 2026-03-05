@@ -9,11 +9,12 @@ use flate2::read::GzDecoder;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Cursor, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -47,6 +48,40 @@ const SECRET_KEY_PEM: &str = "secret_key.pem";
 const MOTE_PER_CSPR: u128 = 1_000_000_000;
 const PROGRESS_TICK_MS: u64 = 120;
 const CONTROL_SOCKET_NAME_MAX: usize = 80;
+const HOOKS_DIR_NAME: &str = "hooks";
+const HOOKS_PENDING_DIR_NAME: &str = "pending";
+const HOOKS_STATUS_DIR_NAME: &str = "status";
+const HOOKS_LOGS_DIR_NAME: &str = "logs";
+const PRE_STAGE_PROTOCOL_HOOK: &str = "pre-stage-protocol";
+const POST_STAGE_PROTOCOL_HOOK: &str = "post-stage-protocol";
+const PRE_STAGE_PROTOCOL_SAMPLE: &str = "pre-stage-protocol.sample";
+const POST_STAGE_PROTOCOL_SAMPLE: &str = "post-stage-protocol.sample";
+const HOOK_FILE_MODE: u32 = 0o755;
+const PRE_STAGE_PROTOCOL_SAMPLE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+# Copy this file to hooks/pre-stage-protocol to activate it.
+# argv: <network_name> <protocol_version> <activation_point>
+# cwd:  the running network directory (networks/<network>)
+
+network_name="${1:?missing network name}"
+protocol_version="${2:?missing protocol version}"
+activation_point="${3:?missing activation point}"
+
+echo "sample pre-stage-protocol hook: network=${network_name} protocol_version=${protocol_version} activation_point=${activation_point}"
+"#;
+const POST_STAGE_PROTOCOL_SAMPLE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+# Copy this file to hooks/post-stage-protocol to activate it.
+# argv: <network_name> <protocol_version>
+# cwd:  the running network directory (networks/<network>)
+
+network_name="${1:?missing network name}"
+protocol_version="${2:?missing protocol version}"
+
+echo "sample post-stage-protocol hook: network=${network_name} protocol_version=${protocol_version}"
+"#;
 
 #[derive(Debug)]
 struct DerivedAccountMaterial {
@@ -154,6 +189,26 @@ impl AssetsLayout {
     /// Directory for daemon-related artifacts.
     pub fn daemon_dir(&self) -> PathBuf {
         self.net_dir().join("daemon")
+    }
+
+    /// Directory for per-network hook metadata and logs.
+    pub fn hooks_dir(&self) -> PathBuf {
+        self.daemon_dir().join(HOOKS_DIR_NAME)
+    }
+
+    /// Directory for pending hook metadata.
+    pub fn hooks_pending_dir(&self) -> PathBuf {
+        self.hooks_dir().join(HOOKS_PENDING_DIR_NAME)
+    }
+
+    /// Directory for hook completion state.
+    pub fn hooks_status_dir(&self) -> PathBuf {
+        self.hooks_dir().join(HOOKS_STATUS_DIR_NAME)
+    }
+
+    /// Directory for hook stdout/stderr logs.
+    pub fn hook_logs_dir(&self) -> PathBuf {
+        self.hooks_dir().join(HOOKS_LOGS_DIR_NAME)
     }
 
     /// Path to the control socket for runtime operations.
@@ -372,8 +427,55 @@ pub struct StageProtocolOptions {
     pub activation_point: u64,
 }
 
+#[derive(Debug)]
 pub struct StageProtocolResult {
     pub staged_nodes: u32,
+}
+
+#[derive(Clone, Debug)]
+struct HookLogPaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingPostStageProtocolHook {
+    asset_name: String,
+    network_name: String,
+    protocol_version: String,
+    activation_point: u64,
+    command_path: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CompletedPostStageProtocolHook {
+    asset_name: String,
+    network_name: String,
+    protocol_version: String,
+    activation_point: u64,
+    command_path: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    status: HookRunStatus,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    completed_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HookRunStatus {
+    Success,
+    Failure,
+}
+
+pub(crate) enum PendingPostStageProtocolHookResult {
+    NotRun,
+    Succeeded,
+    Failed(String),
 }
 
 /// Create or refresh local assets for a devnet.
@@ -444,8 +546,12 @@ pub async fn install_custom_asset(opts: &CustomAssetInstallOptions) -> Result<()
 
     let root = custom_assets_root()?;
     let asset_dir = root.join(&opts.name);
-    if is_dir(&asset_dir).await {
-        tokio_fs::remove_dir_all(&asset_dir).await?;
+    if tokio_fs::symlink_metadata(&asset_dir).await.is_ok() {
+        return Err(anyhow!(
+            "custom asset '{}' already exists at {}",
+            opts.name,
+            asset_dir.display()
+        ));
     }
 
     tokio_fs::create_dir_all(asset_dir.join("bin")).await?;
@@ -454,6 +560,7 @@ pub async fn install_custom_asset(opts: &CustomAssetInstallOptions) -> Result<()
     symlink_file(&chainspec_src, &asset_dir.join("chainspec.toml")).await?;
     symlink_file(&node_config_src, &asset_dir.join("node-config.toml")).await?;
     symlink_file(&sidecar_config_src, &asset_dir.join("sidecar-config.toml")).await?;
+    create_default_hook_samples(&asset_dir).await?;
 
     Ok(())
 }
@@ -482,6 +589,13 @@ pub async fn stage_protocol(
 
     let node_log_format = detect_current_node_log_format(layout).await?;
     let accounts_path = layout.net_dir().join("chainspec/accounts.toml");
+    run_pre_stage_protocol_hook(
+        layout,
+        &custom_asset,
+        &protocol_version_chain,
+        opts.activation_point,
+    )
+    .await?;
 
     for node_id in 1..=total_nodes {
         let node_bin_version_dir = layout.node_bin_dir(node_id).join(&protocol_version_fs);
@@ -628,6 +742,8 @@ pub async fn stage_protocol(
         .await?;
         tokio_fs::write(&sidecar_dest, updated_sidecar).await?;
     }
+
+    refresh_post_stage_protocol_hook(layout, &custom_asset, opts, &protocol_version_chain).await?;
 
     Ok(StageProtocolResult {
         staged_nodes: total_nodes,
@@ -1715,6 +1831,341 @@ struct CustomAssetPaths {
     chainspec: PathBuf,
     node_config: PathBuf,
     sidecar_config: PathBuf,
+    pre_stage_protocol_hook: Option<PathBuf>,
+    post_stage_protocol_hook: Option<PathBuf>,
+}
+
+async fn create_default_hook_samples(asset_dir: &Path) -> Result<()> {
+    let hooks_dir = asset_dir.join(HOOKS_DIR_NAME);
+    tokio_fs::create_dir_all(&hooks_dir).await?;
+    write_executable_script(
+        &hooks_dir.join(PRE_STAGE_PROTOCOL_SAMPLE),
+        PRE_STAGE_PROTOCOL_SAMPLE_SCRIPT,
+    )
+    .await?;
+    write_executable_script(
+        &hooks_dir.join(POST_STAGE_PROTOCOL_SAMPLE),
+        POST_STAGE_PROTOCOL_SAMPLE_SCRIPT,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn write_executable_script(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+    tokio_fs::write(path, contents).await?;
+    tokio_fs::set_permissions(path, std::fs::Permissions::from_mode(HOOK_FILE_MODE)).await?;
+    Ok(())
+}
+
+fn protocol_version_fs(protocol_version: &str) -> String {
+    protocol_version.replace('.', "_")
+}
+
+fn hook_log_paths(logs_dir: &Path, hook_name: &str, protocol_version: &str) -> HookLogPaths {
+    let base = format!("{hook_name}-{}", protocol_version_fs(protocol_version));
+    HookLogPaths {
+        stdout: logs_dir.join(format!("{base}.stdout.log")),
+        stderr: logs_dir.join(format!("{base}.stderr.log")),
+    }
+}
+
+fn pending_post_stage_protocol_hook_path(hooks_dir: &Path, protocol_version: &str) -> PathBuf {
+    hooks_dir.join(HOOKS_PENDING_DIR_NAME).join(format!(
+        "{POST_STAGE_PROTOCOL_HOOK}-{}.json",
+        protocol_version_fs(protocol_version)
+    ))
+}
+
+fn post_stage_protocol_claim_path(hooks_dir: &Path, protocol_version: &str) -> PathBuf {
+    hooks_dir.join(HOOKS_STATUS_DIR_NAME).join(format!(
+        "{POST_STAGE_PROTOCOL_HOOK}-{}.claimed",
+        protocol_version_fs(protocol_version)
+    ))
+}
+
+fn post_stage_protocol_completion_path(hooks_dir: &Path, protocol_version: &str) -> PathBuf {
+    hooks_dir.join(HOOKS_STATUS_DIR_NAME).join(format!(
+        "{POST_STAGE_PROTOCOL_HOOK}-{}.json",
+        protocol_version_fs(protocol_version)
+    ))
+}
+
+async fn run_pre_stage_protocol_hook(
+    layout: &AssetsLayout,
+    custom_asset: &CustomAssetPaths,
+    protocol_version: &str,
+    activation_point: u64,
+) -> Result<()> {
+    let Some(command_path) = &custom_asset.pre_stage_protocol_hook else {
+        return Ok(());
+    };
+
+    let log_paths = hook_log_paths(
+        &layout.hook_logs_dir(),
+        PRE_STAGE_PROTOCOL_HOOK,
+        protocol_version,
+    );
+    let args = vec![
+        layout.network_name().to_string(),
+        protocol_version.to_string(),
+        activation_point.to_string(),
+    ];
+    let exit_status =
+        execute_hook_command(command_path, &args, &layout.net_dir(), &log_paths).await?;
+    if !exit_status.success() {
+        return Err(anyhow!(
+            "{} hook {} exited with status {}",
+            PRE_STAGE_PROTOCOL_HOOK,
+            command_path.display(),
+            exit_status
+        ));
+    }
+    Ok(())
+}
+
+async fn refresh_post_stage_protocol_hook(
+    layout: &AssetsLayout,
+    custom_asset: &CustomAssetPaths,
+    opts: &StageProtocolOptions,
+    protocol_version: &str,
+) -> Result<()> {
+    clear_post_stage_protocol_hook_state(layout, protocol_version).await?;
+
+    let Some(command_path) = &custom_asset.post_stage_protocol_hook else {
+        return Ok(());
+    };
+
+    tokio_fs::create_dir_all(layout.hooks_pending_dir()).await?;
+    tokio_fs::create_dir_all(layout.hooks_status_dir()).await?;
+    tokio_fs::create_dir_all(layout.hook_logs_dir()).await?;
+
+    let log_paths = hook_log_paths(
+        &layout.hook_logs_dir(),
+        POST_STAGE_PROTOCOL_HOOK,
+        protocol_version,
+    );
+    let pending = PendingPostStageProtocolHook {
+        asset_name: opts.asset_name.clone(),
+        network_name: layout.network_name().to_string(),
+        protocol_version: protocol_version.to_string(),
+        activation_point: opts.activation_point,
+        command_path: command_path.clone(),
+        stdout_path: log_paths.stdout,
+        stderr_path: log_paths.stderr,
+    };
+    write_json_atomic(
+        &pending_post_stage_protocol_hook_path(&layout.hooks_dir(), protocol_version),
+        &pending,
+    )
+    .await
+}
+
+async fn clear_post_stage_protocol_hook_state(
+    layout: &AssetsLayout,
+    protocol_version: &str,
+) -> Result<()> {
+    let hooks_dir = layout.hooks_dir();
+    remove_file_if_exists(&pending_post_stage_protocol_hook_path(
+        &hooks_dir,
+        protocol_version,
+    ))
+    .await?;
+    remove_file_if_exists(&post_stage_protocol_claim_path(
+        &hooks_dir,
+        protocol_version,
+    ))
+    .await?;
+    remove_file_if_exists(&post_stage_protocol_completion_path(
+        &hooks_dir,
+        protocol_version,
+    ))
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn run_pending_post_stage_protocol_hook(
+    hooks_dir: &Path,
+    network_dir: &Path,
+    protocol_version: &Version,
+) -> Result<PendingPostStageProtocolHookResult> {
+    let protocol_version = protocol_version.to_string();
+    let pending_path = pending_post_stage_protocol_hook_path(hooks_dir, &protocol_version);
+    if !is_file(&pending_path).await {
+        return Ok(PendingPostStageProtocolHookResult::NotRun);
+    }
+
+    let claim_path = post_stage_protocol_claim_path(hooks_dir, &protocol_version);
+    if !try_create_claim_marker(&claim_path).await? {
+        return Ok(PendingPostStageProtocolHookResult::NotRun);
+    }
+
+    let pending = read_json_file::<PendingPostStageProtocolHook>(&pending_path).await?;
+    let args = vec![
+        pending.network_name.clone(),
+        pending.protocol_version.clone(),
+    ];
+    let completion = match execute_hook_command(
+        &pending.command_path,
+        &args,
+        network_dir,
+        &HookLogPaths {
+            stdout: pending.stdout_path.clone(),
+            stderr: pending.stderr_path.clone(),
+        },
+    )
+    .await
+    {
+        Ok(exit_status) if exit_status.success() => CompletedPostStageProtocolHook {
+            asset_name: pending.asset_name.clone(),
+            network_name: pending.network_name.clone(),
+            protocol_version: pending.protocol_version.clone(),
+            activation_point: pending.activation_point,
+            command_path: pending.command_path.clone(),
+            stdout_path: pending.stdout_path.clone(),
+            stderr_path: pending.stderr_path.clone(),
+            status: HookRunStatus::Success,
+            exit_code: exit_status.code(),
+            error: None,
+            completed_at: OffsetDateTime::now_utc(),
+        },
+        Ok(exit_status) => CompletedPostStageProtocolHook {
+            asset_name: pending.asset_name.clone(),
+            network_name: pending.network_name.clone(),
+            protocol_version: pending.protocol_version.clone(),
+            activation_point: pending.activation_point,
+            command_path: pending.command_path.clone(),
+            stdout_path: pending.stdout_path.clone(),
+            stderr_path: pending.stderr_path.clone(),
+            status: HookRunStatus::Failure,
+            exit_code: exit_status.code(),
+            error: Some(format!(
+                "{} hook {} exited with status {}",
+                POST_STAGE_PROTOCOL_HOOK,
+                pending.command_path.display(),
+                exit_status
+            )),
+            completed_at: OffsetDateTime::now_utc(),
+        },
+        Err(err) => CompletedPostStageProtocolHook {
+            asset_name: pending.asset_name.clone(),
+            network_name: pending.network_name.clone(),
+            protocol_version: pending.protocol_version.clone(),
+            activation_point: pending.activation_point,
+            command_path: pending.command_path.clone(),
+            stdout_path: pending.stdout_path.clone(),
+            stderr_path: pending.stderr_path.clone(),
+            status: HookRunStatus::Failure,
+            exit_code: None,
+            error: Some(err.to_string()),
+            completed_at: OffsetDateTime::now_utc(),
+        },
+    };
+
+    write_json_atomic(
+        &post_stage_protocol_completion_path(hooks_dir, &protocol_version),
+        &completion,
+    )
+    .await?;
+    remove_file_if_exists(&pending_path).await?;
+    Ok(match completion.status {
+        HookRunStatus::Success => PendingPostStageProtocolHookResult::Succeeded,
+        HookRunStatus::Failure => PendingPostStageProtocolHookResult::Failed(
+            completion
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("{POST_STAGE_PROTOCOL_HOOK} hook failed")),
+        ),
+    })
+}
+
+async fn execute_hook_command(
+    command_path: &Path,
+    args: &[String],
+    cwd: &Path,
+    log_paths: &HookLogPaths,
+) -> Result<std::process::ExitStatus> {
+    ensure_executable_hook(command_path).await?;
+    let stdout = open_hook_log_file(&log_paths.stdout).await?;
+    let stderr = open_hook_log_file(&log_paths.stderr).await?;
+    let mut command = Command::new(command_path);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdout(stdout)
+        .stderr(stderr);
+    let mut child = command.spawn()?;
+    Ok(child.wait().await?)
+}
+
+async fn open_hook_log_file(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+    let file = tokio_fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    Ok(file.into_std().await)
+}
+
+async fn ensure_executable_hook(path: &Path) -> Result<()> {
+    let metadata = tokio_fs::metadata(path).await?;
+    if !metadata.is_file() {
+        return Err(anyhow!("hook path {} is not a file", path.display()));
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(anyhow!("hook path {} is not executable", path.display()));
+    }
+    Ok(())
+}
+
+async fn try_create_claim_marker(path: &Path) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+    match tokio_fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+    let tmp_path = path.with_extension(format!(
+        "{}.tmp-{}",
+        path.extension().and_then(OsStr::to_str).unwrap_or("json"),
+        std::process::id()
+    ));
+    tokio_fs::write(&tmp_path, bytes).await?;
+    tokio_fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
+async fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    let contents = tokio_fs::read(path).await?;
+    Ok(serde_json::from_slice(&contents)?)
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match tokio_fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn detect_current_node_log_format(layout: &AssetsLayout) -> Result<String> {
@@ -1762,6 +2213,15 @@ async fn load_custom_asset(name: &str) -> Result<CustomAssetPaths> {
     let sidecar_config =
         canonicalize_required_file(&asset_dir.join("sidecar-config.toml"), "sidecar-config")
             .await?;
+    let pre_stage_protocol_hook =
+        canonicalize_optional_hook(&asset_dir.join(HOOKS_DIR_NAME).join(PRE_STAGE_PROTOCOL_HOOK))
+            .await?;
+    let post_stage_protocol_hook = canonicalize_optional_hook(
+        &asset_dir
+            .join(HOOKS_DIR_NAME)
+            .join(POST_STAGE_PROTOCOL_HOOK),
+    )
+    .await?;
 
     Ok(CustomAssetPaths {
         casper_node,
@@ -1769,7 +2229,22 @@ async fn load_custom_asset(name: &str) -> Result<CustomAssetPaths> {
         chainspec,
         node_config,
         sidecar_config,
+        pre_stage_protocol_hook,
+        post_stage_protocol_hook,
     })
+}
+
+async fn canonicalize_optional_hook(path: &Path) -> Result<Option<PathBuf>> {
+    match tokio_fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if metadata.is_dir() || !is_file(path).await {
+                return Err(anyhow!("hook path {} is not a file", path.display()));
+            }
+            Ok(Some(tokio_fs::canonicalize(path).await?))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn canonicalize_required_file(path: &Path, label: &str) -> Result<PathBuf> {
@@ -1922,8 +2397,146 @@ fn ensure_table<'a>(table: &'a mut toml::value::Table, key: &str) -> &'a mut tom
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetsLayout, format_cspr, validate_custom_asset_name};
-    use std::path::PathBuf;
+    use super::*;
+    use serde_json::Value;
+    use std::env;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use tempfile::TempDir;
+
+    struct TestDataEnv {
+        _lock: MutexGuard<'static, ()>,
+        temp_dir: TempDir,
+        old_home: Option<OsString>,
+        old_xdg_data_home: Option<OsString>,
+    }
+
+    impl TestDataEnv {
+        fn new() -> Self {
+            let lock = test_env_lock().lock().expect("env test lock poisoned");
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let old_home = env::var_os("HOME");
+            let old_xdg_data_home = env::var_os("XDG_DATA_HOME");
+            unsafe {
+                env::set_var("HOME", temp_dir.path());
+                env::set_var("XDG_DATA_HOME", temp_dir.path().join("xdg-data"));
+            }
+            Self {
+                _lock: lock,
+                temp_dir,
+                old_home,
+                old_xdg_data_home,
+            }
+        }
+
+        fn root(&self) -> &Path {
+            self.temp_dir.path()
+        }
+    }
+
+    impl Drop for TestDataEnv {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_home {
+                unsafe {
+                    env::set_var("HOME", value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var("HOME");
+                }
+            }
+            if let Some(value) = &self.old_xdg_data_home {
+                unsafe {
+                    env::set_var("XDG_DATA_HOME", value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var("XDG_DATA_HOME");
+                }
+            }
+        }
+    }
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn create_fake_binary(path: &Path, label: &str) -> Result<()> {
+        write_executable_script(
+            path,
+            &format!(
+                "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  echo \"{label} 1.0.0\"\n  exit 0\nfi\nexit 0\n"
+            ),
+        )
+        .await
+    }
+
+    async fn create_test_custom_asset_sources(
+        root: &Path,
+        name: &str,
+    ) -> Result<CustomAssetInstallOptions> {
+        let source_dir = root.join("sources").join(name);
+        tokio_fs::create_dir_all(&source_dir).await?;
+        let node_path = source_dir.join("casper-node");
+        let sidecar_path = source_dir.join("casper-sidecar");
+        create_fake_binary(&node_path, "casper-node").await?;
+        create_fake_binary(&sidecar_path, "casper-sidecar").await?;
+        let chainspec = source_dir.join("chainspec.toml");
+        let node_config = source_dir.join("node-config.toml");
+        let sidecar_config = source_dir.join("sidecar-config.toml");
+        tokio_fs::write(&chainspec, "").await?;
+        tokio_fs::write(&node_config, "").await?;
+        tokio_fs::write(&sidecar_config, "").await?;
+        Ok(CustomAssetInstallOptions {
+            name: name.to_string(),
+            casper_node: node_path,
+            casper_sidecar: sidecar_path,
+            chainspec,
+            node_config,
+            sidecar_config,
+        })
+    }
+
+    async fn install_test_custom_asset(env: &TestDataEnv, name: &str) -> Result<PathBuf> {
+        let options = create_test_custom_asset_sources(env.root(), name).await?;
+        install_custom_asset(&options).await?;
+        custom_asset_path(name).await
+    }
+
+    async fn create_test_network_layout(
+        root: &Path,
+        network_name: &str,
+        current_version: &str,
+    ) -> Result<AssetsLayout> {
+        let layout = AssetsLayout::new(root.join("networks"), network_name.to_string());
+        let version_fs = protocol_version_fs(current_version);
+        tokio_fs::create_dir_all(layout.node_bin_dir(1).join(&version_fs)).await?;
+        tokio_fs::create_dir_all(layout.node_config_root(1).join(&version_fs)).await?;
+        tokio_fs::create_dir_all(layout.node_dir(1).join("logs")).await?;
+        tokio_fs::create_dir_all(layout.node_dir(1).join("storage")).await?;
+        tokio_fs::create_dir_all(layout.node_dir(1).join("keys")).await?;
+        tokio_fs::create_dir_all(layout.net_dir().join("chainspec")).await?;
+        tokio_fs::write(
+            layout
+                .node_config_root(1)
+                .join(&version_fs)
+                .join("config.toml"),
+            "[logging]\nformat = \"text\"\n",
+        )
+        .await?;
+        tokio_fs::write(layout.net_dir().join("chainspec/accounts.toml"), "").await?;
+        Ok(layout)
+    }
+
+    fn stage_options(asset_name: &str, protocol_version: &str) -> StageProtocolOptions {
+        StageProtocolOptions {
+            asset_name: asset_name.to_string(),
+            protocol_version: protocol_version.to_string(),
+            activation_point: 123,
+        }
+    }
 
     #[test]
     fn format_cspr_handles_whole_and_fractional() {
@@ -1962,5 +2575,194 @@ mod tests {
             socket_path,
             std::env::temp_dir().join("my_network_with_spaces.socket")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_custom_asset_creates_executable_hook_samples() {
+        let env = TestDataEnv::new();
+        let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
+
+        let pre_sample = asset_dir
+            .join(HOOKS_DIR_NAME)
+            .join(PRE_STAGE_PROTOCOL_SAMPLE);
+        let post_sample = asset_dir
+            .join(HOOKS_DIR_NAME)
+            .join(POST_STAGE_PROTOCOL_SAMPLE);
+
+        assert!(is_file(&pre_sample).await);
+        assert!(is_file(&post_sample).await);
+        assert_ne!(
+            tokio_fs::metadata(&pre_sample)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_ne!(
+            tokio_fs::metadata(&post_sample)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_custom_asset_rejects_duplicate_names_without_mutation() {
+        let env = TestDataEnv::new();
+        let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
+        let sentinel = asset_dir.join("sentinel.txt");
+        tokio_fs::write(&sentinel, "keep").await.unwrap();
+
+        let duplicate = create_test_custom_asset_sources(env.root(), "dev")
+            .await
+            .unwrap();
+        let err = install_custom_asset(&duplicate).await.unwrap_err();
+
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(tokio_fs::read_to_string(&sentinel).await.unwrap(), "keep");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stage_protocol_ignores_sample_hook_files() {
+        let env = TestDataEnv::new();
+        let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0")
+            .await
+            .unwrap();
+        write_executable_script(
+            &asset_dir
+                .join(HOOKS_DIR_NAME)
+                .join(PRE_STAGE_PROTOCOL_SAMPLE),
+            "#!/bin/sh\nset -eu\necho sample-ran > \"$PWD/sample-hook-ran\"\n",
+        )
+        .await
+        .unwrap();
+
+        stage_protocol(&layout, &stage_options("dev", "2.0.0"))
+            .await
+            .unwrap();
+
+        assert!(!is_file(&layout.net_dir().join("sample-hook-ran")).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stage_protocol_aborts_before_mutation_when_pre_hook_fails() {
+        let env = TestDataEnv::new();
+        let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0")
+            .await
+            .unwrap();
+        write_executable_script(
+            &asset_dir.join(HOOKS_DIR_NAME).join(PRE_STAGE_PROTOCOL_HOOK),
+            "#!/bin/sh\nset -eu\necho pre-hook-start >&2\nexit 7\n",
+        )
+        .await
+        .unwrap();
+
+        let err = stage_protocol(&layout, &stage_options("dev", "2.0.0"))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains(PRE_STAGE_PROTOCOL_HOOK));
+        assert!(!is_dir(&layout.node_bin_dir(1).join("2_0_0")).await);
+        assert!(!is_dir(&layout.node_config_root(1).join("2_0_0")).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stage_protocol_runs_pre_hook_and_writes_pending_post_hook_metadata() {
+        let env = TestDataEnv::new();
+        let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0")
+            .await
+            .unwrap();
+        write_executable_script(
+            &asset_dir.join(HOOKS_DIR_NAME).join(PRE_STAGE_PROTOCOL_HOOK),
+            "#!/bin/sh\nset -eu\nprintf '%s\n' \"$PWD\" > \"$PWD/pre-hook-cwd\"\nprintf '%s,%s,%s\n' \"$1\" \"$2\" \"$3\" > \"$PWD/pre-hook-args\"\necho pre-stdout\necho pre-stderr >&2\n",
+        )
+        .await
+        .unwrap();
+        write_executable_script(
+            &asset_dir
+                .join(HOOKS_DIR_NAME)
+                .join(POST_STAGE_PROTOCOL_HOOK),
+            "#!/bin/sh\nset -eu\necho post-hook\n",
+        )
+        .await
+        .unwrap();
+
+        let stale_claim = post_stage_protocol_claim_path(&layout.hooks_dir(), "2.0.0");
+        let stale_completion = post_stage_protocol_completion_path(&layout.hooks_dir(), "2.0.0");
+        tokio_fs::create_dir_all(layout.hooks_status_dir())
+            .await
+            .unwrap();
+        tokio_fs::write(&stale_claim, "stale").await.unwrap();
+        tokio_fs::write(&stale_completion, "stale").await.unwrap();
+
+        stage_protocol(&layout, &stage_options("dev", "2.0.0"))
+            .await
+            .unwrap();
+
+        let expected_net_dir = tokio_fs::canonicalize(layout.net_dir()).await.unwrap();
+        assert_eq!(
+            tokio_fs::read_to_string(layout.net_dir().join("pre-hook-cwd"))
+                .await
+                .unwrap()
+                .trim(),
+            expected_net_dir.display().to_string()
+        );
+        assert_eq!(
+            tokio_fs::read_to_string(layout.net_dir().join("pre-hook-args"))
+                .await
+                .unwrap()
+                .trim(),
+            "casper-dev,2.0.0,123"
+        );
+
+        let pre_logs = hook_log_paths(&layout.hook_logs_dir(), PRE_STAGE_PROTOCOL_HOOK, "2.0.0");
+        assert_eq!(
+            tokio_fs::read_to_string(&pre_logs.stdout)
+                .await
+                .unwrap()
+                .trim(),
+            "pre-stdout"
+        );
+        assert_eq!(
+            tokio_fs::read_to_string(&pre_logs.stderr)
+                .await
+                .unwrap()
+                .trim(),
+            "pre-stderr"
+        );
+
+        let pending_path = pending_post_stage_protocol_hook_path(&layout.hooks_dir(), "2.0.0");
+        let pending: Value =
+            serde_json::from_slice(&tokio_fs::read(&pending_path).await.unwrap()).unwrap();
+        assert_eq!(pending["asset_name"], "dev");
+        assert_eq!(pending["network_name"], "casper-dev");
+        assert_eq!(pending["protocol_version"], "2.0.0");
+        assert_eq!(pending["activation_point"], 123);
+        assert_eq!(
+            pending["stdout_path"],
+            layout
+                .hook_logs_dir()
+                .join("post-stage-protocol-2_0_0.stdout.log")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            pending["stderr_path"],
+            layout
+                .hook_logs_dir()
+                .join("post-stage-protocol-2_0_0.stderr.log")
+                .display()
+                .to_string()
+        );
+        assert!(!is_file(&stale_claim).await);
+        assert!(!is_file(&stale_completion).await);
     }
 }

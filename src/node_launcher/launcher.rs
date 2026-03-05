@@ -1,3 +1,4 @@
+use crate::assets::{self, PendingPostStageProtocolHookResult};
 use std::{
     collections::BTreeMap,
     mem,
@@ -74,6 +75,12 @@ impl Default for State {
 /// At each state transition, it caches its state to disk so that it can resume the same operation
 /// if restarted.
 #[derive(Debug)]
+struct HookContext {
+    hooks_dir: PathBuf,
+    network_dir: PathBuf,
+}
+
+#[derive(Debug)]
 pub struct Launcher {
     binary_root_dir: PathBuf,
     config_root_dir: PathBuf,
@@ -83,6 +90,7 @@ pub struct Launcher {
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
     cwd: Option<PathBuf>,
+    hook_context: Option<HookContext>,
     rust_log: Option<String>,
 }
 
@@ -113,6 +121,7 @@ impl Launcher {
             stdout_path: None,
             stderr_path: None,
             cwd: None,
+            hook_context: None,
             rust_log: None,
         };
 
@@ -163,6 +172,14 @@ impl Launcher {
     /// Set the working directory for node processes.
     pub fn set_cwd(&mut self, cwd: PathBuf) {
         self.cwd = Some(cwd);
+    }
+
+    /// Set the hook execution context for network-scoped post-stage hooks.
+    pub fn set_hook_context(&mut self, network_dir: PathBuf, hooks_dir: PathBuf) {
+        self.hook_context = Some(HookContext {
+            hooks_dir,
+            network_dir,
+        });
     }
 
     /// Set environment variables for the node process.
@@ -562,7 +579,7 @@ impl Launcher {
                     .arg(VALIDATOR_SUBCOMMAND)
                     .arg(&node_info.config_path);
                 self.configure_command(&mut command).await?;
-                let exit_code = utils::run_node(command, self.child_pid.as_ref()).await?;
+                let exit_code = self.run_validator(command, &node_info.version).await?;
                 info!(version=%node_info.version, "finished running node as validator");
                 exit_code
             }
@@ -586,5 +603,286 @@ impl Launcher {
         };
 
         self.transition_state(exit_code).await
+    }
+
+    async fn run_validator(&self, mut command: Command, version: &Version) -> Result<NodeExitCode> {
+        let mut child =
+            utils::map_and_log_error(command.spawn(), format!("failed to execute {command:?}"))?;
+        if let Some(pid) = child.id() {
+            self.child_pid.store(pid, Ordering::SeqCst);
+        }
+
+        self.spawn_post_stage_protocol_hook(version);
+
+        let exit_status = utils::map_and_log_error(
+            child.wait().await,
+            format!("failed to wait for completion of {command:?}"),
+        )?;
+        self.child_pid.store(0, Ordering::SeqCst);
+
+        match exit_status.code() {
+            Some(code) if code == NodeExitCode::Success as i32 => Ok(NodeExitCode::Success),
+            Some(code) if code == NodeExitCode::ShouldDowngrade as i32 => {
+                Ok(NodeExitCode::ShouldDowngrade)
+            }
+            Some(code) if code == NodeExitCode::ShouldExitLauncher as i32 => {
+                Ok(NodeExitCode::ShouldExitLauncher)
+            }
+            _ => {
+                warn!(%exit_status, "failed running {command:?}");
+                bail!("{command:?} exited with error");
+            }
+        }
+    }
+
+    fn spawn_post_stage_protocol_hook(&self, version: &Version) {
+        let Some(hook_context) = &self.hook_context else {
+            return;
+        };
+        let hook_context = HookContext {
+            hooks_dir: hook_context.hooks_dir.clone(),
+            network_dir: hook_context.network_dir.clone(),
+        };
+        let version = version.clone();
+        tokio::spawn(async move {
+            match assets::run_pending_post_stage_protocol_hook(
+                &hook_context.hooks_dir,
+                &hook_context.network_dir,
+                &version,
+            )
+            .await
+            {
+                Ok(PendingPostStageProtocolHookResult::NotRun)
+                | Ok(PendingPostStageProtocolHookResult::Succeeded) => {}
+                Ok(PendingPostStageProtocolHookResult::Failed(error)) => {
+                    warn!(
+                        %error,
+                        %version,
+                        network_dir=%hook_context.network_dir.display(),
+                        "post-stage-protocol hook failed"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        %version,
+                        network_dir=%hook_context.network_dir.display(),
+                        "failed to run post-stage-protocol hook"
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+    use tokio::time::{Duration, sleep};
+
+    fn test_launcher(network_dir: &Path, hooks_dir: &Path) -> Launcher {
+        Launcher {
+            binary_root_dir: PathBuf::new(),
+            config_root_dir: PathBuf::new(),
+            state: State::default(),
+            child_pid: Arc::new(AtomicU32::new(0)),
+            env: BTreeMap::new(),
+            stdout_path: None,
+            stderr_path: None,
+            cwd: None,
+            hook_context: Some(HookContext {
+                hooks_dir: hooks_dir.to_path_buf(),
+                network_dir: network_dir.to_path_buf(),
+            }),
+            rust_log: None,
+        }
+    }
+
+    async fn write_executable(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            tokio_fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio_fs::write(path, contents).await.unwrap();
+        tokio_fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+    }
+
+    async fn write_pending_post_hook(
+        hooks_dir: &Path,
+        command_path: &Path,
+        network_name: &str,
+        protocol_version: &str,
+        activation_point: u64,
+    ) {
+        let version_fs = protocol_version.replace('.', "_");
+        let logs_dir = hooks_dir.join("logs");
+        tokio_fs::create_dir_all(hooks_dir.join("pending"))
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(&logs_dir).await.unwrap();
+        let pending = serde_json::json!({
+            "asset_name": "dev",
+            "network_name": network_name,
+            "protocol_version": protocol_version,
+            "activation_point": activation_point,
+            "command_path": command_path,
+            "stdout_path": logs_dir.join(format!("post-stage-protocol-{version_fs}.stdout.log")),
+            "stderr_path": logs_dir.join(format!("post-stage-protocol-{version_fs}.stderr.log")),
+        });
+        tokio_fs::write(
+            hooks_dir
+                .join("pending")
+                .join(format!("post-stage-protocol-{version_fs}.json")),
+            serde_json::to_vec_pretty(&pending).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn wait_for_path(path: &Path) {
+        for _ in 0..200 {
+            if tokio_fs::metadata(path).await.is_ok() {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_hook_runs_once_with_network_cwd_and_log_redirection() {
+        let temp_dir = TempDir::new().unwrap();
+        let network_dir = temp_dir.path().join("casper-dev");
+        let hooks_dir = network_dir.join("daemon").join("hooks");
+        tokio_fs::create_dir_all(&network_dir).await.unwrap();
+
+        let hook_script = temp_dir.path().join("post-hook.sh");
+        write_executable(
+            &hook_script,
+            "#!/bin/sh\nset -eu\nprintf '%s\n' \"$PWD\" > \"$PWD/post-hook-cwd\"\nprintf '%s,%s\n' \"$1\" \"$2\" > \"$PWD/post-hook-args\"\necho hook-stdout\necho hook-stderr >&2\necho run >> \"$PWD/post-hook-count\"\n",
+        )
+        .await;
+        write_pending_post_hook(&hooks_dir, &hook_script, "casper-dev", "2.0.0", 123).await;
+
+        let launcher_a = test_launcher(&network_dir, &hooks_dir);
+        let launcher_b = test_launcher(&network_dir, &hooks_dir);
+        let version = Version::new(2, 0, 0);
+        launcher_a.spawn_post_stage_protocol_hook(&version);
+        launcher_b.spawn_post_stage_protocol_hook(&version);
+
+        let completion_path = hooks_dir
+            .join("status")
+            .join("post-stage-protocol-2_0_0.json");
+        wait_for_path(&completion_path).await;
+
+        let expected_network_dir = tokio_fs::canonicalize(&network_dir).await.unwrap();
+        assert_eq!(
+            tokio_fs::read_to_string(network_dir.join("post-hook-cwd"))
+                .await
+                .unwrap()
+                .trim(),
+            expected_network_dir.display().to_string()
+        );
+        assert_eq!(
+            tokio_fs::read_to_string(network_dir.join("post-hook-args"))
+                .await
+                .unwrap()
+                .trim(),
+            "casper-dev,2.0.0"
+        );
+        assert_eq!(
+            tokio_fs::read_to_string(network_dir.join("post-hook-count"))
+                .await
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            tokio_fs::read_to_string(
+                hooks_dir
+                    .join("logs")
+                    .join("post-stage-protocol-2_0_0.stdout.log"),
+            )
+            .await
+            .unwrap()
+            .trim(),
+            "hook-stdout"
+        );
+        assert_eq!(
+            tokio_fs::read_to_string(
+                hooks_dir
+                    .join("logs")
+                    .join("post-stage-protocol-2_0_0.stderr.log"),
+            )
+            .await
+            .unwrap()
+            .trim(),
+            "hook-stderr"
+        );
+        assert!(
+            tokio_fs::metadata(
+                hooks_dir
+                    .join("pending")
+                    .join("post-stage-protocol-2_0_0.json"),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_post_hook_is_marked_consumed_after_first_attempt() {
+        let temp_dir = TempDir::new().unwrap();
+        let network_dir = temp_dir.path().join("casper-dev");
+        let hooks_dir = network_dir.join("daemon").join("hooks");
+        tokio_fs::create_dir_all(&network_dir).await.unwrap();
+
+        let hook_script = temp_dir.path().join("post-hook-fail.sh");
+        write_executable(
+            &hook_script,
+            "#!/bin/sh\nset -eu\necho run >> \"$PWD/post-hook-count\"\necho failing >&2\nexit 7\n",
+        )
+        .await;
+        write_pending_post_hook(&hooks_dir, &hook_script, "casper-dev", "2.0.0", 123).await;
+
+        let launcher = test_launcher(&network_dir, &hooks_dir);
+        let version = Version::new(2, 0, 0);
+        launcher.spawn_post_stage_protocol_hook(&version);
+
+        let completion_path = hooks_dir
+            .join("status")
+            .join("post-stage-protocol-2_0_0.json");
+        wait_for_path(&completion_path).await;
+
+        let completion: Value =
+            serde_json::from_slice(&tokio_fs::read(&completion_path).await.unwrap()).unwrap();
+        assert_eq!(completion["status"], "failure");
+        assert_eq!(completion["exit_code"], 7);
+
+        launcher.spawn_post_stage_protocol_hook(&version);
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            tokio_fs::read_to_string(network_dir.join("post-hook-count"))
+                .await
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            tokio_fs::metadata(
+                hooks_dir
+                    .join("pending")
+                    .join("post-stage-protocol-2_0_0.json"),
+            )
+            .await
+            .is_err()
+        );
     }
 }

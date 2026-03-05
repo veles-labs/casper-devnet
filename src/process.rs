@@ -281,6 +281,7 @@ async fn spawn_node(
     .await?;
     launcher.set_log_paths(stdout_path.clone(), stderr_path.clone());
     launcher.set_cwd(node_dir.clone());
+    launcher.set_hook_context(layout.net_dir(), layout.hooks_dir());
     launcher.set_rust_log(rust_log.to_string());
 
     let mut env = BTreeMap::new();

@@ -117,6 +117,9 @@ casper-devnet assets add dev \
   --sidecar-config /path/to/sidecar-config.toml
 ```
 
+Custom asset names are write-once: reusing an existing name returns an error instead of replacing
+the asset directory.
+
 List installed protocol bundles and custom assets:
 
 ```bash
@@ -128,6 +131,15 @@ Print absolute path to a custom asset directory (shell-substitution friendly):
 ```bash
 casper-devnet assets path dev
 vim "$(casper-devnet assets path dev)/chainspec.toml"
+```
+
+Custom assets also include hook samples under `hooks/`. Activate one by copying or renaming the
+matching `.sample` file:
+
+```bash
+cp "$(casper-devnet assets path dev)/hooks/pre-stage-protocol.sample" \
+  "$(casper-devnet assets path dev)/hooks/pre-stage-protocol"
+chmod +x "$(casper-devnet assets path dev)/hooks/pre-stage-protocol"
 ```
 
 List managed network directories:
@@ -204,6 +216,12 @@ In live mode, consensus keys are restored from the network seed before staging s
 `migrate-data` can run successfully at the upgrade boundary.
 Node and sidecar log aliases (for example `node-1.stdout`) are atomically repointed to
 versioned log files during protocol transitions; use `tail -F` to follow across alias swaps.
+If `assets/custom/<name>/hooks/pre-stage-protocol` exists, it runs before any stage-protocol
+filesystem mutation with argv `<network_name> <protocol_version> <activation_point>`.
+If `assets/custom/<name>/hooks/post-stage-protocol` exists, it runs once later at the real
+upgrade boundary, after the launcher starts the target validator version, with argv
+`<network_name> <protocol_version>`. Hook cwd is always the running network directory.
+Hook stdout/stderr are written under `networks/<network>/daemon/hooks/logs/`.
 
 Run MCP control plane server (STDIO + HTTP):
 
@@ -328,6 +346,21 @@ v2.1.1/node-config.toml
 
 Custom override assets are stored separately under `assets/custom/<name>/` as symlinks to local
 `casper-node`, `casper-sidecar`, `chainspec.toml`, `node-config.toml`, and `sidecar-config.toml`.
+Each custom asset also gets:
+
+```
+assets/custom/<name>/hooks/pre-stage-protocol.sample
+assets/custom/<name>/hooks/post-stage-protocol.sample
+```
+
+Only exact hook filenames are executed:
+
+```
+assets/custom/<name>/hooks/pre-stage-protocol
+assets/custom/<name>/hooks/post-stage-protocol
+```
+
+The `.sample` files are boilerplate only and are never executed directly.
 
 For manual rebuilds and bundle scripts, see
 [https://github.com/veles-labs/devnet-launcher-assets/](https://github.com/veles-labs/devnet-launcher-assets/).
