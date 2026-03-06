@@ -5,21 +5,25 @@ use crate::control::{ControlRequest, ControlResponse, ControlResult, send_reques
 use crate::diagnostics_port;
 use crate::mcp::{self, McpArgs};
 use crate::process::{self, ProcessHandle, RunningProcess, StartPlan};
-use crate::state::{ProcessKind, ProcessRecord, ProcessStatus, STATE_FILE_NAME, State};
+use crate::state::{
+    ProcessKind, ProcessRecord, ProcessStatus, STATE_FILE_NAME, State, spawn_pid_sync_tasks,
+};
 use anyhow::{Result, anyhow};
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
 use casper_types::U512;
 use casper_types::contract_messages::MessagePayload;
 use casper_types::execution::ExecutionResult;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use dialoguer::Confirm;
 use directories::BaseDirs;
 use futures::StreamExt;
 use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
+use rand::prelude::IndexedRandom;
 use serde::Deserialize;
+use serde_json::json;
 use spinners::{Spinner, Spinners};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::FileTypeExt;
@@ -35,6 +39,12 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use veles_casper_rust_sdk::sse::event::SseEvent;
 use veles_casper_rust_sdk::sse::{self, config::ListenerConfig};
+
+const DEFAULT_SEED: &str = "default";
+const DERIVE_SECRET_KEY_FILE: &str = "secret_key.pem";
+const DERIVE_PUBLIC_KEY_FILE: &str = "public_key_hex";
+const DERIVE_ACCOUNT_HASH_FILE: &str = "account_hash";
+const LIVE_CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// CLI entrypoint for the devnet launcher.
 #[derive(Parser)]
@@ -57,12 +67,14 @@ enum Command {
     Mcp(McpArgs),
     /// Manage assets bundles.
     Assets(AssetsArgs),
+    /// Derive deterministic account material from a BIP32 path.
+    Derive(DeriveArgs),
+    /// Inspect a managed network.
+    Network(NetworkArgs),
     /// Manage local network directories.
     Networks(NetworksArgs),
     /// Stage a protocol upgrade from a custom asset.
     StageProtocol(StageProtocolArgs),
-    /// Check whether a network has observed a block yet.
-    IsReady(IsReadyArgs),
 }
 
 /// Arguments for `nctl start`.
@@ -109,8 +121,61 @@ struct StartArgs {
     force_setup: bool,
 
     /// Deterministic seed for devnet key generation.
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value = DEFAULT_SEED)]
     seed: Arc<str>,
+}
+
+/// Arguments for `nctl derive`.
+#[derive(Args, Clone)]
+#[command(group(
+    ArgGroup::new("material")
+        .required(true)
+        .multiple(false)
+        .args(["secret_key", "public_key", "account_hash"])
+))]
+struct DeriveArgs {
+    /// BIP32 derivation path (for example m/44'/506'/0'/0/0).
+    #[arg(value_name = "PATH")]
+    path: String,
+
+    /// Print or write the derived secret key PEM.
+    #[arg(long, group = "material")]
+    secret_key: bool,
+
+    /// Print or write the derived public key hex.
+    #[arg(long, group = "material")]
+    public_key: bool,
+
+    /// Print or write the derived account hash.
+    #[arg(long, group = "material")]
+    account_hash: bool,
+
+    /// Deterministic seed for derivation.
+    #[arg(long, default_value = DEFAULT_SEED)]
+    seed: Arc<str>,
+
+    /// Output directory, or `-` to force stdout.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeriveSelection {
+    SecretKey,
+    PublicKey,
+    AccountHash,
+}
+
+impl DeriveArgs {
+    fn selection(&self) -> DeriveSelection {
+        if self.secret_key {
+            DeriveSelection::SecretKey
+        } else if self.public_key {
+            DeriveSelection::PublicKey
+        } else {
+            DeriveSelection::AccountHash
+        }
+    }
 }
 
 /// Asset management arguments.
@@ -221,12 +286,101 @@ struct NetworksRmArgs {
     net_path: Option<PathBuf>,
 }
 
-/// Arguments for `nctl is-ready`.
+/// Arguments for `nctl network <name>`.
 #[derive(Args, Clone)]
-struct IsReadyArgs {
-    /// Network name used in assets paths and configs.
-    #[arg(long, default_value = "casper-dev")]
+struct NetworkArgs {
+    /// Managed network name.
+    #[arg(value_name = "NETWORK_NAME")]
     network_name: String,
+
+    #[command(subcommand)]
+    command: NetworkCommand,
+}
+
+/// Network inspection subcommands.
+#[derive(Subcommand, Clone)]
+enum NetworkCommand {
+    /// Check whether a network has observed a block yet.
+    IsReady(NetworkIsReadyArgs),
+    /// Print the chainspec path for a staged protocol version.
+    Path(NetworkPathArgs),
+    /// Print a random live endpoint for a running node in the network.
+    Port(NetworkPortArgs),
+}
+
+/// Arguments for `nctl network <name> is-ready`.
+#[derive(Args, Clone)]
+struct NetworkIsReadyArgs {
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
+}
+
+/// Arguments for `nctl network <name> port`.
+#[derive(Args, Clone)]
+#[command(group(
+    ArgGroup::new("endpoint")
+        .required(true)
+        .multiple(false)
+        .args(["rpc", "sse", "rest", "binary", "diagnostics"])
+))]
+struct NetworkPortArgs {
+    /// Print a random node RPC URL.
+    #[arg(long, group = "endpoint")]
+    rpc: bool,
+
+    /// Print a random node SSE URL.
+    #[arg(long, group = "endpoint")]
+    sse: bool,
+
+    /// Print a random node REST URL.
+    #[arg(long, group = "endpoint")]
+    rest: bool,
+
+    /// Print a random node binary port address.
+    #[arg(long, group = "endpoint")]
+    binary: bool,
+
+    /// Print a random node diagnostics socket path.
+    #[arg(long, group = "endpoint")]
+    diagnostics: bool,
+
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum PortSelection {
+    Rpc,
+    Sse,
+    Rest,
+    Binary,
+    Diagnostics,
+}
+
+impl NetworkPortArgs {
+    fn selection(&self) -> PortSelection {
+        if self.rpc {
+            PortSelection::Rpc
+        } else if self.sse {
+            PortSelection::Sse
+        } else if self.rest {
+            PortSelection::Rest
+        } else if self.binary {
+            PortSelection::Binary
+        } else {
+            PortSelection::Diagnostics
+        }
+    }
+}
+
+/// Arguments for `nctl network <name> path`.
+#[derive(Args, Clone)]
+struct NetworkPathArgs {
+    /// Protocol version to inspect (e.g. 2.2.0). When omitted, prints the network root.
+    #[arg(value_name = "PROTOCOL_VERSION")]
+    protocol_version: Option<String>,
 
     /// Override the base path for network runtime assets.
     #[arg(long, value_name = "PATH")]
@@ -264,9 +418,10 @@ pub async fn run() -> Result<()> {
         Command::Start(args) => run_start(args).await,
         Command::Mcp(args) => mcp::run(args).await,
         Command::Assets(args) => run_assets(args).await,
+        Command::Derive(args) => run_derive(args).await,
+        Command::Network(args) => run_network(args).await,
         Command::Networks(args) => run_networks(args).await,
         Command::StageProtocol(args) => run_stage_protocol(args).await,
-        Command::IsReady(args) => run_is_ready(args).await,
     }
 }
 
@@ -302,6 +457,8 @@ async fn run_start(args: StartArgs) -> Result<()> {
         ));
     }
 
+    assets::ensure_network_hook_samples(&layout).await?;
+
     if !args.force_setup && assets_exist {
         let restored = assets::ensure_consensus_keys(&layout, Arc::clone(&args.seed)).await?;
         if restored > 0 {
@@ -316,11 +473,15 @@ async fn run_start(args: StartArgs) -> Result<()> {
     };
 
     let state_path = layout.net_dir().join(STATE_FILE_NAME);
+    if !is_file(&state_path).await {
+        assets::prepare_genesis_hooks(&layout, &protocol_version).await?;
+    }
     let state = Arc::new(Mutex::new(State::new(state_path).await?));
     let started = {
         let mut state = state.lock().await;
         process::start(&layout, &plan, &mut state).await?
     };
+    spawn_pid_sync_tasks(Arc::clone(&state)).await;
 
     print_pids(&started);
     print_start_banner(&layout, &started).await;
@@ -431,13 +592,7 @@ async fn run_setup_only(
 }
 
 fn record_pid(record: &ProcessRecord) -> Option<u32> {
-    if let Some(handle) = &record.pid_handle {
-        let pid = handle.load(Ordering::SeqCst);
-        if pid != 0 {
-            return Some(pid);
-        }
-    }
-    record.pid
+    record.current_pid()
 }
 
 fn setup_options(args: &StartArgs, protocol_version: &str) -> SetupOptions {
@@ -785,7 +940,7 @@ async fn spawn_control_server(
 
             let accepted =
                 tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
-            let (mut stream, _) = match accepted {
+            let (stream, _) = match accepted {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(err)) => {
                     eprintln!("warning: control socket accept failed: {}", err);
@@ -793,46 +948,74 @@ async fn spawn_control_server(
                 }
                 Err(_) => continue,
             };
-
-            let mut request_bytes = Vec::new();
-            let response = match stream.read_to_end(&mut request_bytes).await {
-                Ok(_) => match serde_json::from_slice::<ControlRequest>(&request_bytes) {
-                    Ok(request) => {
-                        handle_control_request(
-                            &layout,
-                            &state,
-                            &event_tx,
-                            &planned_exits,
-                            &rust_log,
-                            &seed,
-                            request,
-                        )
-                        .await
-                    }
-                    Err(err) => ControlResponse::Error {
-                        error: format!("invalid control request: {}", err),
-                    },
-                },
-                Err(err) => ControlResponse::Error {
-                    error: format!("failed to read control request: {}", err),
-                },
-            };
-
-            let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|err| {
-                format!(
-                    "{{\"status\":\"error\",\"error\":\"failed to serialize control response: {}\"}}",
-                    err
+            let layout = layout.clone();
+            let state = Arc::clone(&state);
+            let event_tx = event_tx.clone();
+            let planned_exits = Arc::clone(&planned_exits);
+            let rust_log = rust_log.clone();
+            let seed = Arc::clone(&seed);
+            tokio::spawn(async move {
+                handle_control_stream(
+                    stream,
+                    layout,
+                    state,
+                    event_tx,
+                    planned_exits,
+                    rust_log,
+                    seed,
                 )
-                .into_bytes()
+                .await;
             });
-            let _ = stream.write_all(&response_bytes).await;
-            let _ = stream.shutdown().await;
         }
 
         let _ = tokio_fs::remove_file(&socket_path).await;
     });
 
     Ok(ControlServerHandle { shutdown, task })
+}
+
+async fn handle_control_stream(
+    mut stream: tokio::net::UnixStream,
+    layout: AssetsLayout,
+    state: Arc<Mutex<State>>,
+    event_tx: UnboundedSender<RunEvent>,
+    planned_exits: Arc<Mutex<HashSet<(String, u32)>>>,
+    default_rust_log: String,
+    seed: Arc<str>,
+) {
+    let mut request_bytes = Vec::new();
+    let response = match stream.read_to_end(&mut request_bytes).await {
+        Ok(_) => match serde_json::from_slice::<ControlRequest>(&request_bytes) {
+            Ok(request) => {
+                handle_control_request(
+                    &layout,
+                    &state,
+                    &event_tx,
+                    &planned_exits,
+                    &default_rust_log,
+                    &seed,
+                    request,
+                )
+                .await
+            }
+            Err(err) => ControlResponse::Error {
+                error: format!("invalid control request: {}", err),
+            },
+        },
+        Err(err) => ControlResponse::Error {
+            error: format!("failed to read control request: {}", err),
+        },
+    };
+
+    let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|err| {
+        format!(
+            "{{\"status\":\"error\",\"error\":\"failed to serialize control response: {}\"}}",
+            err
+        )
+        .into_bytes()
+    });
+    let _ = stream.write_all(&response_bytes).await;
+    let _ = stream.shutdown().await;
 }
 
 async fn handle_control_request(
@@ -845,6 +1028,15 @@ async fn handle_control_request(
     request: ControlRequest,
 ) -> ControlResponse {
     match request {
+        ControlRequest::RuntimeStatus => {
+            let state = state.lock().await;
+            ControlResponse::Ok {
+                result: ControlResult::RuntimeStatus {
+                    running_node_ids: running_node_ids(&state),
+                    last_block_height: state.last_block_height,
+                },
+            }
+        }
         ControlRequest::StageProtocol {
             asset_name,
             protocol_version,
@@ -952,6 +1144,7 @@ struct SseHealth {
     versions: HashMap<u32, String>,
     announced: bool,
     block_seen: bool,
+    last_block_hook_hash: Option<String>,
     last_uniform_version_announced: Option<String>,
     sse_spinner: Option<Spinner>,
     block_spinner: Option<Spinner>,
@@ -965,6 +1158,7 @@ impl SseHealth {
             versions: HashMap::new(),
             announced: false,
             block_seen: false,
+            last_block_hook_hash: None,
             last_uniform_version_announced: None,
             sse_spinner: None,
             block_spinner: None,
@@ -979,6 +1173,15 @@ async fn should_log_primary(node_id: u32, health: &Arc<Mutex<SseHealth>>) -> boo
     }
     let state = health.lock().await;
     state.announced
+}
+
+async fn claim_block_hook(block_hash: &str, health: &Arc<Mutex<SseHealth>>) -> bool {
+    let mut state = health.lock().await;
+    if state.last_block_hook_hash.as_deref() == Some(block_hash) {
+        return false;
+    }
+    state.last_block_hook_hash = Some(block_hash.to_string());
+    true
 }
 
 fn start_spinner(message: &str) -> Spinner {
@@ -1058,13 +1261,25 @@ async fn run_sse_listener(
                         record_api_version(node_id, version, &health).await;
                     }
                     SseEvent::BlockAdded { block_hash, block } => {
-                        if node_id == 1
-                            && let Err(err) = record_last_block_height(&state, block.height()).await
-                        {
+                        if let Err(err) = record_last_block_height(&state, block.height()).await {
                             eprintln!("warning: failed to record last block height: {}", err);
                         }
+                        mark_block_seen(&health, &layout).await;
+                        if let Some(protocol_version) = connection_version.as_deref()
+                            && claim_block_hook(&block_hash.to_string(), &health).await
+                        {
+                            assets::spawn_block_added_hook(
+                                layout.clone(),
+                                protocol_version.to_string(),
+                                json!({
+                                    "block_hash": block_hash.to_string(),
+                                    "height": block.height(),
+                                    "era_id": block.era_id().value(),
+                                }),
+                            );
+                        }
+                        assets::spawn_pending_post_genesis_hook(layout.clone());
                         if should_log_primary(node_id, &health).await {
-                            mark_block_seen(&health, &layout).await;
                             let prefix = timestamp_prefix();
                             println!(
                                 "{} Block {} added (height={} era={})",
@@ -1154,11 +1369,10 @@ async fn record_api_version(node_id: u32, version: String, health: &Arc<Mutex<Ss
         let should_log = if !state.announced {
             details = Some(state.details.clone());
             sse_spinner = state.sse_spinner.take();
-            if state.block_spinner.is_none() {
+            if !state.block_seen && state.block_spinner.is_none() {
                 state.block_spinner = Some(start_spinner(BLOCK_WAIT_MESSAGE));
             }
             state.announced = true;
-            state.block_seen = false;
             if let Some(uniform) = uniform {
                 state.last_uniform_version_announced = Some(uniform);
             }
@@ -1395,6 +1609,13 @@ async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+async fn is_file(path: &Path) -> bool {
+    tokio_fs::metadata(path)
+        .await
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+}
+
 async fn run_assets(args: AssetsArgs) -> Result<()> {
     match args.command {
         AssetsCommand::Add(add) => run_assets_add(add).await,
@@ -1404,6 +1625,33 @@ async fn run_assets(args: AssetsArgs) -> Result<()> {
     }
 }
 
+async fn run_derive(args: DeriveArgs) -> Result<()> {
+    let selection = args.selection();
+    let material =
+        assets::derive_account_from_seed_path(Arc::clone(&args.seed), &args.path).await?;
+    let output = derive_output_content(&material, selection);
+
+    if let Some(path) = args.output.as_deref() {
+        if path == Path::new("-") {
+            print!("{}", output);
+            if !output.ends_with('\n') {
+                println!();
+            }
+            return Ok(());
+        }
+
+        let output_path = write_derive_output(path, selection, &output).await?;
+        println!("{}", output_path.display());
+        return Ok(());
+    }
+
+    print!("{}", output);
+    if !output.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
 async fn run_networks(args: NetworksArgs) -> Result<()> {
     match args.command {
         NetworksCommand::List(list) => run_networks_list(list).await,
@@ -1411,12 +1659,220 @@ async fn run_networks(args: NetworksArgs) -> Result<()> {
     }
 }
 
-async fn run_is_ready(args: IsReadyArgs) -> Result<()> {
+fn derive_output_content(
+    material: &assets::DerivedPathMaterial,
+    selection: DeriveSelection,
+) -> String {
+    match selection {
+        DeriveSelection::SecretKey => material.secret_key_pem.clone(),
+        DeriveSelection::PublicKey => format!("{}\n", material.public_key_hex),
+        DeriveSelection::AccountHash => format!("{}\n", material.account_hash),
+    }
+}
+
+fn derive_output_file_name(selection: DeriveSelection) -> &'static str {
+    match selection {
+        DeriveSelection::SecretKey => DERIVE_SECRET_KEY_FILE,
+        DeriveSelection::PublicKey => DERIVE_PUBLIC_KEY_FILE,
+        DeriveSelection::AccountHash => DERIVE_ACCOUNT_HASH_FILE,
+    }
+}
+
+async fn write_derive_output(
+    output_dir: &Path,
+    selection: DeriveSelection,
+    content: &str,
+) -> Result<PathBuf> {
+    if let Ok(metadata) = tokio_fs::metadata(output_dir).await
+        && !metadata.is_dir()
+    {
+        return Err(anyhow!(
+            "derive output path {} is not a directory",
+            output_dir.display()
+        ));
+    }
+
+    tokio_fs::create_dir_all(output_dir).await?;
+    let output_path = output_dir.join(derive_output_file_name(selection));
+    tokio_fs::write(&output_path, content).await?;
+    Ok(output_path)
+}
+
+async fn run_network(args: NetworkArgs) -> Result<()> {
+    match args.command {
+        NetworkCommand::IsReady(is_ready) => {
+            run_network_is_ready(args.network_name, is_ready).await
+        }
+        NetworkCommand::Path(path) => run_network_path(args.network_name, path).await,
+        NetworkCommand::Port(port) => run_network_port(args.network_name, port).await,
+    }
+}
+
+async fn run_network_port(network_name: String, args: NetworkPortArgs) -> Result<()> {
     let assets_root = match &args.net_path {
         Some(path) => path.clone(),
         None => assets::default_assets_root()?,
     };
-    let layout = AssetsLayout::new(assets_root, args.network_name);
+    let selection = args.selection();
+    let layout = AssetsLayout::new(assets_root, network_name);
+    let net_dir = layout.net_dir();
+    if !is_dir(&net_dir).await {
+        return Err(anyhow!(
+            "assets for {} not found under {}; run `start --setup-only` first",
+            layout.network_name(),
+            shorten_home_path(&net_dir.display().to_string())
+        ));
+    }
+
+    let node_ids = if let Some(node_ids) = query_live_running_node_ids(&layout).await? {
+        node_ids
+    } else {
+        let state = read_state_snapshot(&net_dir)
+            .await
+            .map_err(|_| anyhow!("network is not running yet"))?;
+        running_node_ids(&state)
+    };
+    if node_ids.is_empty() {
+        return Err(anyhow!(
+            "no running node processes found for {}",
+            layout.network_name()
+        ));
+    }
+
+    let mut rng = rand::rng();
+    let node_id = *node_ids.choose(&mut rng).expect("non-empty node ids");
+    println!("{}", endpoint_for_selection(&layout, node_id, selection));
+    Ok(())
+}
+
+async fn query_live_running_node_ids(layout: &AssetsLayout) -> Result<Option<Vec<u32>>> {
+    query_live_running_node_ids_with_timeout(layout, LIVE_CONTROL_QUERY_TIMEOUT).await
+}
+
+async fn query_live_running_node_ids_with_timeout(
+    layout: &AssetsLayout,
+    timeout: Duration,
+) -> Result<Option<Vec<u32>>> {
+    let socket_path = layout.control_socket_path();
+    if !is_control_socket(&socket_path).await {
+        return Ok(None);
+    }
+
+    let response = match tokio::time::timeout(
+        timeout,
+        send_request(&socket_path, &ControlRequest::RuntimeStatus),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            eprintln!(
+                "warning: failed to query live control socket {}: {}; falling back to {}",
+                socket_path.display(),
+                err,
+                layout.net_dir().join(STATE_FILE_NAME).display()
+            );
+            return Ok(None);
+        }
+        Err(_) => {
+            eprintln!(
+                "warning: live control socket {} did not respond within {:?}; falling back to {}",
+                socket_path.display(),
+                timeout,
+                layout.net_dir().join(STATE_FILE_NAME).display()
+            );
+            return Ok(None);
+        }
+    };
+
+    match response {
+        ControlResponse::Ok {
+            result:
+                ControlResult::RuntimeStatus {
+                    running_node_ids, ..
+                },
+        } => Ok(Some(running_node_ids)),
+        ControlResponse::Ok { .. } => Err(anyhow!(
+            "unexpected control response from {}",
+            socket_path.display()
+        )),
+        ControlResponse::Error { error } => Err(anyhow!(
+            "live control socket {} returned error: {}",
+            socket_path.display(),
+            error
+        )),
+    }
+}
+
+async fn run_network_path(network_name: String, args: NetworkPathArgs) -> Result<()> {
+    let assets_root = match &args.net_path {
+        Some(path) => path.clone(),
+        None => assets::default_assets_root()?,
+    };
+    let layout = AssetsLayout::new(assets_root, network_name);
+    let paths = resolve_network_paths(&layout, args.protocol_version.as_deref()).await?;
+    for path in paths {
+        println!("{}", path.display());
+    }
+    Ok(())
+}
+
+async fn resolve_network_paths(
+    layout: &AssetsLayout,
+    protocol_version: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let net_dir = layout.net_dir();
+    if !is_dir(&net_dir).await {
+        return Err(anyhow!(
+            "assets for {} not found under {}; run `start --setup-only` first",
+            layout.network_name(),
+            shorten_home_path(&net_dir.display().to_string())
+        ));
+    }
+
+    let Some(protocol_version) = protocol_version else {
+        return Ok(vec![net_dir]);
+    };
+
+    let protocol_version = assets::parse_protocol_version(protocol_version)?;
+    let version_fs = protocol_version.to_string().replace('.', "_");
+    let node_ids = layout.node_ids().await?;
+    if node_ids.is_empty() {
+        return Err(anyhow!(
+            "no nodes found under {}; run `start --setup-only` first",
+            layout.nodes_dir().display()
+        ));
+    }
+
+    let mut paths = Vec::with_capacity(node_ids.len());
+    let mut missing = Vec::new();
+    for node_id in node_ids {
+        let config_dir = layout.node_config_root(node_id).join(&version_fs);
+        let chainspec_path = config_dir.join("chainspec.toml");
+        if !is_file(&chainspec_path).await {
+            missing.push(format!("node-{} ({})", node_id, config_dir.display()));
+            continue;
+        }
+        paths.push(config_dir);
+    }
+
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "staged config directories for protocol {} not found for {}",
+            protocol_version,
+            missing.join(", ")
+        ));
+    }
+
+    Ok(paths)
+}
+
+async fn run_network_is_ready(network_name: String, args: NetworkIsReadyArgs) -> Result<()> {
+    let assets_root = match &args.net_path {
+        Some(path) => path.clone(),
+        None => assets::default_assets_root()?,
+    };
+    let layout = AssetsLayout::new(assets_root, network_name);
     let argv0 = std::env::args()
         .next()
         .unwrap_or_else(|| "casper-devnet".to_string());
@@ -1430,16 +1886,9 @@ async fn run_is_ready(args: IsReadyArgs) -> Result<()> {
         ));
     }
 
-    let state_path = net_dir.join(STATE_FILE_NAME);
-    let contents = match tokio_fs::read_to_string(&state_path).await {
-        Ok(contents) => contents,
-        Err(_) => return Err(anyhow!("network is not ready yet")),
-    };
-    let state =
-        match tokio::task::spawn_blocking(move || serde_json::from_str::<State>(&contents)).await {
-            Ok(Ok(state)) => state,
-            _ => return Err(anyhow!("network is not ready yet")),
-        };
+    let state = read_state_snapshot(&net_dir)
+        .await
+        .map_err(|_| anyhow!("network is not ready yet"))?;
 
     ensure_processes_running(&state)?;
 
@@ -1449,6 +1898,50 @@ async fn run_is_ready(args: IsReadyArgs) -> Result<()> {
 
     ensure_rest_ready(&state).await?;
     Ok(())
+}
+
+async fn read_state_snapshot(net_dir: &Path) -> Result<State> {
+    let state_path = net_dir.join(STATE_FILE_NAME);
+    let contents = tokio_fs::read_to_string(&state_path).await?;
+    match tokio::task::spawn_blocking(move || serde_json::from_str::<State>(&contents)).await {
+        Ok(Ok(state)) => Ok(state),
+        Ok(Err(err)) => Err(err.into()),
+        Err(err) => Err(anyhow!("failed to parse {}: {}", state_path.display(), err)),
+    }
+}
+
+fn running_node_ids(state: &State) -> Vec<u32> {
+    let mut node_ids = HashSet::new();
+    for process in &state.processes {
+        if !matches!(process.kind, ProcessKind::Node) {
+            continue;
+        }
+        if !matches!(process.last_status, ProcessStatus::Running) {
+            continue;
+        }
+        let Some(pid) = record_pid(process) else {
+            continue;
+        };
+        if !is_pid_running(pid) {
+            continue;
+        }
+        node_ids.insert(process.node_id);
+    }
+    let mut node_ids = node_ids.into_iter().collect::<Vec<_>>();
+    node_ids.sort_unstable();
+    node_ids
+}
+
+fn endpoint_for_selection(layout: &AssetsLayout, node_id: u32, selection: PortSelection) -> String {
+    match selection {
+        PortSelection::Rpc => assets::rpc_endpoint(node_id),
+        PortSelection::Sse => assets::sse_endpoint(node_id),
+        PortSelection::Rest => assets::rest_endpoint(node_id),
+        PortSelection::Binary => assets::binary_address(node_id),
+        PortSelection::Diagnostics => {
+            assets::diagnostics_socket_path(layout.network_name(), node_id)
+        }
+    }
 }
 
 async fn run_assets_add(args: AssetsAddArgs) -> Result<()> {
@@ -1636,6 +2129,12 @@ async fn run_stage_protocol(args: StageProtocolArgs) -> Result<()> {
                         staged_nodes,
                         restarted_sidecars,
                     } => (staged_nodes, restarted_sidecars, live_mode),
+                    ControlResult::RuntimeStatus { .. } => {
+                        return Err(anyhow!(
+                            "unexpected runtime_status response from {}",
+                            socket_path.display()
+                        ));
+                    }
                 };
                 println!(
                     "staged protocol {} from custom asset '{}' for {} node(s) (live_mode={})",
@@ -1742,7 +2241,7 @@ fn ensure_processes_running(state: &State) -> Result<()> {
         if !matches!(process.last_status, ProcessStatus::Running) {
             return Err(anyhow!("network is not ready yet"));
         }
-        let pid = match process.pid {
+        let pid = match process.current_pid() {
             Some(pid) => pid,
             None => return Err(anyhow!("network is not ready yet")),
         };
@@ -1885,12 +2384,242 @@ struct BlockSync {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_hex, extract_era_id, format_cspr_u512, format_message_payload, shorten_home_path,
+        Cli, DEFAULT_SEED, DeriveSelection, PortSelection, derive_output_file_name, encode_hex,
+        endpoint_for_selection, extract_era_id, format_cspr_u512, format_message_payload,
+        query_live_running_node_ids, query_live_running_node_ids_with_timeout,
+        resolve_network_paths, shorten_home_path, spawn_control_server, write_derive_output,
     };
+    use crate::assets::{self, CustomAssetInstallOptions};
+    use crate::control::{ControlRequest, ControlResponse, ControlResult, send_request};
+    use crate::state::{ProcessGroup, ProcessKind, ProcessRecord, ProcessStatus, State};
     use casper_types::U512;
     use casper_types::contract_messages::MessagePayload;
+    use clap::Parser;
     use directories::BaseDirs;
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::env;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::{Arc, MutexGuard};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+    use tokio::fs as tokio_fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+    use tokio::sync::Mutex as TokioMutex;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    const TEST_HOOK_FILE_MODE: u32 = 0o755;
+
+    struct TestDataEnv {
+        _lock: MutexGuard<'static, ()>,
+        temp_dir: TempDir,
+        old_home: Option<OsString>,
+        old_xdg_data_home: Option<OsString>,
+    }
+
+    impl TestDataEnv {
+        fn new() -> Self {
+            let lock = crate::assets::test_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let old_home = env::var_os("HOME");
+            let old_xdg_data_home = env::var_os("XDG_DATA_HOME");
+            unsafe {
+                env::set_var("HOME", temp_dir.path());
+                env::set_var("XDG_DATA_HOME", temp_dir.path().join("xdg-data"));
+            }
+            Self {
+                _lock: lock,
+                temp_dir,
+                old_home,
+                old_xdg_data_home,
+            }
+        }
+
+        fn root(&self) -> &std::path::Path {
+            self.temp_dir.path()
+        }
+    }
+
+    impl Drop for TestDataEnv {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_home {
+                unsafe {
+                    env::set_var("HOME", value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var("HOME");
+                }
+            }
+            if let Some(value) = &self.old_xdg_data_home {
+                unsafe {
+                    env::set_var("XDG_DATA_HOME", value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var("XDG_DATA_HOME");
+                }
+            }
+        }
+    }
+
+    async fn write_executable_script(path: &std::path::Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            tokio_fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio_fs::write(path, contents).await.unwrap();
+        tokio_fs::set_permissions(path, std::fs::Permissions::from_mode(TEST_HOOK_FILE_MODE))
+            .await
+            .unwrap();
+    }
+
+    async fn create_fake_binary(path: &std::path::Path, label: &str) {
+        write_executable_script(
+            path,
+            &format!(
+                "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  echo \"{label} 1.0.0\"\n  exit 0\nfi\nexit 0\n"
+            ),
+        )
+        .await;
+    }
+
+    async fn create_test_custom_asset_sources(
+        root: &std::path::Path,
+        name: &str,
+    ) -> CustomAssetInstallOptions {
+        let source_dir = root.join("sources").join(name);
+        tokio_fs::create_dir_all(&source_dir).await.unwrap();
+        let node_path = source_dir.join("casper-node");
+        let sidecar_path = source_dir.join("casper-sidecar");
+        create_fake_binary(&node_path, "casper-node").await;
+        create_fake_binary(&sidecar_path, "casper-sidecar").await;
+        let chainspec = source_dir.join("chainspec.toml");
+        let node_config = source_dir.join("node-config.toml");
+        let sidecar_config = source_dir.join("sidecar-config.toml");
+        tokio_fs::write(
+            &chainspec,
+            "\
+[protocol]
+activation_point = 1
+version = '1.0.0'
+
+[network]
+name = 'casper-dev'
+
+[core]
+validator_slots = 4
+rewards_handling = { type = 'standard' }
+",
+        )
+        .await
+        .unwrap();
+        tokio_fs::write(&node_config, "").await.unwrap();
+        tokio_fs::write(&sidecar_config, "").await.unwrap();
+        CustomAssetInstallOptions {
+            name: name.to_string(),
+            casper_node: node_path,
+            casper_sidecar: sidecar_path,
+            chainspec,
+            node_config,
+            sidecar_config,
+        }
+    }
+
+    async fn install_test_custom_asset(env: &TestDataEnv, name: &str) -> PathBuf {
+        let options = create_test_custom_asset_sources(env.root(), name).await;
+        assets::install_custom_asset(&options).await.unwrap();
+        assets::custom_assets_root().unwrap().join(name)
+    }
+
+    async fn create_test_network_layout(
+        root: &std::path::Path,
+        network_name: &str,
+        current_version: &str,
+    ) -> crate::assets::AssetsLayout {
+        let layout =
+            crate::assets::AssetsLayout::new(root.join("networks"), network_name.to_string());
+        let version_fs = current_version.replace('.', "_");
+        tokio_fs::create_dir_all(layout.node_bin_dir(1).join(&version_fs))
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(layout.node_config_root(1).join(&version_fs))
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(layout.node_dir(1).join("logs"))
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(layout.node_dir(1).join("storage"))
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(layout.node_dir(1).join("keys"))
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(layout.net_dir().join("chainspec"))
+            .await
+            .unwrap();
+        tokio_fs::write(
+            layout
+                .node_config_root(1)
+                .join(&version_fs)
+                .join("config.toml"),
+            "[logging]\nformat = \"text\"\n",
+        )
+        .await
+        .unwrap();
+        tokio_fs::write(
+            layout
+                .node_config_root(1)
+                .join(&version_fs)
+                .join("chainspec.toml"),
+            "",
+        )
+        .await
+        .unwrap();
+        tokio_fs::write(layout.net_dir().join("chainspec/accounts.toml"), "")
+            .await
+            .unwrap();
+        layout
+    }
+
+    async fn test_state(layout: &crate::assets::AssetsLayout) -> State {
+        let mut state = State::new(layout.net_dir().join(crate::state::STATE_FILE_NAME))
+            .await
+            .unwrap();
+        state.processes.push(ProcessRecord {
+            id: "node-1".to_string(),
+            node_id: 1,
+            kind: ProcessKind::Node,
+            group: ProcessGroup::Validators1,
+            command: "/tmp/casper-node".to_string(),
+            args: vec!["validator".to_string()],
+            cwd: layout.node_dir(1).display().to_string(),
+            pid: Some(std::process::id()),
+            pid_handle: None,
+            shutdown_handle: None,
+            stdout_path: layout
+                .node_logs_dir(1)
+                .join("stdout.log")
+                .display()
+                .to_string(),
+            stderr_path: layout
+                .node_logs_dir(1)
+                .join("stderr.log")
+                .display()
+                .to_string(),
+            started_at: None,
+            stopped_at: None,
+            exit_code: None,
+            exit_signal: None,
+            last_status: ProcessStatus::Running,
+        });
+        state.touch().await.unwrap();
+        state
+    }
 
     #[test]
     fn format_cspr_u512_handles_whole_and_fractional() {
@@ -1949,5 +2678,301 @@ mod tests {
         assert_eq!(extract_era_id(Some(&json!({"era_id": "456"}))), Some(456));
         assert_eq!(extract_era_id(Some(&json!({"era_id": "abc"}))), None);
         assert_eq!(extract_era_id(None), None);
+    }
+
+    #[test]
+    fn network_port_requires_exactly_one_selector() {
+        assert!(Cli::try_parse_from(["nctl", "network", "casper-dev", "port"]).is_err());
+        assert!(
+            Cli::try_parse_from(["nctl", "network", "casper-dev", "port", "--rpc", "--rest"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["nctl", "network", "casper-dev", "port", "--rpc"]).is_ok());
+    }
+
+    #[test]
+    fn derive_requires_exactly_one_selector() {
+        assert!(Cli::try_parse_from(["nctl", "derive", "m/44'/506'/0'/0/0"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "nctl",
+                "derive",
+                "m/44'/506'/0'/0/0",
+                "--secret-key",
+                "--public-key",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["nctl", "derive", "m/44'/506'/0'/0/0", "--account-hash"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn network_command_parser_validates_nested_commands() {
+        assert!(
+            Cli::try_parse_from(["nctl", "network", "casper-dev", "port", "--rpc", "--rest"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["nctl", "network", "casper-dev", "port", "--rpc"]).is_ok());
+        assert!(Cli::try_parse_from(["nctl", "network", "casper-dev", "path"]).is_ok());
+        assert!(Cli::try_parse_from(["nctl", "network", "casper-dev", "path", "2.2.0"]).is_ok());
+        assert!(Cli::try_parse_from(["nctl", "network", "casper-dev", "is-ready"]).is_ok());
+        assert!(Cli::try_parse_from(["nctl", "networks", "casper-dev", "port", "--rpc"]).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_network_paths_without_version_returns_network_root() {
+        let env = TestDataEnv::new();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0").await;
+
+        let paths = resolve_network_paths(&layout, None).await.unwrap();
+
+        assert_eq!(paths, vec![layout.net_dir()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_network_paths_with_version_returns_each_node_config_dir() {
+        let env = TestDataEnv::new();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0").await;
+        tokio_fs::create_dir_all(layout.node_config_root(2).join("1_0_0"))
+            .await
+            .unwrap();
+        tokio_fs::write(
+            layout
+                .node_config_root(2)
+                .join("1_0_0")
+                .join("chainspec.toml"),
+            "",
+        )
+        .await
+        .unwrap();
+
+        let paths = resolve_network_paths(&layout, Some("1.0.0")).await.unwrap();
+
+        assert_eq!(
+            paths,
+            vec![
+                layout.node_config_root(1).join("1_0_0"),
+                layout.node_config_root(2).join("1_0_0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_for_selection_maps_expected_urls() {
+        let layout = crate::assets::AssetsLayout::new(
+            PathBuf::from("/tmp/networks"),
+            "casper-dev".to_string(),
+        );
+        assert_eq!(
+            endpoint_for_selection(&layout, 2, PortSelection::Rpc),
+            "http://127.0.0.1:11102/rpc"
+        );
+        assert_eq!(
+            endpoint_for_selection(&layout, 2, PortSelection::Diagnostics),
+            crate::assets::diagnostics_socket_path("casper-dev", 2)
+        );
+    }
+
+    #[test]
+    fn derive_output_file_names_match_selection() {
+        assert_eq!(
+            derive_output_file_name(DeriveSelection::SecretKey),
+            "secret_key.pem"
+        );
+        assert_eq!(
+            derive_output_file_name(DeriveSelection::PublicKey),
+            "public_key_hex"
+        );
+        assert_eq!(
+            derive_output_file_name(DeriveSelection::AccountHash),
+            "account_hash"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_derive_output_creates_named_file_in_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let output_dir = temp_dir.path().join("derived");
+
+        let output_path = write_derive_output(&output_dir, DeriveSelection::PublicKey, "abc123\n")
+            .await
+            .unwrap();
+
+        assert_eq!(output_path, output_dir.join("public_key_hex"));
+        assert_eq!(
+            tokio_fs::read_to_string(&output_path).await.unwrap(),
+            "abc123\n"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_live_running_node_ids_uses_control_socket_runtime_status() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let network_name = format!("casper-dev-test-{suffix}");
+        let layout =
+            crate::assets::AssetsLayout::new(PathBuf::from("/tmp/networks"), network_name.clone());
+        let socket_path = layout.control_socket_path();
+        let _ = tokio_fs::remove_file(&socket_path).await;
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_bytes = Vec::new();
+            stream.read_to_end(&mut request_bytes).await.unwrap();
+            let request: crate::control::ControlRequest =
+                serde_json::from_slice(&request_bytes).unwrap();
+            assert!(matches!(
+                request,
+                crate::control::ControlRequest::RuntimeStatus
+            ));
+
+            let response = crate::control::ControlResponse::Ok {
+                result: crate::control::ControlResult::RuntimeStatus {
+                    running_node_ids: vec![2, 4],
+                    last_block_height: Some(123),
+                },
+            };
+            let response_bytes = serde_json::to_vec(&response).unwrap();
+            stream.write_all(&response_bytes).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let node_ids = query_live_running_node_ids(&layout).await.unwrap();
+        assert_eq!(node_ids, Some(vec![2, 4]));
+
+        server.await.unwrap();
+        let _ = tokio_fs::remove_file(&socket_path).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_live_running_node_ids_times_out_without_hanging() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let network_name = format!("casper-dev-stalled-{suffix}");
+        let layout =
+            crate::assets::AssetsLayout::new(PathBuf::from("/tmp/networks"), network_name.clone());
+        let socket_path = layout.control_socket_path();
+        let _ = tokio_fs::remove_file(&socket_path).await;
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_bytes = Vec::new();
+            stream.read_to_end(&mut request_bytes).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let node_ids = query_live_running_node_ids_with_timeout(&layout, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(node_ids, None);
+
+        server.abort();
+        let _ = server.await;
+        let _ = tokio_fs::remove_file(&socket_path).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_server_handles_runtime_status_while_stage_protocol_is_in_flight() {
+        let env = TestDataEnv::new();
+        let asset_dir = install_test_custom_asset(&env, "dev").await;
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0").await;
+        write_executable_script(
+            &asset_dir.join("hooks").join("pre-stage-protocol"),
+            "#!/bin/sh\nset -eu\nprintf 'started\n' > \"$PWD/pre-hook-started\"\nsleep 1\n",
+        )
+        .await;
+
+        let state = Arc::new(TokioMutex::new(test_state(&layout).await));
+        let (event_tx, _event_rx) = unbounded_channel();
+        let planned_exits = Arc::new(TokioMutex::new(HashSet::new()));
+        let control_server = spawn_control_server(
+            layout.clone(),
+            Arc::clone(&state),
+            event_tx,
+            planned_exits,
+            "info".to_string(),
+            Arc::<str>::from(DEFAULT_SEED),
+        )
+        .await
+        .unwrap();
+
+        let stage_socket_path = layout.control_socket_path();
+        let stage_request = ControlRequest::StageProtocol {
+            asset_name: "dev".to_string(),
+            protocol_version: "2.0.0".to_string(),
+            activation_point: 123,
+            restart_sidecars: false,
+            rust_log: None,
+        };
+        let stage_task =
+            tokio::spawn(async move { send_request(&stage_socket_path, &stage_request).await });
+
+        let marker_path = layout
+            .hook_work_dir("pre-stage-protocol")
+            .join("pre-hook-started");
+        for _ in 0..50 {
+            if tokio_fs::metadata(&marker_path)
+                .await
+                .map(|meta| meta.is_file())
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            tokio_fs::metadata(&marker_path)
+                .await
+                .map(|meta| meta.is_file())
+                .unwrap_or(false),
+            "timed out waiting for pre-stage hook to start"
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            send_request(
+                &layout.control_socket_path(),
+                &ControlRequest::RuntimeStatus,
+            ),
+        )
+        .await
+        .expect("runtime_status request timed out")
+        .unwrap();
+        match response {
+            ControlResponse::Ok {
+                result:
+                    ControlResult::RuntimeStatus {
+                        running_node_ids, ..
+                    },
+            } => assert_eq!(running_node_ids, vec![1]),
+            other => panic!("unexpected runtime_status response: {other:?}"),
+        }
+
+        let response = stage_task.await.unwrap().unwrap();
+        match response {
+            ControlResponse::Ok {
+                result:
+                    ControlResult::StageProtocol {
+                        live_mode,
+                        staged_nodes,
+                        restarted_sidecars,
+                    },
+            } => {
+                assert!(live_mode);
+                assert_eq!(staged_nodes, 1);
+                assert!(restarted_sidecars.is_empty());
+            }
+            other => panic!("unexpected stage_protocol response: {other:?}"),
+        }
+
+        control_server.shutdown().await;
     }
 }

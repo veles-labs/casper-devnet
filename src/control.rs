@@ -7,6 +7,7 @@ use tokio::net::UnixStream;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ControlRequest {
+    RuntimeStatus,
     StageProtocol {
         asset_name: String,
         protocol_version: String,
@@ -26,6 +27,10 @@ pub enum ControlResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ControlResult {
+    RuntimeStatus {
+        running_node_ids: Vec<u32>,
+        last_block_height: Option<u64>,
+    },
     StageProtocol {
         live_mode: bool,
         staged_nodes: u32,

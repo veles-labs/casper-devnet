@@ -155,6 +155,18 @@ casper-devnet networks rm casper-dev
 casper-devnet networks rm casper-dev --yes
 ```
 
+Print the staged per-node config directories for a protocol version:
+
+```bash
+casper-devnet network casper-dev path 2.2.0
+```
+
+Print the network root:
+
+```bash
+casper-devnet network casper-dev path
+```
+
 Download assets from the latest release:
 
 ```bash
@@ -207,6 +219,29 @@ Stage a protocol upgrade from a custom asset:
 casper-devnet stage-protocol dev --protocol-version 2.2.0 --activation-point 123
 ```
 
+Derive deterministic account material from a seed and BIP32 path:
+
+```bash
+casper-devnet derive "m/44'/506'/0'/0/0" --secret-key
+casper-devnet derive "m/44'/506'/0'/0/100" --public-key
+casper-devnet derive "m/44'/506'/0'/0/100" --account-hash -o /tmp/derived
+casper-devnet derive "m/44'/506'/0'/0/100" --account-hash -o -
+```
+
+Print a random live endpoint for a running node:
+
+```bash
+casper-devnet network casper-dev port --rpc
+casper-devnet network casper-dev port --sse
+casper-devnet network casper-dev port --rest
+casper-devnet network casper-dev port --binary
+casper-devnet network casper-dev port --diagnostics
+```
+
+When the network is actively managed by `casper-devnet`, this command prefers the live control
+socket to discover currently running nodes before choosing an endpoint. If that live query is
+unavailable or unresponsive, it falls back to `state.json` instead of hanging indefinitely.
+
 If a managed process is running (from `start` or MCP), staging runs in live mode and restarts
 sidecars. Otherwise, staging runs in offline mode and only writes versioned
 `nodes/node-*/bin/<version>` and `nodes/node-*/config/<version>` assets.
@@ -220,8 +255,26 @@ If `assets/custom/<name>/hooks/pre-stage-protocol` exists, it runs before any st
 filesystem mutation with argv `<network_name> <protocol_version> <activation_point>`.
 If `assets/custom/<name>/hooks/post-stage-protocol` exists, it runs once later at the real
 upgrade boundary, after the launcher starts the target validator version, with argv
-`<network_name> <protocol_version>`. Hook cwd is always the running network directory.
-Hook stdout/stderr are written under `networks/<network>/daemon/hooks/logs/`.
+`<network_name> <protocol_version>`.
+If `networks/<network>/hooks/pre-genesis` exists, it runs after assets have been prepared
+for a fresh network but before the network is started, with argv
+`<network_name> <protocol_version>`.
+If `networks/<network>/hooks/post-genesis` exists, it runs once after the fresh network
+produces its first block, with argv `<network_name> <protocol_version>`.
+If `networks/<network>/hooks/block-added` exists, it runs on each observed new block with
+argv `<network_name> <protocol_version>` and the block event JSON payload on stdin.
+Each hook runs in its own working directory under `networks/<network>/hooks/work/<hook-name>/`, so
+hooks can leave files behind for later hooks to inspect.
+Hook stdout/stderr are streamed line by line through `casper-devnet` stderr as
+`<hook_name> stdout: ...` and `<hook_name> stderr: ...`. Non-zero exits are still reported, but
+successful exit code `0` is quiet. The raw hook streams are also written under
+`networks/<network>/hooks/logs/` for network hooks and the same log directory is reused for
+custom-asset staging hooks.
+The generated sample hooks live under `assets/custom/<name>/hooks/*.sample` for stage hooks and
+`networks/<network>/hooks/*.sample` for network hooks. The samples show how to call
+`casper-devnet network <network> port --rpc`, issue an `info_get_status` JSON-RPC request with
+`curl`, consume `block-added` JSON from stdin, and use `casper-devnet network <network> path
+[<protocol_version>]` to locate the network root or staged per-node config directories.
 
 Run MCP control plane server (STDIO + HTTP):
 
@@ -238,7 +291,7 @@ casper-devnet mcp --transport http --http-bind 127.0.0.1:32100 --http-path /mcp
 Check whether a devnet has produced blocks (useful for CI):
 
 ```bash
-casper-devnet is-ready
+casper-devnet network casper-dev is-ready
 ```
 
 Create assets without starting processes:
@@ -314,7 +367,7 @@ Claude CLI config example: PRs welcome.
 - `--log-level <level>`: Child process log level (default: `info`)
 - `--node-log-format <format>`: Node logging format in config (default: `json`)
 - `--setup-only`: Build assets and exit
-- `--force-setup`: Rebuild assets even if they exist
+- `--force-setup`: Rebuild assets even if they exist, while preserving `networks/<network>/hooks/`
 - `--seed <string>`: Seed for deterministic devnet keys (default: `default`)
 
 `casper-devnet mcp` flags:
@@ -329,6 +382,40 @@ Claude CLI config example: PRs welcome.
 - `--protocol-version <version>`: Protocol version to stage (required)
 - `--activation-point <era-id>`: Future era id for activation (required)
 - `--network-name <name>`: Network name for runtime paths (default: `casper-dev`)
+- `--net-path <path>`: Override network runtime root (same behavior as `start`)
+
+`casper-devnet derive` flags:
+
+- `<path>`: BIP32 derivation path to resolve
+- `--secret-key`: Print or write the derived secret key PEM
+- `--public-key`: Print or write the derived public key hex
+- `--account-hash`: Print or write the derived account hash
+- `--seed <string>`: Deterministic seed for derivation (default: `default`)
+- `-o, --output <path>`: Output directory, or `-` for stdout
+
+Exactly one of `--secret-key`, `--public-key`, or `--account-hash` must be provided.
+
+`casper-devnet network <network> path` flags:
+
+- `[protocol_version]`: Optional protocol version to inspect
+- `--net-path <path>`: Override network runtime root (same behavior as `start`)
+
+When no protocol version is provided, this prints the network root directory. When a protocol
+version is provided, it prints one staged config directory per known node, one path per line.
+
+`casper-devnet network <network> port` flags:
+
+- `--rpc`: Print one random running node RPC URL
+- `--sse`: Print one random running node SSE URL
+- `--rest`: Print one random running node REST URL
+- `--binary`: Print one random running node binary-port address
+- `--diagnostics`: Print one random running node diagnostics socket path
+- `--net-path <path>`: Override network runtime root (same behavior as `start`)
+
+Exactly one of `--rpc`, `--sse`, `--rest`, `--binary`, or `--diagnostics` must be provided.
+
+`casper-devnet network <network> is-ready` flags:
+
 - `--net-path <path>`: Override network runtime root (same behavior as `start`)
 
 ## Assets bundle layout

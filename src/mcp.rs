@@ -2,7 +2,7 @@ use self::args_parser::parse_session_args;
 use crate::assets::{self, AssetsLayout, SetupOptions, StageProtocolOptions};
 use crate::control::{ControlRequest, ControlResponse, ControlResult, send_request};
 use crate::process::{self, StartPlan};
-use crate::state::{ProcessKind, ProcessStatus, STATE_FILE_NAME, State};
+use crate::state::{ProcessKind, ProcessStatus, STATE_FILE_NAME, State, spawn_pid_sync_tasks};
 use anyhow::{Context, Result, anyhow};
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
@@ -1137,6 +1137,7 @@ struct ManagedNetwork {
     rust_log: String,
     seed: Arc<str>,
     sse_store: Arc<SseStore>,
+    last_block_hook_hash: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
     control_shutdown: Arc<AtomicBool>,
     sse_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -1272,6 +1273,8 @@ impl NetworkManager {
             ));
         }
 
+        assets::ensure_network_hook_samples(&layout).await?;
+
         if !force_setup && assets_exist {
             let _ = assets::ensure_consensus_keys(&layout, Arc::clone(&seed)).await?;
         }
@@ -1284,6 +1287,9 @@ impl NetworkManager {
         ensure_sidecar_available(&layout, node_count).await?;
 
         let state_path = layout.net_dir().join(STATE_FILE_NAME);
+        if !tokio_fs::try_exists(&state_path).await.unwrap_or(false) {
+            assets::prepare_genesis_hooks(&layout, &protocol_version).await?;
+        }
         let mut state = State::new(state_path).await?;
 
         let rust_log = log_level.clone();
@@ -1303,11 +1309,13 @@ impl NetworkManager {
             rust_log,
             seed,
             sse_store: Arc::new(SseStore::new(DEFAULT_SSE_HISTORY_CAPACITY)),
+            last_block_hook_hash: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             control_shutdown: Arc::new(AtomicBool::new(false)),
             sse_tasks: Mutex::new(Vec::new()),
             control_task: Mutex::new(None),
         });
+        spawn_pid_sync_tasks(Arc::clone(&managed.state)).await;
 
         self.spawn_sse_collectors(&managed).await;
         if let Err(err) = self.spawn_control_server(&managed).await {
@@ -1367,36 +1375,15 @@ impl NetworkManager {
 
                 let accepted =
                     tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
-                let (mut stream, _) = match accepted {
+                let (stream, _) = match accepted {
                     Ok(Ok(pair)) => pair,
                     Ok(Err(_)) => break,
                     Err(_) => continue,
                 };
-
-                let mut request_bytes = Vec::new();
-                let response = match stream.read_to_end(&mut request_bytes).await {
-                    Ok(_) => match serde_json::from_slice::<ControlRequest>(&request_bytes) {
-                        Ok(request) => {
-                            handle_managed_control_request(&network_for_task, request).await
-                        }
-                        Err(err) => ControlResponse::Error {
-                            error: format!("invalid control request: {}", err),
-                        },
-                    },
-                    Err(err) => ControlResponse::Error {
-                        error: format!("failed to read control request: {}", err),
-                    },
-                };
-
-                let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|err| {
-                    format!(
-                        "{{\"status\":\"error\",\"error\":\"failed to serialize control response: {}\"}}",
-                        err
-                    )
-                    .into_bytes()
+                let network = Arc::clone(&network_for_task);
+                tokio::spawn(async move {
+                    handle_managed_control_stream(stream, network).await;
                 });
-                let _ = stream.write_all(&response_bytes).await;
-                let _ = stream.shutdown().await;
             }
 
             let _ = tokio_fs::remove_file(&socket_path).await;
@@ -1450,6 +1437,10 @@ impl NetworkManager {
                         staged_nodes,
                         restarted_sidecars,
                     }),
+                    ControlResult::RuntimeStatus { .. } => Err(anyhow!(
+                        "unexpected runtime_status response from {}",
+                        socket_path.display()
+                    )),
                 },
                 Ok(ControlResponse::Error { error }) => Err(anyhow!(error)),
                 Err(err) => Err(anyhow!(
@@ -1624,8 +1615,9 @@ impl NetworkManager {
                 continue;
             }
 
+            let pid = process.current_pid();
             let running = matches!(process.last_status, ProcessStatus::Running)
-                && process.pid.is_some_and(is_pid_running);
+                && pid.is_some_and(is_pid_running);
             if running_only && !running {
                 continue;
             }
@@ -1634,7 +1626,7 @@ impl NetworkManager {
                 id: process.id.clone(),
                 node_id: process.node_id,
                 kind: process_kind_name(&process.kind).to_string(),
-                pid: process.pid,
+                pid,
                 running,
                 last_status: process_status_name(&process.last_status).to_string(),
                 command: process.command.clone(),
@@ -1754,11 +1746,48 @@ impl NetworkManager {
     }
 }
 
+async fn handle_managed_control_stream(
+    mut stream: tokio::net::UnixStream,
+    network: Arc<ManagedNetwork>,
+) {
+    let mut request_bytes = Vec::new();
+    let response = match stream.read_to_end(&mut request_bytes).await {
+        Ok(_) => match serde_json::from_slice::<ControlRequest>(&request_bytes) {
+            Ok(request) => handle_managed_control_request(&network, request).await,
+            Err(err) => ControlResponse::Error {
+                error: format!("invalid control request: {}", err),
+            },
+        },
+        Err(err) => ControlResponse::Error {
+            error: format!("failed to read control request: {}", err),
+        },
+    };
+
+    let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|err| {
+        format!(
+            "{{\"status\":\"error\",\"error\":\"failed to serialize control response: {}\"}}",
+            err
+        )
+        .into_bytes()
+    });
+    let _ = stream.write_all(&response_bytes).await;
+    let _ = stream.shutdown().await;
+}
+
 async fn handle_managed_control_request(
     network: &Arc<ManagedNetwork>,
     request: ControlRequest,
 ) -> ControlResponse {
     match request {
+        ControlRequest::RuntimeStatus => {
+            let state = network.state.lock().await;
+            ControlResponse::Ok {
+                result: ControlResult::RuntimeStatus {
+                    running_node_ids: running_node_ids(&state),
+                    last_block_height: state.last_block_height,
+                },
+            }
+        }
         ControlRequest::StageProtocol {
             asset_name,
             protocol_version,
@@ -2745,8 +2774,18 @@ async fn fetch_rest_status(node_id: u32) -> Result<Value> {
     Ok(response.json::<Value>().await?)
 }
 
+async fn claim_block_hook(network: &Arc<ManagedNetwork>, block_hash: &str) -> bool {
+    let mut last_block_hook_hash = network.last_block_hook_hash.lock().await;
+    if last_block_hook_hash.as_deref() == Some(block_hash) {
+        return false;
+    }
+    *last_block_hook_hash = Some(block_hash.to_string());
+    true
+}
+
 async fn run_sse_listener(network: Arc<ManagedNetwork>, node_id: u32, endpoint: String) {
     let mut backoff = ExponentialBackoff::default();
+    let mut connection_version: Option<String> = None;
 
     loop {
         if network.shutdown.load(Ordering::SeqCst) {
@@ -2789,8 +2828,25 @@ async fn run_sse_listener(network: Arc<ManagedNetwork>, node_id: u32, endpoint: 
 
             match event {
                 Ok(event) => {
-                    if let SseEvent::BlockAdded { block, .. } = &event {
+                    if let SseEvent::ApiVersion(version) = &event {
+                        connection_version = Some(version.to_string());
+                    }
+                    if let SseEvent::BlockAdded { block_hash, block } = &event {
                         let _ = record_last_block_height(&network.state, block.height()).await;
+                        assets::spawn_pending_post_genesis_hook(network.layout.clone());
+                        if let Some(protocol_version) = connection_version.as_deref()
+                            && claim_block_hook(&network, &block_hash.to_string()).await
+                        {
+                            assets::spawn_block_added_hook(
+                                network.layout.clone(),
+                                protocol_version.to_string(),
+                                json!({
+                                    "block_hash": block_hash.to_string(),
+                                    "height": block.height(),
+                                    "era_id": block.era_id().value(),
+                                }),
+                            );
+                        }
                     }
                     network.sse_store.push(node_id, event).await;
                 }
@@ -2801,6 +2857,7 @@ async fn run_sse_listener(network: Arc<ManagedNetwork>, node_id: u32, endpoint: 
             }
         }
 
+        connection_version = None;
         if failed && !sleep_backoff(&mut backoff).await {
             return;
         }
@@ -2924,8 +2981,28 @@ fn processes_running(state: &State) -> bool {
 
     state.processes.iter().all(|process| {
         matches!(process.last_status, ProcessStatus::Running)
-            && process.pid.is_some_and(is_pid_running)
+            && process.current_pid().is_some_and(is_pid_running)
     })
+}
+
+fn running_node_ids(state: &State) -> Vec<u32> {
+    let mut node_ids = std::collections::BTreeSet::new();
+    for process in &state.processes {
+        if !matches!(process.kind, ProcessKind::Node) {
+            continue;
+        }
+        if !matches!(process.last_status, ProcessStatus::Running) {
+            continue;
+        }
+        let Some(pid) = process.current_pid() else {
+            continue;
+        };
+        if !is_pid_running(pid) {
+            continue;
+        }
+        node_ids.insert(process.node_id);
+    }
+    node_ids.into_iter().collect()
 }
 
 fn is_pid_running(pid: u32) -> bool {

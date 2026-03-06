@@ -720,7 +720,7 @@ mod tests {
     ) {
         let version_fs = protocol_version.replace('.', "_");
         let logs_dir = hooks_dir.join("logs");
-        tokio_fs::create_dir_all(hooks_dir.join("pending"))
+        tokio_fs::create_dir_all(hooks_dir.join(".pending"))
             .await
             .unwrap();
         tokio_fs::create_dir_all(&logs_dir).await.unwrap();
@@ -735,7 +735,7 @@ mod tests {
         });
         tokio_fs::write(
             hooks_dir
-                .join("pending")
+                .join(".pending")
                 .join(format!("post-stage-protocol-{version_fs}.json")),
             serde_json::to_vec_pretty(&pending).unwrap(),
         )
@@ -757,7 +757,7 @@ mod tests {
     async fn post_hook_runs_once_with_network_cwd_and_log_redirection() {
         let temp_dir = TempDir::new().unwrap();
         let network_dir = temp_dir.path().join("casper-dev");
-        let hooks_dir = network_dir.join("daemon").join("hooks");
+        let hooks_dir = crate::assets::network_hooks_dir(&network_dir);
         tokio_fs::create_dir_all(&network_dir).await.unwrap();
 
         let hook_script = temp_dir.path().join("post-hook.sh");
@@ -775,31 +775,45 @@ mod tests {
         launcher_b.spawn_post_stage_protocol_hook(&version);
 
         let completion_path = hooks_dir
-            .join("status")
+            .join(".status")
             .join("post-stage-protocol-2_0_0.json");
         wait_for_path(&completion_path).await;
 
-        let expected_network_dir = tokio_fs::canonicalize(&network_dir).await.unwrap();
+        let expected_hook_dir = tokio_fs::canonicalize(crate::assets::network_hook_work_dir(
+            &network_dir,
+            "post-stage-protocol",
+        ))
+        .await
+        .unwrap();
         assert_eq!(
-            tokio_fs::read_to_string(network_dir.join("post-hook-cwd"))
-                .await
-                .unwrap()
-                .trim(),
-            expected_network_dir.display().to_string()
+            tokio_fs::read_to_string(
+                crate::assets::network_hook_work_dir(&network_dir, "post-stage-protocol")
+                    .join("post-hook-cwd"),
+            )
+            .await
+            .unwrap()
+            .trim(),
+            expected_hook_dir.display().to_string()
         );
         assert_eq!(
-            tokio_fs::read_to_string(network_dir.join("post-hook-args"))
-                .await
-                .unwrap()
-                .trim(),
+            tokio_fs::read_to_string(
+                crate::assets::network_hook_work_dir(&network_dir, "post-stage-protocol")
+                    .join("post-hook-args"),
+            )
+            .await
+            .unwrap()
+            .trim(),
             "casper-dev,2.0.0"
         );
         assert_eq!(
-            tokio_fs::read_to_string(network_dir.join("post-hook-count"))
-                .await
-                .unwrap()
-                .lines()
-                .count(),
+            tokio_fs::read_to_string(
+                crate::assets::network_hook_work_dir(&network_dir, "post-stage-protocol")
+                    .join("post-hook-count"),
+            )
+            .await
+            .unwrap()
+            .lines()
+            .count(),
             1
         );
         assert_eq!(
@@ -827,7 +841,7 @@ mod tests {
         assert!(
             tokio_fs::metadata(
                 hooks_dir
-                    .join("pending")
+                    .join(".pending")
                     .join("post-stage-protocol-2_0_0.json"),
             )
             .await
@@ -839,7 +853,7 @@ mod tests {
     async fn failed_post_hook_is_marked_consumed_after_first_attempt() {
         let temp_dir = TempDir::new().unwrap();
         let network_dir = temp_dir.path().join("casper-dev");
-        let hooks_dir = network_dir.join("daemon").join("hooks");
+        let hooks_dir = crate::assets::network_hooks_dir(&network_dir);
         tokio_fs::create_dir_all(&network_dir).await.unwrap();
 
         let hook_script = temp_dir.path().join("post-hook-fail.sh");
@@ -855,7 +869,7 @@ mod tests {
         launcher.spawn_post_stage_protocol_hook(&version);
 
         let completion_path = hooks_dir
-            .join("status")
+            .join(".status")
             .join("post-stage-protocol-2_0_0.json");
         wait_for_path(&completion_path).await;
 
@@ -868,17 +882,20 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         assert_eq!(
-            tokio_fs::read_to_string(network_dir.join("post-hook-count"))
-                .await
-                .unwrap()
-                .lines()
-                .count(),
+            tokio_fs::read_to_string(
+                crate::assets::network_hook_work_dir(&network_dir, "post-stage-protocol")
+                    .join("post-hook-count"),
+            )
+            .await
+            .unwrap()
+            .lines()
+            .count(),
             1
         );
         assert!(
             tokio_fs::metadata(
                 hooks_dir
-                    .join("pending")
+                    .join(".pending")
                     .join("post-stage-protocol-2_0_0.json"),
             )
             .await

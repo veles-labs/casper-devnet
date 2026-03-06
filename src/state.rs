@@ -4,11 +4,14 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::fs as tokio_fs;
+use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
+use tracing::warn;
 
 pub const STATE_FILE_NAME: &str = "state.json";
 
@@ -63,6 +66,18 @@ pub struct ProcessRecord {
     pub last_status: ProcessStatus,
 }
 
+impl ProcessRecord {
+    pub fn current_pid(&self) -> Option<u32> {
+        if let Some(handle) = &self.pid_handle {
+            let pid = handle.load(Ordering::SeqCst);
+            if pid != 0 {
+                return Some(pid);
+            }
+        }
+        self.pid
+    }
+}
+
 /// State snapshot stored for process bookkeeping.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
@@ -97,8 +112,86 @@ impl State {
 
     async fn persist(&self) -> Result<()> {
         ensure_parent(&self.path).await?;
-        let contents = serde_json::to_string_pretty(self)?;
+        let mut snapshot = self.clone();
+        for process in &mut snapshot.processes {
+            process.pid = process.current_pid();
+            process.pid_handle = None;
+            process.shutdown_handle = None;
+        }
+        let contents = serde_json::to_string_pretty(&snapshot)?;
         write_atomic(&self.path, contents).await
+    }
+}
+
+pub async fn spawn_pid_sync_tasks(state: Arc<Mutex<State>>) {
+    let tracked = {
+        let state = state.lock().await;
+        state
+            .processes
+            .iter()
+            .filter_map(|process| {
+                process
+                    .pid_handle
+                    .as_ref()
+                    .map(|handle| (process.id.clone(), Arc::clone(handle)))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (process_id, pid_handle) in tracked {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut last_seen = Some(u32::MAX);
+            loop {
+                let current_pid = {
+                    let pid = pid_handle.load(Ordering::SeqCst);
+                    (pid != 0).then_some(pid)
+                };
+                let should_exit;
+
+                if current_pid != last_seen {
+                    last_seen = current_pid;
+                    let mut state = state.lock().await;
+                    let Some(process) = state
+                        .processes
+                        .iter_mut()
+                        .find(|process| process.id == process_id)
+                    else {
+                        return;
+                    };
+
+                    process.pid = current_pid;
+                    should_exit = !matches!(process.last_status, ProcessStatus::Running)
+                        && current_pid.is_none();
+
+                    if let Err(error) = state.touch().await {
+                        warn!(
+                            %error,
+                            process_id,
+                            "failed to persist updated process pid"
+                        );
+                        return;
+                    }
+                } else {
+                    let state = state.lock().await;
+                    let Some(process) = state
+                        .processes
+                        .iter()
+                        .find(|process| process.id == process_id)
+                    else {
+                        return;
+                    };
+                    should_exit = !matches!(process.last_status, ProcessStatus::Running)
+                        && current_pid.is_none();
+                }
+
+                if should_exit {
+                    return;
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+        });
     }
 }
 
@@ -129,4 +222,80 @@ async fn write_atomic(path: &Path, contents: String) -> Result<()> {
         return Err(err.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    fn test_record(pid: Option<u32>, pid_handle: Option<Arc<AtomicU32>>) -> ProcessRecord {
+        ProcessRecord {
+            id: "node-1".to_string(),
+            node_id: 1,
+            kind: ProcessKind::Node,
+            group: ProcessGroup::Validators1,
+            command: "/tmp/casper-node".to_string(),
+            args: vec!["validator".to_string()],
+            cwd: "/tmp/network".to_string(),
+            pid,
+            pid_handle,
+            shutdown_handle: None,
+            stdout_path: "/tmp/stdout.log".to_string(),
+            stderr_path: "/tmp/stderr.log".to_string(),
+            started_at: None,
+            stopped_at: None,
+            exit_code: None,
+            exit_signal: None,
+            last_status: ProcessStatus::Running,
+        }
+    }
+
+    async fn read_pid(path: &Path) -> Option<u64> {
+        let contents = tokio_fs::read_to_string(path).await.unwrap();
+        let value: Value = serde_json::from_str(&contents).unwrap();
+        value["processes"][0]["pid"].as_u64()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn touch_persists_current_pid_from_handle() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+        let pid_handle = Arc::new(AtomicU32::new(4242));
+
+        let mut state = State::new(state_path.clone()).await.unwrap();
+        state
+            .processes
+            .push(test_record(Some(1111), Some(Arc::clone(&pid_handle))));
+        state.touch().await.unwrap();
+
+        assert_eq!(read_pid(&state_path).await, Some(4242));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pid_sync_task_updates_state_when_pid_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+        let pid_handle = Arc::new(AtomicU32::new(5001));
+
+        let mut state = State::new(state_path.clone()).await.unwrap();
+        state
+            .processes
+            .push(test_record(Some(5001), Some(Arc::clone(&pid_handle))));
+        state.touch().await.unwrap();
+
+        let state = Arc::new(Mutex::new(state));
+        spawn_pid_sync_tasks(Arc::clone(&state)).await;
+        pid_handle.store(6002, Ordering::SeqCst);
+
+        for _ in 0..50 {
+            if read_pid(&state_path).await == Some(6002) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        panic!("timed out waiting for pid sync task to persist updated pid");
+    }
 }

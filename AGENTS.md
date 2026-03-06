@@ -57,5 +57,8 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - Do not use `curl` for JSON-RPC transaction lookups; use MCP `get_transaction` (single fetch) or `wait_transaction` (poll-until-executed) tools instead.
 - Keep `README.md` updated with CLI defaults/flags whenever code changes.
 - Before finishing a task, run `cargo clippy --all --all-targets --all-features --tests` only if any `.rs` code is changed, and report failures.
-- Update `CHANGELOG.md` for user-facing changes; list them under `[Unreleased]` in the appropriate section.
+- Update `CHANGELOG.md` only when explicitly asked. When asked, derive the changelog work from
+  changes against the upstream branch, considering commits, modified files, and staged files as
+  needed; summarize the relevant user-facing changes first, then distill them into
+  `CHANGELOG.md` entries under `[Unreleased]`.
 - Changelog maintenance: follow Keep a Changelog + SemVer; keep the standard section headings; when cutting a release, move entries from `[Unreleased]` into a new tagged section with the release date based on the latest git tag; update compare links for `[Unreleased]` and the new version.

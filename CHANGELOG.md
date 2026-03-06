@@ -15,6 +15,13 @@ Semantic Versioning.
   `networks rm <name>` (interactive confirmation or `--yes`).
 - Add custom-asset hook scaffolding under `assets/custom/<name>/hooks/` with executable
   `pre-stage-protocol.sample` and `post-stage-protocol.sample` templates.
+- Add `network <network> path <protocol_version>` to print the staged chainspec path for that
+  protocol version.
+- Add `network <network> port --rpc|--sse|--rest|--binary|--diagnostics` to print one random
+  live endpoint or diagnostics socket path from a running node.
+- Add `network <network> is-ready` for scoped CI readiness checks.
+- Add `derive <path> --secret-key|--public-key|--account-hash` with `-o/--output` support for
+  deterministic seed-path account material lookup.
 
 ### Changed
 - Protocol staging now writes per-node versioned `bin/<version>` and `config/<version>` trees,
@@ -22,7 +29,8 @@ Semantic Versioning.
   mode without requiring a full `start` restart cycle.
 - Protocol staging now runs optional custom-asset hooks: `pre-stage-protocol` before any staging
   mutation and `post-stage-protocol` once at the real upgrade boundary after the launcher starts
-  the target validator version. Hook stdout/stderr are captured under
+  the target validator version. Hook stdout/stderr are streamed through `casper-devnet` stderr
+  with `<hook_name> stdout|stderr: ...` prefixes and still captured under
   `networks/<network>/daemon/hooks/logs/`.
 - Runtime supervisor logs now make upgrade transitions explicit (launcher upgrade notes,
   SSE shutdown/disconnect visibility, and post-reconnect `Network is healthy` API re-announcement).
@@ -30,6 +38,10 @@ Semantic Versioning.
   protocol transitions and sidecar restarts.
 - Custom `assets add <name> ...` installs are now write-once: reusing an existing custom asset
   name fails instead of replacing that directory in place.
+- Hook sample scripts now include a best-effort
+  `casper-devnet network <network> port --rpc` + `curl` example using `info_get_status`.
+- Reuse the shared seed-path derivation helper for both MCP signing flows and the new CLI
+  `derive` command.
 
 ### Deprecated
 
@@ -39,6 +51,13 @@ Semantic Versioning.
 - Avoid unintended offline fallback on macOS by using short `/tmp` control socket paths.
 - Restore consensus keys from the network seed before live staging so `migrate-data` can complete
   at upgrade boundaries.
+- Keep managed network PID state in sync across launcher-driven node restarts so `network <name>
+  port ...`, `network <name> is-ready`, and MCP process inspection continue to work after staged
+  upgrades.
+- Make `network <name> port ...` prefer live control-socket runtime status over persisted
+  `state.json` when the network is actively managed.
+- Handle control-socket requests concurrently and time out stalled live port lookups so
+  `network <name> port ...` no longer hangs during in-flight `stage-protocol` hooks.
 
 ### Security
 

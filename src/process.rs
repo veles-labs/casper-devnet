@@ -599,11 +599,5 @@ async fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
 }
 
 fn current_pid(record: &ProcessRecord) -> Option<u32> {
-    if let Some(handle) = &record.pid_handle {
-        let pid = handle.load(Ordering::SeqCst);
-        if pid != 0 {
-            return Some(pid);
-        }
-    }
-    record.pid
+    record.current_pid()
 }

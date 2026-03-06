@@ -361,6 +361,7 @@ dependencies = [
  "futures",
  "indicatif",
  "nix",
+ "rand 0.10.0",
  "reqwest",
  "rmcp",
  "schemars 1.2.1",
