@@ -9,7 +9,12 @@ use tokio::net::UnixStream;
 pub enum ControlRequest {
     RuntimeStatus,
     StageProtocol {
-        asset_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_asset: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset_name: Option<String>,
         protocol_version: String,
         activation_point: u64,
         restart_sidecars: bool,

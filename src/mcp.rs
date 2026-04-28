@@ -1,5 +1,7 @@
 use self::args_parser::parse_session_args;
-use crate::assets::{self, AddNodesOptions, AssetsLayout, SetupOptions, StageProtocolOptions};
+use crate::assets::{
+    self, AddNodesOptions, AssetSelector, AssetsLayout, SetupOptions, StageProtocolOptions,
+};
 use crate::control::{ControlRequest, ControlResponse, ControlResult, send_request};
 use crate::process::{self, StartPlan};
 use crate::state::{
@@ -158,7 +160,9 @@ impl McpServer {
             .manager
             .stage_protocol(
                 &request.network_name,
-                &request.asset_name,
+                request.asset.as_deref(),
+                request.custom_asset.as_deref(),
+                request.asset_name.as_deref(),
                 &request.protocol_version,
                 request.activation_point,
             )
@@ -1236,39 +1240,49 @@ impl NetworkManager {
         let layout = AssetsLayout::new(self.assets_root.clone(), network_name.clone());
         let assets_exist = layout.exists().await;
 
-        let protocol_version =
-            resolve_protocol_version(request.protocol_version.as_deref()).await?;
+        let asset_selector = assets::optional_asset_selector(
+            request.asset.as_deref(),
+            request.custom_asset.as_deref(),
+        )?;
 
-        if force_setup {
+        let setup_result = if force_setup {
             assets::teardown(&layout).await?;
-            assets::setup_local(
-                &layout,
-                &SetupOptions {
-                    nodes: requested_nodes,
-                    users,
-                    delay_seconds: delay,
-                    network_name: network_name.clone(),
-                    protocol_version: protocol_version.clone(),
-                    node_log_format,
-                    seed: Arc::clone(&seed),
-                },
+            Some(
+                assets::setup_local(
+                    &layout,
+                    &SetupOptions {
+                        nodes: requested_nodes,
+                        users,
+                        delay_seconds: delay,
+                        network_name: network_name.clone(),
+                        asset: asset_selector.clone(),
+                        protocol_version: request.protocol_version.clone(),
+                        node_log_format,
+                        seed: Arc::clone(&seed),
+                    },
+                )
+                .await?,
             )
-            .await?;
         } else if !assets_exist {
-            assets::setup_local(
-                &layout,
-                &SetupOptions {
-                    nodes: requested_nodes,
-                    users,
-                    delay_seconds: delay,
-                    network_name: network_name.clone(),
-                    protocol_version: protocol_version.clone(),
-                    node_log_format,
-                    seed: Arc::clone(&seed),
-                },
+            Some(
+                assets::setup_local(
+                    &layout,
+                    &SetupOptions {
+                        nodes: requested_nodes,
+                        users,
+                        delay_seconds: delay,
+                        network_name: network_name.clone(),
+                        asset: asset_selector,
+                        protocol_version: request.protocol_version.clone(),
+                        node_log_format,
+                        seed: Arc::clone(&seed),
+                    },
+                )
+                .await?,
             )
-            .await?;
-        }
+        } else {
+            None
+        };
 
         if !layout.exists().await {
             return Err(anyhow!(
@@ -1292,6 +1306,10 @@ impl NetworkManager {
 
         let state_path = layout.net_dir().join(STATE_FILE_NAME);
         if !tokio_fs::try_exists(&state_path).await.unwrap_or(false) {
+            let protocol_version = match &setup_result {
+                Some(result) => result.protocol_version.clone(),
+                None => latest_layout_protocol_version(&layout).await?,
+            };
             assets::prepare_genesis_hooks(&layout, &protocol_version).await?;
         }
         let mut state = State::new(state_path).await?;
@@ -1400,10 +1418,13 @@ impl NetworkManager {
     async fn stage_protocol(
         &self,
         network_name: &str,
-        asset_name: &str,
+        asset: Option<&str>,
+        custom_asset: Option<&str>,
+        legacy_asset_name: Option<&str>,
         protocol_version: &str,
         activation_point: u64,
     ) -> Result<StageProtocolResponse> {
+        let asset_selector = stage_asset_selector(asset, custom_asset, legacy_asset_name)?;
         let managed = {
             let guard = self.managed.lock().await;
             guard.get(network_name).cloned()
@@ -1423,7 +1444,15 @@ impl NetworkManager {
             }
 
             let request = ControlRequest::StageProtocol {
-                asset_name: asset_name.to_string(),
+                asset: match &asset_selector {
+                    AssetSelector::Versioned(asset) => Some(asset.clone()),
+                    AssetSelector::LatestVersioned | AssetSelector::Custom(_) => None,
+                },
+                custom_asset: match &asset_selector {
+                    AssetSelector::Custom(asset) => Some(asset.clone()),
+                    AssetSelector::LatestVersioned | AssetSelector::Versioned(_) => None,
+                },
+                asset_name: None,
                 protocol_version: protocol_version.to_string(),
                 activation_point,
                 restart_sidecars: true,
@@ -1472,7 +1501,7 @@ impl NetworkManager {
         let staged = assets::stage_protocol(
             &layout,
             &StageProtocolOptions {
-                asset_name: asset_name.to_string(),
+                asset: asset_selector,
                 protocol_version: protocol_version.to_string(),
                 activation_point,
             },
@@ -1813,12 +1842,26 @@ async fn handle_managed_control_request(
             }
         }
         ControlRequest::StageProtocol {
+            asset,
+            custom_asset,
             asset_name,
             protocol_version,
             activation_point,
             restart_sidecars,
             rust_log,
         } => {
+            let asset_selector = match stage_asset_selector(
+                asset.as_deref(),
+                custom_asset.as_deref(),
+                asset_name.as_deref(),
+            ) {
+                Ok(asset_selector) => asset_selector,
+                Err(err) => {
+                    return ControlResponse::Error {
+                        error: err.to_string(),
+                    };
+                }
+            };
             let _asset_mutation_guard = network.asset_mutation_lock.lock().await;
             if let Err(err) =
                 assets::ensure_consensus_keys(&network.layout, Arc::clone(&network.seed)).await
@@ -1831,7 +1874,7 @@ async fn handle_managed_control_request(
             let staged = assets::stage_protocol(
                 &network.layout,
                 &StageProtocolOptions {
-                    asset_name,
+                    asset: asset_selector,
                     protocol_version,
                     activation_point,
                 },
@@ -2116,6 +2159,8 @@ struct DerivedSigner {
 #[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
 struct SpawnNetworkRequest {
     network_name: Option<String>,
+    asset: Option<String>,
+    custom_asset: Option<String>,
     protocol_version: Option<String>,
     node_count: Option<u32>,
     users: Option<u32>,
@@ -2153,7 +2198,9 @@ struct WaitReadyResponse {
 #[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
 struct StageProtocolRequest {
     network_name: String,
-    asset_name: String,
+    asset: Option<String>,
+    custom_asset: Option<String>,
+    asset_name: Option<String>,
     protocol_version: String,
     activation_point: u64,
 }
@@ -3163,19 +3210,28 @@ async fn ensure_sidecar_available(layout: &AssetsLayout, node_count: u32) -> Res
     Ok(())
 }
 
-async fn resolve_protocol_version(candidate: Option<&str>) -> Result<String> {
-    if let Some(raw) = candidate {
-        let version = assets::parse_protocol_version(raw)?;
-        if !assets::has_bundle_version(&version).await? {
-            return Err(anyhow!("assets for version {} not found", version));
-        }
-        return Ok(version.to_string());
-    }
-
-    let version = assets::most_recent_bundle_version()
+async fn latest_layout_protocol_version(layout: &AssetsLayout) -> Result<String> {
+    Ok(layout
+        .latest_protocol_version_dir(1)
         .await?
-        .ok_or_else(|| anyhow!("no assets bundles found"))?;
-    Ok(version.to_string())
+        .replace('_', "."))
+}
+
+fn stage_asset_selector(
+    asset: Option<&str>,
+    custom_asset: Option<&str>,
+    legacy_asset_name: Option<&str>,
+) -> Result<AssetSelector> {
+    let custom_asset = match (custom_asset, legacy_asset_name) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "custom_asset and asset_name are mutually exclusive"
+            ));
+        }
+        (Some(custom_asset), None) | (None, Some(custom_asset)) => Some(custom_asset),
+        (None, None) => None,
+    };
+    assets::required_asset_selector(asset, custom_asset)
 }
 
 async fn parse_derived_accounts_csv(

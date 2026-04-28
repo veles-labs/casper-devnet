@@ -1,3 +1,4 @@
+use super::stage_protocol;
 use crate::assets::{self, AssetsLayout};
 use crate::cli::common::{
     is_control_socket, is_dir, is_file, is_ready_reactor_state, shorten_home_path,
@@ -40,6 +41,8 @@ enum NetworkCommand {
     Port(NetworkPortArgs),
     /// Print REST /status for a specific node.
     Status(NetworkStatusArgs),
+    /// Stage a protocol upgrade for this network.
+    StageProtocol(stage_protocol::StageProtocolArgs),
 }
 
 #[derive(Args, Clone)]
@@ -151,6 +154,9 @@ pub(crate) async fn run(args: NetworkArgs) -> Result<()> {
         NetworkCommand::Path(path) => run_network_path(args.network_name, path).await,
         NetworkCommand::Port(port) => run_network_port(args.network_name, port).await,
         NetworkCommand::Status(status) => run_network_status(args.network_name, status).await,
+        NetworkCommand::StageProtocol(stage_protocol_args) => {
+            stage_protocol::run(args.network_name, stage_protocol_args).await
+        }
     }
 }
 

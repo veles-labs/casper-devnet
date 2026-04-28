@@ -40,8 +40,6 @@ enum Command {
     Network(network::NetworkArgs),
     /// Manage local network directories.
     Networks(networks::NetworksArgs),
-    /// Stage a protocol upgrade from a custom asset.
-    StageProtocol(stage_protocol::StageProtocolArgs),
 }
 
 /// Parses CLI and runs the selected subcommand.
@@ -54,6 +52,5 @@ pub async fn run() -> Result<()> {
         Command::Derive(args) => derive::run(args).await,
         Command::Network(args) => network::run(args).await,
         Command::Networks(args) => networks::run(args).await,
-        Command::StageProtocol(args) => stage_protocol::run(args).await,
     }
 }

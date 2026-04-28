@@ -450,6 +450,30 @@ pub async fn custom_asset_path(name: &str) -> Result<PathBuf> {
     Ok(asset_dir)
 }
 
+pub fn optional_asset_selector(
+    asset: Option<&str>,
+    custom_asset: Option<&str>,
+) -> Result<AssetSelector> {
+    match (asset, custom_asset) {
+        (Some(_), Some(_)) => Err(anyhow!("--asset and --custom-asset are mutually exclusive")),
+        (Some(asset), None) => Ok(AssetSelector::Versioned(asset.to_string())),
+        (None, Some(custom_asset)) => Ok(AssetSelector::Custom(custom_asset.to_string())),
+        (None, None) => Ok(AssetSelector::LatestVersioned),
+    }
+}
+
+pub fn required_asset_selector(
+    asset: Option<&str>,
+    custom_asset: Option<&str>,
+) -> Result<AssetSelector> {
+    match optional_asset_selector(asset, custom_asset)? {
+        AssetSelector::LatestVersioned => {
+            Err(anyhow!("one of --asset or --custom-asset is required"))
+        }
+        selector => Ok(selector),
+    }
+}
+
 pub fn file_name(path: &Path) -> Option<&OsStr> {
     path.file_name()
 }
@@ -526,13 +550,46 @@ pub(crate) fn network_hook_work_dir(network_dir: &Path, hook_name: &str) -> Path
     network_hook_work_root(network_dir).join(hook_name)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssetSelector {
+    LatestVersioned,
+    Versioned(String),
+    Custom(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssetSourceKind {
+    Versioned,
+    Custom,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedAsset {
+    display_name: String,
+    source_kind: AssetSourceKind,
+    casper_node: PathBuf,
+    casper_sidecar: PathBuf,
+    chainspec: PathBuf,
+    node_config: PathBuf,
+    sidecar_config: PathBuf,
+    pre_stage_protocol_hook: Option<PathBuf>,
+    post_stage_protocol_hook: Option<PathBuf>,
+    chainspec_protocol_version: Version,
+}
+
+#[derive(Debug)]
+pub struct SetupLocalResult {
+    pub protocol_version: String,
+}
+
 /// Parameters for building a local devnet asset tree.
 pub struct SetupOptions {
     pub nodes: u32,
     pub users: Option<u32>,
     pub delay_seconds: u64,
     pub network_name: String,
-    pub protocol_version: String,
+    pub asset: AssetSelector,
+    pub protocol_version: Option<String>,
     pub node_log_format: String,
     pub seed: Arc<str>,
 }
@@ -547,7 +604,7 @@ pub struct CustomAssetInstallOptions {
 }
 
 pub struct StageProtocolOptions {
-    pub asset_name: String,
+    pub asset: AssetSelector,
     pub protocol_version: String,
     pub activation_point: u64,
 }
@@ -644,29 +701,27 @@ pub(crate) enum PendingPostGenesisHookResult {
 }
 
 /// Create or refresh local assets for a devnet.
-pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<()> {
+pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<SetupLocalResult> {
     let genesis_nodes = opts.nodes;
     if genesis_nodes == 0 {
         return Err(anyhow!("nodes must be greater than 0"));
     }
     let total_nodes = genesis_nodes;
     let users = opts.users.unwrap_or(total_nodes);
-    let bundle_root = assets_bundle_root()?;
-    let protocol_version = parse_protocol_version(&opts.protocol_version)?;
+    let asset = resolve_asset(&opts.asset).await?;
+    preflight_resolved_asset(&asset).await?;
+    let protocol_version = match &opts.protocol_version {
+        Some(protocol_version) => parse_protocol_version(protocol_version)?,
+        None => asset.chainspec_protocol_version.clone(),
+    };
     let protocol_version_chain = protocol_version.to_string();
     let protocol_version_fs = protocol_version_chain.replace('.', "_");
-    let bundle_dir = bundle_dir_for_version(&bundle_root, &protocol_version).await?;
-
-    let chainspec_path = bundle_dir.join("chainspec.toml");
-    let config_path = bundle_dir.join("node-config.toml");
-    let sidecar_config_path = bundle_dir.join("sidecar-config.toml");
 
     let net_dir = layout.net_dir();
     tokio_fs::create_dir_all(&net_dir).await?;
 
     setup_directories(layout, total_nodes, &protocol_version_fs).await?;
-    preflight_bundle(&bundle_dir, &chainspec_path, &config_path).await?;
-    setup_binaries(layout, total_nodes, &bundle_dir, &protocol_version_fs).await?;
+    setup_binaries(layout, total_nodes, &asset, &protocol_version_fs).await?;
 
     let derived_accounts =
         setup_seeded_keys(layout, total_nodes, users, Arc::clone(&opts.seed)).await?;
@@ -674,7 +729,7 @@ pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<(
     setup_chainspec(
         layout,
         total_nodes,
-        &chainspec_path,
+        &asset.chainspec,
         opts.delay_seconds,
         &protocol_version_chain,
         &opts.network_name,
@@ -687,14 +742,16 @@ pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<(
         layout,
         total_nodes,
         &protocol_version_fs,
-        &config_path,
-        &sidecar_config_path,
+        &asset.node_config,
+        &asset.sidecar_config,
         &opts.node_log_format,
     )
     .await?;
     ensure_network_hook_samples(layout).await?;
 
-    Ok(())
+    Ok(SetupLocalResult {
+        protocol_version: protocol_version_chain,
+    })
 }
 
 pub async fn install_custom_asset(opts: &CustomAssetInstallOptions) -> Result<()> {
@@ -735,15 +792,11 @@ pub async fn stage_protocol(
     layout: &AssetsLayout,
     opts: &StageProtocolOptions,
 ) -> Result<StageProtocolResult> {
-    validate_custom_asset_name(&opts.asset_name)?;
-
+    let asset = resolve_asset(&opts.asset).await?;
+    preflight_resolved_asset(&asset).await?;
     let protocol_version = parse_protocol_version(&opts.protocol_version)?;
     let protocol_version_chain = protocol_version.to_string();
     let protocol_version_fs = protocol_version_chain.replace('.', "_");
-    let custom_asset = load_custom_asset(&opts.asset_name).await?;
-
-    verify_binary_version(&custom_asset.casper_node, "casper-node").await?;
-    verify_binary_version(&custom_asset.casper_sidecar, "casper-sidecar").await?;
 
     let total_nodes = layout.count_nodes().await?;
     if total_nodes == 0 {
@@ -757,7 +810,7 @@ pub async fn stage_protocol(
     let accounts_path = layout.net_dir().join("chainspec/accounts.toml");
     run_pre_stage_protocol_hook(
         layout,
-        &custom_asset,
+        &asset,
         &protocol_version_chain,
         opts.activation_point,
     )
@@ -776,19 +829,21 @@ pub async fn stage_protocol(
         tokio_fs::create_dir_all(&node_bin_version_dir).await?;
         tokio_fs::create_dir_all(&node_config_version_dir).await?;
 
-        symlink_file(
-            &custom_asset.casper_node,
+        install_binary_file(
+            &asset,
+            &asset.casper_node,
             &node_bin_version_dir.join("casper-node"),
         )
         .await?;
-        symlink_file(
-            &custom_asset.casper_sidecar,
+        install_binary_file(
+            &asset,
+            &asset.casper_sidecar,
             &node_bin_version_dir.join("casper-sidecar"),
         )
         .await?;
 
         let chainspec_dest = node_config_version_dir.join("chainspec.toml");
-        copy_file(&custom_asset.chainspec, &chainspec_dest).await?;
+        copy_file(&asset.chainspec, &chainspec_dest).await?;
         let staged_chainspec = tokio_fs::read_to_string(&chainspec_dest).await?;
         let network_name = layout.network_name().to_string();
         let activation_point = opts.activation_point as i64;
@@ -815,7 +870,7 @@ pub async fn stage_protocol(
         }
 
         let node_config_dest = node_config_version_dir.join("config.toml");
-        copy_file(&custom_asset.node_config, &node_config_dest).await?;
+        copy_file(&asset.node_config, &node_config_dest).await?;
         let config_contents = tokio_fs::read_to_string(&node_config_dest).await?;
         let bind_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_NETWORK, node_id));
         let known = known_addresses(node_id, total_nodes);
@@ -875,7 +930,7 @@ pub async fn stage_protocol(
         tokio_fs::write(&node_config_dest, updated_config).await?;
 
         let sidecar_dest = node_config_version_dir.join("sidecar.toml");
-        copy_file(&custom_asset.sidecar_config, &sidecar_dest).await?;
+        copy_file(&asset.sidecar_config, &sidecar_dest).await?;
         let sidecar_contents = tokio_fs::read_to_string(&sidecar_dest).await?;
         let rpc_port = node_port(DEVNET_BASE_PORT_RPC, node_id) as i64;
         let binary_port = node_port(DEVNET_BASE_PORT_BINARY, node_id) as i64;
@@ -907,7 +962,7 @@ pub async fn stage_protocol(
         tokio_fs::write(&sidecar_dest, updated_sidecar).await?;
     }
 
-    refresh_post_stage_protocol_hook(layout, &custom_asset, opts, &protocol_version_chain).await?;
+    refresh_post_stage_protocol_hook(layout, &asset, opts, &protocol_version_chain).await?;
 
     Ok(StageProtocolResult {
         staged_nodes: total_nodes,
@@ -1685,6 +1740,79 @@ pub async fn list_custom_asset_names() -> Result<Vec<String>> {
     Ok(names)
 }
 
+async fn resolve_asset(selector: &AssetSelector) -> Result<ResolvedAsset> {
+    match selector {
+        AssetSelector::LatestVersioned => {
+            let version = most_recent_bundle_version()
+                .await?
+                .ok_or_else(|| anyhow!("no assets bundles found"))?;
+            resolve_versioned_asset(&version).await
+        }
+        AssetSelector::Versioned(raw) => {
+            let version = parse_protocol_version(raw)?;
+            resolve_versioned_asset(&version).await
+        }
+        AssetSelector::Custom(name) => resolve_custom_asset(name).await,
+    }
+}
+
+async fn resolve_versioned_asset(version: &Version) -> Result<ResolvedAsset> {
+    let bundle_root = assets_bundle_root()?;
+    let bundle_dir = bundle_dir_for_version(&bundle_root, version).await?;
+    let casper_node =
+        canonicalize_required_file(&bundle_dir.join("bin").join("casper-node"), "casper-node")
+            .await?;
+    let casper_sidecar = canonicalize_required_file(
+        &bundle_dir.join("bin").join("casper-sidecar"),
+        "casper-sidecar",
+    )
+    .await?;
+    let chainspec =
+        canonicalize_required_file(&bundle_dir.join("chainspec.toml"), "chainspec").await?;
+    let node_config =
+        canonicalize_required_file(&bundle_dir.join("node-config.toml"), "node-config").await?;
+    let sidecar_config =
+        canonicalize_required_file(&bundle_dir.join("sidecar-config.toml"), "sidecar-config")
+            .await?;
+    let chainspec_protocol_version = parse_chainspec_file(&chainspec).await?;
+
+    Ok(ResolvedAsset {
+        display_name: version.to_string(),
+        source_kind: AssetSourceKind::Versioned,
+        casper_node,
+        casper_sidecar,
+        chainspec,
+        node_config,
+        sidecar_config,
+        pre_stage_protocol_hook: None,
+        post_stage_protocol_hook: None,
+        chainspec_protocol_version,
+    })
+}
+
+async fn resolve_custom_asset(name: &str) -> Result<ResolvedAsset> {
+    let custom_asset = load_custom_asset(name).await?;
+    let chainspec_protocol_version = parse_chainspec_file(&custom_asset.chainspec).await?;
+
+    Ok(ResolvedAsset {
+        display_name: format!("custom/{name}"),
+        source_kind: AssetSourceKind::Custom,
+        casper_node: custom_asset.casper_node,
+        casper_sidecar: custom_asset.casper_sidecar,
+        chainspec: custom_asset.chainspec,
+        node_config: custom_asset.node_config,
+        sidecar_config: custom_asset.sidecar_config,
+        pre_stage_protocol_hook: custom_asset.pre_stage_protocol_hook,
+        post_stage_protocol_hook: custom_asset.post_stage_protocol_hook,
+        chainspec_protocol_version,
+    })
+}
+
+async fn parse_chainspec_file(path: &Path) -> Result<Version> {
+    let contents = tokio_fs::read_to_string(path).await?;
+    spawn_blocking_result(move || parse_chainspec_version(&contents)).await
+}
+
 fn parse_chainspec_version(contents: &str) -> Result<Version> {
     let value: toml::Value = toml::from_str(contents)?;
     let protocol = value
@@ -1928,59 +2056,33 @@ async fn setup_directories(
 async fn setup_binaries(
     layout: &AssetsLayout,
     total_nodes: u32,
-    bundle_dir: &Path,
+    asset: &ResolvedAsset,
     protocol_version_fs: &str,
 ) -> Result<()> {
-    let node_bin_src = bundle_dir.join("bin").join("casper-node");
-    let sidecar_src = bundle_dir.join("bin").join("casper-sidecar");
-
     for node_id in 1..=total_nodes {
         let node_bin_dir = layout.node_bin_dir(node_id);
         let version_dir = node_bin_dir.join(protocol_version_fs);
 
         let node_dest = version_dir.join("casper-node");
-        hardlink_file(&node_bin_src, &node_dest).await?;
+        install_binary_file(asset, &asset.casper_node, &node_dest).await?;
 
         let sidecar_dest = version_dir.join("casper-sidecar");
-        hardlink_file(&sidecar_src, &sidecar_dest).await?;
+        install_binary_file(asset, &asset.casper_sidecar, &sidecar_dest).await?;
     }
 
     Ok(())
 }
 
-async fn preflight_bundle(
-    bundle_dir: &Path,
-    chainspec_path: &Path,
-    config_path: &Path,
-) -> Result<()> {
-    let mut missing = Vec::new();
+async fn install_binary_file(asset: &ResolvedAsset, src: &Path, dest: &Path) -> Result<()> {
+    match asset.source_kind {
+        AssetSourceKind::Versioned => hardlink_file(src, dest).await,
+        AssetSourceKind::Custom => symlink_file(src, dest).await,
+    }
+}
 
-    let node_bin = bundle_dir.join("bin").join("casper-node");
-    let sidecar_bin = bundle_dir.join("bin").join("casper-sidecar");
-    if !is_file(&node_bin).await {
-        missing.push(node_bin.clone());
-    }
-    if !is_file(&sidecar_bin).await {
-        missing.push(sidecar_bin.clone());
-    }
-    if !is_file(chainspec_path).await {
-        missing.push(chainspec_path.to_path_buf());
-    }
-    if !is_file(config_path).await {
-        missing.push(config_path.to_path_buf());
-    }
-
-    if !missing.is_empty() {
-        let message = missing
-            .into_iter()
-            .map(|path| format!("missing source file {}", path.display()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(anyhow!(message));
-    }
-
-    verify_binary_version(&node_bin, "casper-node").await?;
-    verify_binary_version(&sidecar_bin, "casper-sidecar").await?;
+async fn preflight_resolved_asset(asset: &ResolvedAsset) -> Result<()> {
+    verify_binary_version(&asset.casper_node, "casper-node").await?;
+    verify_binary_version(&asset.casper_sidecar, "casper-sidecar").await?;
     Ok(())
 }
 
@@ -2658,11 +2760,11 @@ pub async fn prepare_genesis_hooks(layout: &AssetsLayout, protocol_version: &str
 
 async fn run_pre_stage_protocol_hook(
     layout: &AssetsLayout,
-    custom_asset: &CustomAssetPaths,
+    asset: &ResolvedAsset,
     protocol_version: &str,
     activation_point: u64,
 ) -> Result<()> {
-    let Some(command_path) = &custom_asset.pre_stage_protocol_hook else {
+    let Some(command_path) = &asset.pre_stage_protocol_hook else {
         return Ok(());
     };
 
@@ -2773,13 +2875,13 @@ async fn clear_post_genesis_hook_state(
 
 async fn refresh_post_stage_protocol_hook(
     layout: &AssetsLayout,
-    custom_asset: &CustomAssetPaths,
+    asset: &ResolvedAsset,
     opts: &StageProtocolOptions,
     protocol_version: &str,
 ) -> Result<()> {
     clear_post_stage_protocol_hook_state(layout, protocol_version).await?;
 
-    let Some(command_path) = &custom_asset.post_stage_protocol_hook else {
+    let Some(command_path) = &asset.post_stage_protocol_hook else {
         return Ok(());
     };
 
@@ -2793,7 +2895,7 @@ async fn refresh_post_stage_protocol_hook(
         protocol_version,
     );
     let pending = PendingPostStageProtocolHook {
-        asset_name: opts.asset_name.clone(),
+        asset_name: asset.display_name.clone(),
         network_name: layout.network_name().to_string(),
         protocol_version: protocol_version.to_string(),
         activation_point: opts.activation_point,
@@ -3735,6 +3837,42 @@ rewards_handling = { type = 'standard' }
         custom_asset_path(name).await
     }
 
+    async fn install_test_versioned_asset(
+        asset_version: &str,
+        chainspec_version: &str,
+    ) -> Result<PathBuf> {
+        let version = parse_protocol_version(asset_version)?;
+        let asset_dir = assets_bundle_root()?.join(format!("v{version}"));
+        tokio_fs::create_dir_all(asset_dir.join("bin")).await?;
+        create_fake_binary(&asset_dir.join("bin").join("casper-node"), "casper-node").await?;
+        create_fake_binary(
+            &asset_dir.join("bin").join("casper-sidecar"),
+            "casper-sidecar",
+        )
+        .await?;
+        tokio_fs::write(
+            asset_dir.join("chainspec.toml"),
+            format!(
+                "\
+[protocol]
+activation_point = 1
+version = '{chainspec_version}'
+
+[network]
+name = 'casper-dev'
+
+[core]
+validator_slots = 4
+rewards_handling = {{ type = 'standard' }}
+"
+            ),
+        )
+        .await?;
+        tokio_fs::write(asset_dir.join("node-config.toml"), "").await?;
+        tokio_fs::write(asset_dir.join("sidecar-config.toml"), "").await?;
+        Ok(asset_dir)
+    }
+
     async fn create_test_network_layout(
         root: &Path,
         network_name: &str,
@@ -3858,10 +3996,36 @@ port = 2
 
     fn stage_options(asset_name: &str, protocol_version: &str) -> StageProtocolOptions {
         StageProtocolOptions {
-            asset_name: asset_name.to_string(),
+            asset: AssetSelector::Custom(asset_name.to_string()),
             protocol_version: protocol_version.to_string(),
             activation_point: 123,
         }
+    }
+
+    fn setup_options(asset: AssetSelector, protocol_version: Option<&str>) -> SetupOptions {
+        SetupOptions {
+            nodes: 1,
+            users: None,
+            delay_seconds: 1,
+            network_name: "casper-dev".to_string(),
+            asset,
+            protocol_version: protocol_version.map(str::to_string),
+            node_log_format: "json".to_string(),
+            seed: Arc::from("default"),
+        }
+    }
+
+    async fn generated_chainspec_version(layout: &AssetsLayout, protocol_version: &str) -> String {
+        let version_fs = protocol_version_fs(protocol_version);
+        let chainspec = tokio_fs::read_to_string(
+            layout
+                .node_config_root(1)
+                .join(version_fs)
+                .join("chainspec.toml"),
+        )
+        .await
+        .unwrap();
+        parse_chainspec_version(&chainspec).unwrap().to_string()
     }
 
     fn add_nodes_options(count: u32) -> AddNodesOptions {
@@ -3971,6 +4135,117 @@ maximum_round_length = '17 seconds'
         assert!(updated.contains("activation_point = 2"));
         assert!(updated.contains("version = '2.1.3'"));
         assert!(updated.contains("validator_slots = 5"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn setup_versioned_asset_without_override_uses_chainspec_version() {
+        let env = TestDataEnv::new();
+        install_test_versioned_asset("2.1.3", "2.2.0")
+            .await
+            .unwrap();
+        let layout = AssetsLayout::new(env.root().join("networks"), "casper-dev".to_string());
+
+        let result = setup_local(
+            &layout,
+            &setup_options(AssetSelector::Versioned("2.1.3".to_string()), None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.protocol_version, "2.2.0");
+        assert!(is_dir(&layout.node_config_root(1).join("2_2_0")).await);
+        assert_eq!(generated_chainspec_version(&layout, "2.2.0").await, "2.2.0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn setup_versioned_asset_with_override_uses_override_version() {
+        let env = TestDataEnv::new();
+        install_test_versioned_asset("2.1.3", "2.1.3")
+            .await
+            .unwrap();
+        let layout = AssetsLayout::new(env.root().join("networks"), "casper-dev".to_string());
+
+        let result = setup_local(
+            &layout,
+            &setup_options(
+                AssetSelector::Versioned("v2.1.3".to_string()),
+                Some("2.2.0"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.protocol_version, "2.2.0");
+        assert!(is_dir(&layout.node_config_root(1).join("2_2_0")).await);
+        assert_eq!(generated_chainspec_version(&layout, "2.2.0").await, "2.2.0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn setup_custom_asset_without_override_uses_chainspec_version() {
+        let env = TestDataEnv::new();
+        install_test_custom_asset(&env, "dev").await.unwrap();
+        let layout = AssetsLayout::new(env.root().join("networks"), "casper-dev".to_string());
+
+        let result = setup_local(
+            &layout,
+            &setup_options(AssetSelector::Custom("dev".to_string()), None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.protocol_version, "1.0.0");
+        assert!(is_dir(&layout.node_config_root(1).join("1_0_0")).await);
+        assert_eq!(generated_chainspec_version(&layout, "1.0.0").await, "1.0.0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn setup_custom_asset_with_override_uses_override_version() {
+        let env = TestDataEnv::new();
+        install_test_custom_asset(&env, "dev").await.unwrap();
+        let layout = AssetsLayout::new(env.root().join("networks"), "casper-dev".to_string());
+
+        let result = setup_local(
+            &layout,
+            &setup_options(AssetSelector::Custom("dev".to_string()), Some("2.0.0")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.protocol_version, "2.0.0");
+        assert!(is_dir(&layout.node_config_root(1).join("2_0_0")).await);
+        assert_eq!(generated_chainspec_version(&layout, "2.0.0").await, "2.0.0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stage_protocol_from_versioned_asset_uses_target_protocol_version() {
+        let env = TestDataEnv::new();
+        install_test_versioned_asset("2.1.3", "2.1.3")
+            .await
+            .unwrap();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0")
+            .await
+            .unwrap();
+
+        stage_protocol(
+            &layout,
+            &StageProtocolOptions {
+                asset: AssetSelector::Versioned("2.1.3".to_string()),
+                protocol_version: "3.0.0".to_string(),
+                activation_point: 123,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(is_dir(&layout.node_config_root(1).join("3_0_0")).await);
+        assert_eq!(generated_chainspec_version(&layout, "3.0.0").await, "3.0.0");
+        assert!(
+            !is_file(&pending_post_stage_protocol_hook_path(
+                &layout.hooks_dir(),
+                "3.0.0"
+            ))
+            .await
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4563,7 +4838,7 @@ maximum_round_length = '17 seconds'
         let pending_path = pending_post_stage_protocol_hook_path(&layout.hooks_dir(), "2.0.0");
         let pending: Value =
             serde_json::from_slice(&tokio_fs::read(&pending_path).await.unwrap()).unwrap();
-        assert_eq!(pending["asset_name"], "dev");
+        assert_eq!(pending["asset_name"], "custom/dev");
         assert_eq!(pending["network_name"], "casper-dev");
         assert_eq!(pending["protocol_version"], "2.0.0");
         assert_eq!(pending["activation_point"], 123);

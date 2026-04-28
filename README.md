@@ -213,10 +213,24 @@ Start a devnet:
 casper-devnet start
 ```
 
-Stage a protocol upgrade from a custom asset:
+Start from a specific installed bundle, or from a custom asset:
 
 ```bash
-casper-devnet stage-protocol dev --protocol-version 2.2.0 --activation-point 123
+casper-devnet start --asset 2.1.3
+casper-devnet start --custom-asset dev
+```
+
+Override the chainspec protocol version while using the selected asset files:
+
+```bash
+casper-devnet start --asset 2.1.3 --protocol-version 2.2.0
+```
+
+Stage a protocol upgrade from a versioned or custom asset:
+
+```bash
+casper-devnet network casper-dev stage-protocol --asset 2.1.3 --protocol-version 2.2.0 --activation-point 123
+casper-devnet network casper-dev stage-protocol --custom-asset dev --protocol-version 2.2.0 --activation-point 123
 ```
 
 Derive deterministic account material from a seed and BIP32 path:
@@ -255,8 +269,8 @@ trusted hash from an existing node's REST `/status`, writes it to `[node].truste
 the active config's joining sync mode (`[node].sync_handling = "ttl"`, or
 `sync_to_genesis = false` for legacy configs).
 Added nodes inherit only the currently active protocol version. If a future protocol version was
-already staged, run `stage-protocol` again after adding nodes so the new nodes receive that staged
-version too.
+already staged, run `network <name> stage-protocol` again after adding nodes so the new nodes
+receive that staged version too.
 The foreground `start` manager logs the full endpoint summary for nodes added through the control
 plane and prints node reactor state changes observed by polling each node's REST `/status` every
 500ms.
@@ -344,8 +358,8 @@ MCP server defaults:
 MCP tools require `network_name`; node-scoped tools also require `node_id`.
 Managed networks are stopped automatically when the MCP server exits.
 Use `managed_processes` to inspect managed node/sidecar processes, with optional process-name filtering and `running_only` control.
-Use `stage_protocol` to stage custom-asset upgrades for managed networks (`live_mode=true`) or
-discovered stopped networks (`live_mode=false`).
+Use `stage_protocol` to stage versioned-asset or custom-asset upgrades for managed networks
+(`live_mode=true`) or discovered stopped networks (`live_mode=false`).
 `rpc_query_global_state` auto-resolves the latest block hash when both `block_id` and `state_root_hash` are omitted.
 For transaction construction, use MCP tools (`make_transaction_package_call`, `make_transaction_contract_call`, `make_transaction_session_wasm`) with `send_transaction_signed` instead of invoking external `casper-client` binaries.
 `session_args` supports full CLType strings (including nested types such as `Option<List<U512>>`, `Map<String,U64>`, tuples, and `ByteArray[32]`). Scalars can be passed as string/number/bool, `null` maps to `None` for `Option<T>`, and composite values should be provided as hex bytes (`0x...`). Pass this field as JSON (array/object), not an escaped JSON string. Legacy `session_args_json` is still accepted for compatibility.
@@ -377,7 +391,9 @@ Claude CLI config example: PRs welcome.
 
 ## Common flags
 
-- `--protocol-version <version>`: Protocol version to use from the assets store (defaults to newest bundle)
+- `--asset <version>`: Versioned asset bundle to use from the assets store (accepts `2.1.3` or `v2.1.3`; defaults to newest bundle)
+- `--custom-asset <name>`: Custom asset under `assets/custom/<name>` to use instead of a versioned bundle
+- `--protocol-version <version>`: Override the chainspec protocol version; when omitted, `start` uses the selected asset's chainspec value
 - `--network-name <name>`: Network name for configs/paths (default: `casper-dev`)
 - `--net-path <path>`: Override the network runtime root (default: platform data dir `.../networks`)
 - `--node-count <n>`: Number of nodes (aliases: `--nodes`, `--validators`; default: 4)
@@ -396,12 +412,16 @@ Claude CLI config example: PRs welcome.
 - `--http-path <path>`: HTTP mount path for MCP endpoint (default: `/mcp`)
 - `--net-path <path>`: Override network runtime root (same behavior as `start`)
 
-`casper-devnet stage-protocol` flags:
+`casper-devnet network <network> stage-protocol` flags:
 
+- `[asset]`: Optional positional shorthand for `--asset <version>`
+- `--asset <version>`: Versioned asset bundle to stage from
+- `--custom-asset <name>`: Custom asset under `assets/custom/<name>` to stage from
 - `--protocol-version <version>`: Protocol version to stage (required)
 - `--activation-point <era-id>`: Future era id for activation (required)
-- `--network-name <name>`: Network name for runtime paths (default: `casper-dev`)
 - `--net-path <path>`: Override network runtime root (same behavior as `start`)
+
+Exactly one of `[asset]`, `--asset`, or `--custom-asset` is required for staging.
 
 `casper-devnet derive` flags:
 

@@ -1,4 +1,6 @@
-use crate::assets::{self, AddNodesOptions, AssetsLayout, SetupOptions, StageProtocolOptions};
+use crate::assets::{
+    self, AddNodesOptions, AssetSelector, AssetsLayout, SetupOptions, StageProtocolOptions,
+};
 use crate::cli::common::{DEFAULT_SEED, is_file, shorten_home_path};
 use crate::control::{ControlRequest, ControlResponse, ControlResult};
 use crate::diagnostics_port;
@@ -13,7 +15,7 @@ use backoff::backoff::Backoff;
 use casper_types::U512;
 use casper_types::contract_messages::{Message, MessagePayload};
 use casper_types::execution::ExecutionResult;
-use clap::Args;
+use clap::{ArgGroup, Args};
 use futures::StreamExt;
 use nix::errno::Errno;
 use nix::sys::signal::kill;
@@ -40,6 +42,11 @@ const BLOCK_WAIT_MESSAGE: &str = "Waiting for new blocks...";
 const REACTOR_STATE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Args, Clone)]
+#[command(group(
+    ArgGroup::new("asset_selector")
+        .multiple(false)
+        .args(["asset", "custom_asset"])
+))]
 pub(crate) struct StartArgs {
     /// Network name used in assets paths and configs.
     #[arg(long, default_value = "casper-dev")]
@@ -49,7 +56,15 @@ pub(crate) struct StartArgs {
     #[arg(long, value_name = "PATH")]
     net_path: Option<PathBuf>,
 
-    /// Protocol version to use from the assets store (e.g. 2.1.1).
+    /// Versioned asset to use from the assets store (e.g. 2.1.3).
+    #[arg(long)]
+    asset: Option<String>,
+
+    /// Custom asset name from assets/custom.
+    #[arg(long)]
+    custom_asset: Option<String>,
+
+    /// Protocol version to write into the generated chainspec.
     #[arg(long)]
     protocol_version: Option<String>,
 
@@ -98,18 +113,19 @@ pub(crate) async fn run(args: StartArgs) -> Result<()> {
     if !args.setup_only && !args.force_setup && assets_exist {
         println!("resuming network operations on {}", layout.network_name());
     }
-    let protocol_version = resolve_protocol_version(&args.protocol_version).await?;
 
     if args.setup_only {
-        return run_setup_only(&layout, &args, &protocol_version).await;
+        return run_setup_only(&layout, &args).await;
     }
 
-    if args.force_setup {
+    let setup_result = if args.force_setup {
         assets::teardown(&layout).await?;
-        assets::setup_local(&layout, &setup_options(&args, &protocol_version)).await?;
+        Some(assets::setup_local(&layout, &setup_options(&args)?).await?)
     } else if !assets_exist {
-        assets::setup_local(&layout, &setup_options(&args, &protocol_version)).await?;
-    }
+        Some(assets::setup_local(&layout, &setup_options(&args)?).await?)
+    } else {
+        None
+    };
 
     if !layout.exists().await {
         return Err(anyhow!(
@@ -134,6 +150,10 @@ pub(crate) async fn run(args: StartArgs) -> Result<()> {
 
     let state_path = layout.net_dir().join(STATE_FILE_NAME);
     if !is_file(&state_path).await {
+        let protocol_version = match &setup_result {
+            Some(result) => result.protocol_version.clone(),
+            None => latest_layout_protocol_version(&layout).await?,
+        };
         assets::prepare_genesis_hooks(&layout, &protocol_version).await?;
     }
     let state = Arc::new(Mutex::new(State::new(state_path).await?));
@@ -233,14 +253,10 @@ pub(crate) async fn run(args: StartArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_setup_only(
-    layout: &AssetsLayout,
-    args: &StartArgs,
-    protocol_version: &str,
-) -> Result<()> {
+async fn run_setup_only(layout: &AssetsLayout, args: &StartArgs) -> Result<()> {
     if args.force_setup {
         assets::teardown(layout).await?;
-        assets::setup_local(layout, &setup_options(args, protocol_version)).await?;
+        assets::setup_local(layout, &setup_options(args)?).await?;
         print_derived_accounts_summary(layout).await;
         return Ok(());
     }
@@ -254,59 +270,48 @@ async fn run_setup_only(
         return Ok(());
     }
 
-    assets::setup_local(layout, &setup_options(args, protocol_version)).await?;
+    assets::setup_local(layout, &setup_options(args)?).await?;
     print_derived_accounts_summary(layout).await;
     Ok(())
 }
 
-fn setup_options(args: &StartArgs, protocol_version: &str) -> SetupOptions {
-    SetupOptions {
+fn setup_options(args: &StartArgs) -> Result<SetupOptions> {
+    let asset =
+        assets::optional_asset_selector(args.asset.as_deref(), args.custom_asset.as_deref())?;
+    Ok(SetupOptions {
         nodes: args.node_count,
         users: args.users,
         delay_seconds: args.delay,
         network_name: args.network_name.clone(),
-        protocol_version: protocol_version.to_string(),
+        asset,
+        protocol_version: args.protocol_version.clone(),
         node_log_format: args.node_log_format.clone(),
         seed: Arc::clone(&args.seed),
-    }
+    })
 }
 
-async fn resolve_protocol_version(candidate: &Option<String>) -> Result<String> {
-    if let Some(raw) = candidate {
-        let version = assets::parse_protocol_version(raw)?;
-        if !assets::has_bundle_version(&version).await? {
-            let argv0 = std::env::args()
-                .next()
-                .unwrap_or_else(|| "casper-devnet".to_string());
-            let pull_cmd = format!("{} assets pull", argv0);
-            let add_cmd = format!("{} assets add <path-to-assets.tar.gz>", argv0);
+async fn latest_layout_protocol_version(layout: &AssetsLayout) -> Result<String> {
+    Ok(layout
+        .latest_protocol_version_dir(1)
+        .await?
+        .replace('_', "."))
+}
+
+fn control_stage_asset_selector(
+    asset: Option<&str>,
+    custom_asset: Option<&str>,
+    legacy_asset_name: Option<&str>,
+) -> Result<AssetSelector> {
+    let custom_asset = match (custom_asset, legacy_asset_name) {
+        (Some(_), Some(_)) => {
             return Err(anyhow!(
-                "assets for version {} not found; run `{}` or `{}`",
-                version,
-                pull_cmd,
-                add_cmd
+                "custom_asset and asset_name are mutually exclusive"
             ));
         }
-        return Ok(version.to_string());
-    }
-    let versions = assets::list_bundle_versions().await?;
-    if versions.is_empty() {
-        let argv0 = std::env::args()
-            .next()
-            .unwrap_or_else(|| "casper-devnet".to_string());
-        let pull_cmd = format!("{} assets pull", argv0);
-        let add_cmd = format!("{} assets add <path-to-assets.tar.gz>", argv0);
-        return Err(anyhow!(
-            "no assets found; run `{}` or `{}`",
-            pull_cmd,
-            add_cmd
-        ));
-    }
-    let version = versions
-        .into_iter()
-        .max()
-        .expect("non-empty assets versions");
-    Ok(version.to_string())
+        (Some(custom_asset), None) | (None, Some(custom_asset)) => Some(custom_asset),
+        (None, None) => None,
+    };
+    assets::required_asset_selector(asset, custom_asset)
 }
 
 fn record_pid(record: &ProcessRecord) -> Option<u32> {
@@ -709,12 +714,26 @@ async fn handle_control_request(
             }
         }
         ControlRequest::StageProtocol {
+            asset,
+            custom_asset,
             asset_name,
             protocol_version,
             activation_point,
             restart_sidecars,
             rust_log,
         } => {
+            let asset_selector = match control_stage_asset_selector(
+                asset.as_deref(),
+                custom_asset.as_deref(),
+                asset_name.as_deref(),
+            ) {
+                Ok(asset_selector) => asset_selector,
+                Err(err) => {
+                    return ControlResponse::Error {
+                        error: err.to_string(),
+                    };
+                }
+            };
             let _asset_mutation_guard = context.asset_mutation_lock.lock().await;
             match assets::ensure_consensus_keys(&context.layout, Arc::clone(&context.seed)).await {
                 Ok(restored) => {
@@ -732,7 +751,7 @@ async fn handle_control_request(
             let stage = assets::stage_protocol(
                 &context.layout,
                 &StageProtocolOptions {
-                    asset_name,
+                    asset: asset_selector,
                     protocol_version,
                     activation_point,
                 },
@@ -1877,7 +1896,9 @@ port = 2
 
         let stage_socket_path = layout.control_socket_path();
         let stage_request = ControlRequest::StageProtocol {
-            asset_name: "dev".to_string(),
+            asset: None,
+            custom_asset: Some("dev".to_string()),
+            asset_name: None,
             protocol_version: "2.0.0".to_string(),
             activation_point: 123,
             restart_sidecars: false,
