@@ -68,107 +68,13 @@ const BLOCK_ADDED_SAMPLE: &str = "block-added.sample";
 const PRE_STAGE_PROTOCOL_SAMPLE: &str = "pre-stage-protocol.sample";
 const POST_STAGE_PROTOCOL_SAMPLE: &str = "post-stage-protocol.sample";
 const HOOK_FILE_MODE: u32 = 0o755;
-const PRE_GENESIS_SAMPLE_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-
-# Copy this file to hooks/pre-genesis to activate it.
-# argv: <network_name> <protocol_version>
-# cwd:  a dedicated hook work directory under the running network
-#       directory (networks/<network>/hooks/work/pre-genesis)
-
-network_name="${1:?missing network name}"
-protocol_version="${2:?missing protocol version}"
-
-echo "sample pre-genesis hook: network=${network_name} protocol_version=${protocol_version}"
-
-if config_dirs="$(casper-devnet network "${network_name}" path "${protocol_version}" 2>/dev/null)"; then
-  printf '%s\n' "${config_dirs}" | while IFS= read -r config_dir; do
-    [ -n "${config_dir}" ] || continue
-    echo "staged config dir: ${config_dir}"
-  done
-fi
-"#;
-const POST_GENESIS_SAMPLE_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-
-# Copy this file to hooks/post-genesis to activate it.
-# argv: <network_name> <protocol_version>
-# cwd:  a dedicated hook work directory under the running network
-#       directory (networks/<network>/hooks/work/post-genesis)
-
-network_name="${1:?missing network name}"
-protocol_version="${2:?missing protocol version}"
-
-echo "sample post-genesis hook: network=${network_name} protocol_version=${protocol_version}"
-
-if rpc_url="$(casper-devnet network "${network_name}" port --rpc 2>/dev/null)"; then
-  curl -sS "${rpc_url}" \
-    -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"info_get_status","params":[]}' \
-    >/dev/null || true
-fi
-"#;
-const BLOCK_ADDED_SAMPLE_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-
-# Copy this file to hooks/block-added to activate it.
-# argv:  <network_name> <protocol_version>
-# stdin: JSON payload for the BlockAdded SSE event
-# cwd:   a dedicated hook work directory under the running network
-#        directory (networks/<network>/hooks/work/block-added)
-
-network_name="${1:?missing network name}"
-protocol_version="${2:?missing protocol version}"
-payload="$(cat)"
-
-height="$(printf '%s\n' "${payload}" | sed -n 's/.*"height":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
-if [ -n "${height}" ] && [ $((height % 10)) -ne 0 ]; then
-  exit 0
-fi
-
-echo "sample block-added hook: network=${network_name} protocol_version=${protocol_version} payload=${payload}"
-"#;
-const PRE_STAGE_PROTOCOL_SAMPLE_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-
-# Copy this file to hooks/pre-stage-protocol to activate it.
-# argv: <network_name> <protocol_version> <activation_point>
-# cwd:  a dedicated hook work directory under the running network
-#       directory (networks/<network>/hooks/work/pre-stage-protocol)
-
-network_name="${1:?missing network name}"
-protocol_version="${2:?missing protocol version}"
-activation_point="${3:?missing activation point}"
-
-echo "sample pre-stage-protocol hook: network=${network_name} protocol_version=${protocol_version} activation_point=${activation_point}"
-
-if rpc_url="$(casper-devnet network "${network_name}" port --rpc 2>/dev/null)"; then
-  curl -sS "${rpc_url}" \
-    -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"info_get_status","params":[]}' \
-    >/dev/null || true
-fi
-"#;
-const POST_STAGE_PROTOCOL_SAMPLE_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-
-# Copy this file to hooks/post-stage-protocol to activate it.
-# argv: <network_name> <protocol_version>
-# cwd:  a dedicated hook work directory under the running network
-#       directory (networks/<network>/hooks/work/post-stage-protocol)
-
-network_name="${1:?missing network name}"
-protocol_version="${2:?missing protocol version}"
-
-echo "sample post-stage-protocol hook: network=${network_name} protocol_version=${protocol_version}"
-
-if rpc_url="$(casper-devnet network "${network_name}" port --rpc 2>/dev/null)"; then
-  curl -sS "${rpc_url}" \
-    -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"info_get_status","params":[]}' \
-    >/dev/null || true
-fi
-"#;
+const PRE_GENESIS_SAMPLE_SCRIPT: &[u8] = include_bytes!("../examples/hooks/pre-genesis.sample");
+const POST_GENESIS_SAMPLE_SCRIPT: &[u8] = include_bytes!("../examples/hooks/post-genesis.sample");
+const BLOCK_ADDED_SAMPLE_SCRIPT: &[u8] = include_bytes!("../examples/hooks/block-added.sample");
+const PRE_STAGE_PROTOCOL_SAMPLE_SCRIPT: &[u8] =
+    include_bytes!("../examples/hooks/pre-stage-protocol.sample");
+const POST_STAGE_PROTOCOL_SAMPLE_SCRIPT: &[u8] =
+    include_bytes!("../examples/hooks/post-stage-protocol.sample");
 
 #[derive(Debug)]
 struct DerivedAccountMaterial {
@@ -572,8 +478,6 @@ struct ResolvedAsset {
     chainspec: PathBuf,
     node_config: PathBuf,
     sidecar_config: PathBuf,
-    pre_stage_protocol_hook: Option<PathBuf>,
-    post_stage_protocol_hook: Option<PathBuf>,
     chainspec_protocol_version: Version,
 }
 
@@ -783,7 +687,6 @@ pub async fn install_custom_asset(opts: &CustomAssetInstallOptions) -> Result<()
     symlink_file(&chainspec_src, &asset_dir.join("chainspec.toml")).await?;
     symlink_file(&node_config_src, &asset_dir.join("node-config.toml")).await?;
     symlink_file(&sidecar_config_src, &asset_dir.join("sidecar-config.toml")).await?;
-    create_default_hook_samples(&asset_dir).await?;
 
     Ok(())
 }
@@ -805,16 +708,10 @@ pub async fn stage_protocol(
             layout.nodes_dir().display()
         ));
     }
+    ensure_network_hook_samples(layout).await?;
 
     let node_log_format = detect_current_node_log_format(layout).await?;
     let accounts_path = layout.net_dir().join("chainspec/accounts.toml");
-    run_pre_stage_protocol_hook(
-        layout,
-        &asset,
-        &protocol_version_chain,
-        opts.activation_point,
-    )
-    .await?;
 
     for node_id in 1..=total_nodes {
         let node_bin_version_dir = layout.node_bin_dir(node_id).join(&protocol_version_fs);
@@ -962,11 +859,67 @@ pub async fn stage_protocol(
         tokio_fs::write(&sidecar_dest, updated_sidecar).await?;
     }
 
-    refresh_post_stage_protocol_hook(layout, &asset, opts, &protocol_version_chain).await?;
+    clear_post_stage_protocol_hook_state(layout, &protocol_version_chain).await?;
+    if let Err(err) =
+        run_pre_stage_protocol_hook(layout, &protocol_version_chain, opts.activation_point).await
+    {
+        return Err(rollback_staged_protocol_dirs_after_error(
+            layout,
+            total_nodes,
+            &protocol_version_fs,
+            err,
+        )
+        .await);
+    }
+
+    refresh_post_stage_protocol_hook(layout, &asset.display_name, opts, &protocol_version_chain)
+        .await?;
 
     Ok(StageProtocolResult {
         staged_nodes: total_nodes,
     })
+}
+
+async fn rollback_staged_protocol_dirs_after_error(
+    layout: &AssetsLayout,
+    total_nodes: u32,
+    protocol_version_fs: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    match rollback_staged_protocol_dirs(layout, total_nodes, protocol_version_fs).await {
+        Ok(()) => err,
+        Err(rollback_err) => {
+            anyhow!("{err}; additionally failed to remove staged protocol assets: {rollback_err}")
+        }
+    }
+}
+
+async fn rollback_staged_protocol_dirs(
+    layout: &AssetsLayout,
+    total_nodes: u32,
+    protocol_version_fs: &str,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    for node_id in 1..=total_nodes {
+        for path in [
+            layout.node_bin_dir(node_id).join(protocol_version_fs),
+            layout.node_config_root(node_id).join(protocol_version_fs),
+        ] {
+            if !is_dir(&path).await {
+                continue;
+            }
+            let display = path.display().to_string();
+            if let Err(err) = tokio_fs::remove_dir_all(&path).await {
+                errors.push(format!("{display}: {err}"));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("{}", errors.join("; ")))
+    }
 }
 
 /// Remove assets for the given network while preserving network hook state.
@@ -1784,8 +1737,6 @@ async fn resolve_versioned_asset(version: &Version) -> Result<ResolvedAsset> {
         chainspec,
         node_config,
         sidecar_config,
-        pre_stage_protocol_hook: None,
-        post_stage_protocol_hook: None,
         chainspec_protocol_version,
     })
 }
@@ -1802,8 +1753,6 @@ async fn resolve_custom_asset(name: &str) -> Result<ResolvedAsset> {
         chainspec: custom_asset.chainspec,
         node_config: custom_asset.node_config,
         sidecar_config: custom_asset.sidecar_config,
-        pre_stage_protocol_hook: custom_asset.pre_stage_protocol_hook,
-        post_stage_protocol_hook: custom_asset.post_stage_protocol_hook,
         chainspec_protocol_version,
     })
 }
@@ -2627,8 +2576,6 @@ struct CustomAssetPaths {
     chainspec: PathBuf,
     node_config: PathBuf,
     sidecar_config: PathBuf,
-    pre_stage_protocol_hook: Option<PathBuf>,
-    post_stage_protocol_hook: Option<PathBuf>,
 }
 
 pub async fn ensure_network_hook_samples(layout: &AssetsLayout) -> Result<()> {
@@ -2649,12 +2596,6 @@ pub async fn ensure_network_hook_samples(layout: &AssetsLayout) -> Result<()> {
         BLOCK_ADDED_SAMPLE_SCRIPT,
     )
     .await?;
-    Ok(())
-}
-
-async fn create_default_hook_samples(asset_dir: &Path) -> Result<()> {
-    let hooks_dir = asset_dir.join(HOOKS_DIR_NAME);
-    tokio_fs::create_dir_all(&hooks_dir).await?;
     write_executable_script_if_missing(
         &hooks_dir.join(PRE_STAGE_PROTOCOL_SAMPLE),
         PRE_STAGE_PROTOCOL_SAMPLE_SCRIPT,
@@ -2668,16 +2609,16 @@ async fn create_default_hook_samples(asset_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn write_executable_script(path: &Path, contents: &str) -> Result<()> {
+async fn write_executable_script(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio_fs::create_dir_all(parent).await?;
     }
-    tokio_fs::write(path, contents).await?;
+    tokio_fs::write(path, contents.as_ref()).await?;
     tokio_fs::set_permissions(path, std::fs::Permissions::from_mode(HOOK_FILE_MODE)).await?;
     Ok(())
 }
 
-async fn write_executable_script_if_missing(path: &Path, contents: &str) -> Result<()> {
+async fn write_executable_script_if_missing(path: &Path, contents: &[u8]) -> Result<()> {
     if tokio_fs::symlink_metadata(path).await.is_ok() {
         return Ok(());
     }
@@ -2760,11 +2701,10 @@ pub async fn prepare_genesis_hooks(layout: &AssetsLayout, protocol_version: &str
 
 async fn run_pre_stage_protocol_hook(
     layout: &AssetsLayout,
-    asset: &ResolvedAsset,
     protocol_version: &str,
     activation_point: u64,
 ) -> Result<()> {
-    let Some(command_path) = &asset.pre_stage_protocol_hook else {
+    let Some(command_path) = lookup_network_hook(layout, PRE_STAGE_PROTOCOL_HOOK).await? else {
         return Ok(());
     };
 
@@ -2779,7 +2719,7 @@ async fn run_pre_stage_protocol_hook(
         activation_point.to_string(),
     ];
     let exit_status = execute_hook_command(
-        command_path,
+        &command_path,
         &args,
         &layout.hook_work_dir(PRE_STAGE_PROTOCOL_HOOK),
         &log_paths,
@@ -2875,13 +2815,13 @@ async fn clear_post_genesis_hook_state(
 
 async fn refresh_post_stage_protocol_hook(
     layout: &AssetsLayout,
-    asset: &ResolvedAsset,
+    asset_name: &str,
     opts: &StageProtocolOptions,
     protocol_version: &str,
 ) -> Result<()> {
     clear_post_stage_protocol_hook_state(layout, protocol_version).await?;
 
-    let Some(command_path) = &asset.post_stage_protocol_hook else {
+    let Some(command_path) = lookup_network_hook(layout, POST_STAGE_PROTOCOL_HOOK).await? else {
         return Ok(());
     };
 
@@ -2895,11 +2835,11 @@ async fn refresh_post_stage_protocol_hook(
         protocol_version,
     );
     let pending = PendingPostStageProtocolHook {
-        asset_name: asset.display_name.clone(),
+        asset_name: asset_name.to_string(),
         network_name: layout.network_name().to_string(),
         protocol_version: protocol_version.to_string(),
         activation_point: opts.activation_point,
-        command_path: command_path.clone(),
+        command_path,
         stdout_path: log_paths.stdout,
         stderr_path: log_paths.stderr,
     };
@@ -3435,15 +3375,6 @@ async fn load_custom_asset(name: &str) -> Result<CustomAssetPaths> {
     let sidecar_config =
         canonicalize_required_file(&asset_dir.join("sidecar-config.toml"), "sidecar-config")
             .await?;
-    let pre_stage_protocol_hook =
-        canonicalize_optional_hook(&asset_dir.join(HOOKS_DIR_NAME).join(PRE_STAGE_PROTOCOL_HOOK))
-            .await?;
-    let post_stage_protocol_hook = canonicalize_optional_hook(
-        &asset_dir
-            .join(HOOKS_DIR_NAME)
-            .join(POST_STAGE_PROTOCOL_HOOK),
-    )
-    .await?;
 
     Ok(CustomAssetPaths {
         casper_node,
@@ -3451,8 +3382,6 @@ async fn load_custom_asset(name: &str) -> Result<CustomAssetPaths> {
         chainspec,
         node_config,
         sidecar_config,
-        pre_stage_protocol_hook,
-        post_stage_protocol_hook,
     })
 }
 
@@ -4523,40 +4452,25 @@ maximum_round_length = '17 seconds'
 
         ensure_network_hook_samples(&layout).await.unwrap();
 
-        let pre_sample = layout.hooks_dir().join(PRE_GENESIS_SAMPLE);
-        let post_sample = layout.hooks_dir().join(POST_GENESIS_SAMPLE);
-        let block_added_sample = layout.hooks_dir().join(BLOCK_ADDED_SAMPLE);
-
-        assert!(is_file(&pre_sample).await);
-        assert!(is_file(&post_sample).await);
-        assert!(is_file(&block_added_sample).await);
-        assert_ne!(
-            tokio_fs::metadata(&pre_sample)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
-        assert_ne!(
-            tokio_fs::metadata(&post_sample)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
-        assert_ne!(
-            tokio_fs::metadata(&block_added_sample)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
+        for sample in [
+            PRE_GENESIS_SAMPLE,
+            POST_GENESIS_SAMPLE,
+            BLOCK_ADDED_SAMPLE,
+            PRE_STAGE_PROTOCOL_SAMPLE,
+            POST_STAGE_PROTOCOL_SAMPLE,
+        ] {
+            let sample_path = layout.hooks_dir().join(sample);
+            assert!(is_file(&sample_path).await);
+            assert_ne!(
+                tokio_fs::metadata(&sample_path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4593,37 +4507,16 @@ maximum_round_length = '17 seconds'
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn install_custom_asset_creates_executable_hook_samples() {
+    async fn install_custom_asset_installs_only_asset_symlinks() {
         let env = TestDataEnv::new();
         let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
 
-        let pre_sample = asset_dir
-            .join(HOOKS_DIR_NAME)
-            .join(PRE_STAGE_PROTOCOL_SAMPLE);
-        let post_sample = asset_dir
-            .join(HOOKS_DIR_NAME)
-            .join(POST_STAGE_PROTOCOL_SAMPLE);
-
-        assert!(is_file(&pre_sample).await);
-        assert!(is_file(&post_sample).await);
-        assert_ne!(
-            tokio_fs::metadata(&pre_sample)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
-        assert_ne!(
-            tokio_fs::metadata(&post_sample)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
+        assert!(is_file(&asset_dir.join("bin").join("casper-node")).await);
+        assert!(is_file(&asset_dir.join("bin").join("casper-sidecar")).await);
+        assert!(is_file(&asset_dir.join("chainspec.toml")).await);
+        assert!(is_file(&asset_dir.join("node-config.toml")).await);
+        assert!(is_file(&asset_dir.join("sidecar-config.toml")).await);
+        assert!(!is_dir(&asset_dir.join(HOOKS_DIR_NAME)).await);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4650,9 +4543,13 @@ maximum_round_length = '17 seconds'
             .await
             .unwrap();
         write_executable_script(
-            &asset_dir
-                .join(HOOKS_DIR_NAME)
-                .join(PRE_STAGE_PROTOCOL_SAMPLE),
+            &asset_dir.join(HOOKS_DIR_NAME).join(PRE_STAGE_PROTOCOL_HOOK),
+            "#!/bin/sh\nset -eu\necho custom-ran > \"$PWD/custom-hook-ran\"\n",
+        )
+        .await
+        .unwrap();
+        write_executable_script(
+            &layout.hooks_dir().join(PRE_STAGE_PROTOCOL_SAMPLE),
             "#!/bin/sh\nset -eu\necho sample-ran > \"$PWD/sample-hook-ran\"\n",
         )
         .await
@@ -4662,22 +4559,48 @@ maximum_round_length = '17 seconds'
             .await
             .unwrap();
 
-        assert!(!is_file(&layout.net_dir().join("sample-hook-ran")).await);
+        assert!(
+            !is_file(
+                &layout
+                    .hook_work_dir(PRE_STAGE_PROTOCOL_HOOK)
+                    .join("sample-hook-ran")
+            )
+            .await
+        );
+        assert!(
+            !is_file(
+                &layout
+                    .hook_work_dir(PRE_STAGE_PROTOCOL_HOOK)
+                    .join("custom-hook-ran")
+            )
+            .await
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn stage_protocol_aborts_before_mutation_when_pre_hook_fails() {
+    async fn stage_protocol_rolls_back_when_pre_hook_fails() {
         let env = TestDataEnv::new();
-        let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
+        install_test_custom_asset(&env, "dev").await.unwrap();
         let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0")
             .await
             .unwrap();
         write_executable_script(
-            &asset_dir.join(HOOKS_DIR_NAME).join(PRE_STAGE_PROTOCOL_HOOK),
+            &layout.hooks_dir().join(PRE_STAGE_PROTOCOL_HOOK),
             "#!/bin/sh\nset -eu\necho pre-hook-start >&2\nexit 7\n",
         )
         .await
         .unwrap();
+        write_executable_script(
+            &layout.hooks_dir().join(POST_STAGE_PROTOCOL_HOOK),
+            "#!/bin/sh\nset -eu\necho post-hook\n",
+        )
+        .await
+        .unwrap();
+        let stale_pending = pending_post_stage_protocol_hook_path(&layout.hooks_dir(), "2.0.0");
+        tokio_fs::create_dir_all(layout.hooks_pending_dir())
+            .await
+            .unwrap();
+        tokio_fs::write(&stale_pending, "stale").await.unwrap();
 
         let err = stage_protocol(&layout, &stage_options("dev", "2.0.0"))
             .await
@@ -4686,6 +4609,13 @@ maximum_round_length = '17 seconds'
         assert!(err.to_string().contains(PRE_STAGE_PROTOCOL_HOOK));
         assert!(!is_dir(&layout.node_bin_dir(1).join("2_0_0")).await);
         assert!(!is_dir(&layout.node_config_root(1).join("2_0_0")).await);
+        assert!(
+            !is_file(&pending_post_stage_protocol_hook_path(
+                &layout.hooks_dir(),
+                "2.0.0"
+            ))
+            .await
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4761,20 +4691,22 @@ maximum_round_length = '17 seconds'
     #[tokio::test(flavor = "current_thread")]
     async fn stage_protocol_runs_pre_hook_and_writes_pending_post_hook_metadata() {
         let env = TestDataEnv::new();
-        let asset_dir = install_test_custom_asset(&env, "dev").await.unwrap();
+        install_test_custom_asset(&env, "dev").await.unwrap();
         let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0")
             .await
             .unwrap();
+        let staged_config_dir = layout.node_config_root(1).join("2_0_0");
         write_executable_script(
-            &asset_dir.join(HOOKS_DIR_NAME).join(PRE_STAGE_PROTOCOL_HOOK),
-            "#!/bin/sh\nset -eu\nprintf '%s\n' \"$PWD\" > \"$PWD/pre-hook-cwd\"\nprintf '%s,%s,%s\n' \"$1\" \"$2\" \"$3\" > \"$PWD/pre-hook-args\"\necho pre-stdout\necho pre-stderr >&2\n",
+            &layout.hooks_dir().join(PRE_STAGE_PROTOCOL_HOOK),
+            format!(
+                "#!/bin/sh\nset -eu\nconfig_dir='{}'\n[ -d \"$config_dir\" ]\n[ -f \"$config_dir/chainspec.toml\" ]\nprintf '%s\n' \"$PWD\" > \"$PWD/pre-hook-cwd\"\nprintf '%s,%s,%s\n' \"$1\" \"$2\" \"$3\" > \"$PWD/pre-hook-args\"\nprintf '\n[hook]\nran = true\n' >> \"$config_dir/chainspec.toml\"\necho pre-stdout\necho pre-stderr >&2\n",
+                staged_config_dir.display()
+            ),
         )
         .await
         .unwrap();
         write_executable_script(
-            &asset_dir
-                .join(HOOKS_DIR_NAME)
-                .join(POST_STAGE_PROTOCOL_HOOK),
+            &layout.hooks_dir().join(POST_STAGE_PROTOCOL_HOOK),
             "#!/bin/sh\nset -eu\necho post-hook\n",
         )
         .await
@@ -4834,14 +4766,28 @@ maximum_round_length = '17 seconds'
                 .trim(),
             "pre-stderr"
         );
+        assert!(
+            tokio_fs::read_to_string(staged_config_dir.join("chainspec.toml"))
+                .await
+                .unwrap()
+                .contains("[hook]\nran = true")
+        );
 
         let pending_path = pending_post_stage_protocol_hook_path(&layout.hooks_dir(), "2.0.0");
         let pending: Value =
             serde_json::from_slice(&tokio_fs::read(&pending_path).await.unwrap()).unwrap();
+        let expected_post_hook =
+            tokio_fs::canonicalize(layout.hooks_dir().join(POST_STAGE_PROTOCOL_HOOK))
+                .await
+                .unwrap();
         assert_eq!(pending["asset_name"], "custom/dev");
         assert_eq!(pending["network_name"], "casper-dev");
         assert_eq!(pending["protocol_version"], "2.0.0");
         assert_eq!(pending["activation_point"], 123);
+        assert_eq!(
+            pending["command_path"],
+            expected_post_hook.display().to_string()
+        );
         assert_eq!(
             pending["stdout_path"],
             layout

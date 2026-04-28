@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import typing
+import urllib.error
+import urllib.request
+
+
+def main() -> int:
+    if len(sys.argv) != 4:
+        print(
+            "usage: pre-stage-protocol <network_name> <protocol_version> <activation_point>",
+            file=sys.stderr,
+        )
+        return 2
+
+    network_name, protocol_version, activation_point = sys.argv[1:]
+    work_dir = pathlib.Path.cwd()
+
+    print(
+        "sample pre-stage-protocol hook: "
+        f"network={network_name} "
+        f"protocol_version={protocol_version} "
+        f"activation_point={activation_point}"
+    )
+
+    config_dirs = staged_config_dirs(network_name, protocol_version)
+    save_status_snapshot(network_name, work_dir / "info_get_status.json")
+
+    # Safe template: by default this sample records the staged chainspec paths
+    # and leaves them unchanged. Set DEVNET_SAMPLE_REWARDS_PURSE to a purse
+    # URef to demonstrate a concrete TOML edit. In a real hook, derive this
+    # value from a live chain query, for example using the block/state data
+    # saved by save_status_snapshot().
+    rewards_purse = os.environ.get("DEVNET_SAMPLE_REWARDS_PURSE", "")
+
+    for config_dir in config_dirs:
+        chainspec_path = config_dir / "chainspec.toml"
+        if not chainspec_path.is_file():
+            continue
+
+        print(f"staged chainspec: {chainspec_path}")
+        if rewards_purse:
+            apply_rewards_purse_template(chainspec_path, rewards_purse)
+
+    return 0
+
+
+def staged_config_dirs(
+    network_name: str,
+    protocol_version: str,
+) -> typing.List[pathlib.Path]:
+    result = subprocess.run(
+        ["casper-devnet", "network", network_name, "path", protocol_version],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [
+        pathlib.Path(line)
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
+
+
+def save_status_snapshot(network_name: str, output_path: pathlib.Path) -> None:
+    rpc_url = optional_command_output(
+        ["casper-devnet", "network", network_name, "port", "--rpc"]
+    )
+    if not rpc_url:
+        return
+
+    payload = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "info_get_status",
+            "params": [],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        rpc_url,
+        data=payload,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            output_path.write_bytes(response.read())
+    except (OSError, urllib.error.URLError):
+        remove_if_exists(output_path)
+
+
+def optional_command_output(argv: typing.List[str]) -> typing.Optional[str]:
+    result = subprocess.run(argv, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def apply_rewards_purse_template(
+    chainspec_path: pathlib.Path,
+    rewards_purse: str,
+) -> None:
+    text = chainspec_path.read_text()
+    replacement = (
+        'rewards_handling = { type = "purse", '
+        f'purse = "{rewards_purse}" }}'
+    )
+
+    if re.search(r"(?m)^rewards_handling\s*=", text):
+        text = re.sub(
+            r"(?m)^rewards_handling\s*=.*$",
+            replacement,
+            text,
+            count=1,
+        )
+    elif re.search(r"(?m)^\[core\]\s*$", text):
+        text = re.sub(
+            r"(?m)^\[core\]\s*$",
+            "[core]\n" + replacement,
+            text,
+            count=1,
+        )
+    else:
+        raise RuntimeError(f"{chainspec_path} missing [core] section")
+
+    chainspec_path.write_text(text)
+
+
+def remove_if_exists(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

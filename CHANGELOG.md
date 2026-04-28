@@ -17,10 +17,11 @@ Semantic Versioning.
 - Add asset and network management helpers:
   `assets path <name>`, `assets list` custom-asset visibility, `networks list`, and
   `networks rm <name>` (interactive confirmation or `--yes`).
-- Add custom-asset hook scaffolding under `assets/custom/<name>/hooks/` with executable
-  `pre-stage-protocol.sample` and `post-stage-protocol.sample` templates.
-- Add `network <network> path <protocol_version>` to print the staged chainspec path for that
-  protocol version.
+- Add network-scoped hook samples under `networks/<network>/hooks/` for `pre-genesis`,
+  `post-genesis`, `block-added`, `pre-stage-protocol`, and `post-stage-protocol`, generated from
+  source-controlled templates in `examples/hooks/`.
+- Add `network <network> path <protocol_version>` to print staged per-node config directories for
+  that protocol version.
 - Add `network <network> port --rpc|--sse|--rest|--binary|--diagnostics` to print one random
   live endpoint or diagnostics socket path from a running node.
 - Add `network <network> is-ready` for scoped CI readiness checks.
@@ -31,19 +32,23 @@ Semantic Versioning.
 - Protocol staging now writes per-node versioned `bin/<version>` and `config/<version>` trees,
   patches chainspec/node/sidecar configs for the target network, and restarts sidecars in live
   mode without requiring a full `start` restart cycle.
-- Protocol staging now runs optional custom-asset hooks: `pre-stage-protocol` before any staging
-  mutation and `post-stage-protocol` once at the real upgrade boundary after the launcher starts
-  the target validator version. Hook stdout/stderr are streamed through `casper-devnet` stderr
-  with `<hook_name> stdout|stderr: ...` prefixes and still captured under
-  `networks/<network>/daemon/hooks/logs/`.
+- Protocol staging now runs optional network-scoped hooks from `networks/<network>/hooks/`.
+  `pre-stage-protocol` runs after staged `bin/<version>` and `config/<version>` directories are
+  written and before post-stage metadata is queued, so it can inspect and edit staged chainspecs.
+  If it fails, the newly staged version directories are removed and `post-stage-protocol` is not
+  queued. `post-stage-protocol` still runs once at the real upgrade boundary after the launcher
+  starts the target validator version. Hook stdout/stderr are streamed through `casper-devnet`
+  stderr with `<hook_name> stdout|stderr: ...` prefixes and captured under
+  `networks/<network>/hooks/logs/`.
 - Runtime supervisor logs now make upgrade transitions explicit (launcher upgrade notes,
   SSE shutdown/disconnect visibility, and post-reconnect `Network is healthy` API re-announcement).
 - Node and sidecar log aliases are atomically repointed to active versioned log files across
   protocol transitions and sidecar restarts.
 - Custom `assets add <name> ...` installs are now write-once: reusing an existing custom asset
   name fails instead of replacing that directory in place.
-- Hook sample scripts now include a best-effort
-  `casper-devnet network <network> port --rpc` + `curl` example using `info_get_status`.
+- Hook sample scripts now include `info_get_status` examples, and the stage hook samples use
+  Python templates to locate staged per-node config directories and demonstrate a safe
+  chainspec TOML edit pattern.
 - Reuse the shared seed-path derivation helper for both MCP signing flows and the new CLI
   `derive` command.
 - Split asset selection from protocol-version overrides. `start --protocol-version` now only
@@ -59,6 +64,8 @@ Semantic Versioning.
 ### Removed
 - Remove the top-level `casper-devnet stage-protocol` command. Use
   `casper-devnet network <network> stage-protocol` instead.
+- Remove custom asset stage hook scaffolding and execution under `assets/custom/<name>/hooks/`;
+  existing files in those directories are ignored.
 
 ### Fixed
 - Avoid unintended offline fallback on macOS by using short `/tmp` control socket paths.

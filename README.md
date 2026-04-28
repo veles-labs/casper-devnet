@@ -133,14 +133,8 @@ casper-devnet assets path dev
 vim "$(casper-devnet assets path dev)/chainspec.toml"
 ```
 
-Custom assets also include hook samples under `hooks/`. Activate one by copying or renaming the
-matching `.sample` file:
-
-```bash
-cp "$(casper-devnet assets path dev)/hooks/pre-stage-protocol.sample" \
-  "$(casper-devnet assets path dev)/hooks/pre-stage-protocol"
-chmod +x "$(casper-devnet assets path dev)/hooks/pre-stage-protocol"
-```
+Custom assets install only symlink-backed asset files. Hooks are network-scoped and live under
+the managed network directory.
 
 List managed network directories:
 
@@ -284,10 +278,15 @@ In live mode, consensus keys are restored from the network seed before staging s
 `migrate-data` can run successfully at the upgrade boundary.
 Node and sidecar log aliases (for example `node-1.stdout`) are atomically repointed to
 versioned log files during protocol transitions; use `tail -F` to follow across alias swaps.
-If `assets/custom/<name>/hooks/pre-stage-protocol` exists, it runs before any stage-protocol
-filesystem mutation with argv `<network_name> <protocol_version> <activation_point>`.
-If `assets/custom/<name>/hooks/post-stage-protocol` exists, it runs once later at the real
-upgrade boundary, after the launcher starts the target validator version, with argv
+If `networks/<network>/hooks/pre-stage-protocol` exists, it runs after the target version's
+per-node `bin/<version>` and `config/<version>` directories have been staged, and before
+post-stage metadata is queued, with argv
+`<network_name> <protocol_version> <activation_point>`. Use
+`casper-devnet network <network> path <protocol_version>` inside the hook to locate each staged
+per-node config directory. If the hook fails, the newly staged version directories are removed and
+`post-stage-protocol` is not queued.
+If `networks/<network>/hooks/post-stage-protocol` exists, it runs once later at the real upgrade
+boundary, after the launcher starts the target validator version, with argv
 `<network_name> <protocol_version>`.
 If `networks/<network>/hooks/pre-genesis` exists, it runs after assets have been prepared
 for a fresh network but before the network is started, with argv
@@ -301,12 +300,10 @@ hooks can leave files behind for later hooks to inspect.
 Hook stdout/stderr are streamed line by line through `casper-devnet` stderr as
 `<hook_name> stdout: ...` and `<hook_name> stderr: ...`. Non-zero exits are still reported, but
 successful exit code `0` is quiet. The raw hook streams are also written under
-`networks/<network>/hooks/logs/` for network hooks and the same log directory is reused for
-custom-asset staging hooks.
-The generated sample hooks live under `assets/custom/<name>/hooks/*.sample` for stage hooks and
-`networks/<network>/hooks/*.sample` for network hooks. The samples show how to call
-`casper-devnet network <network> port --rpc`, issue an `info_get_status` JSON-RPC request with
-`curl`, consume `block-added` JSON from stdin, and use `casper-devnet network <network> path
+`networks/<network>/hooks/logs/`.
+The generated sample hooks live under `networks/<network>/hooks/*.sample`. The samples show how
+to call `casper-devnet network <network> port --rpc`, issue an `info_get_status` JSON-RPC
+request, consume `block-added` JSON from stdin, and use `casper-devnet network <network> path
 [<protocol_version>]` to locate the network root or staged per-node config directories.
 
 Run MCP control plane server (STDIO + HTTP):
@@ -482,18 +479,26 @@ v2.1.1/node-config.toml
 
 Custom override assets are stored separately under `assets/custom/<name>/` as symlinks to local
 `casper-node`, `casper-sidecar`, `chainspec.toml`, `node-config.toml`, and `sidecar-config.toml`.
-Each custom asset also gets:
+Custom assets do not install or execute hooks.
+
+Network hooks live under each managed network directory. Samples are generated as:
 
 ```
-assets/custom/<name>/hooks/pre-stage-protocol.sample
-assets/custom/<name>/hooks/post-stage-protocol.sample
+networks/<network>/hooks/pre-genesis.sample
+networks/<network>/hooks/post-genesis.sample
+networks/<network>/hooks/block-added.sample
+networks/<network>/hooks/pre-stage-protocol.sample
+networks/<network>/hooks/post-stage-protocol.sample
 ```
 
-Only exact hook filenames are executed:
+Only exact active hook filenames are executed:
 
 ```
-assets/custom/<name>/hooks/pre-stage-protocol
-assets/custom/<name>/hooks/post-stage-protocol
+networks/<network>/hooks/pre-genesis
+networks/<network>/hooks/post-genesis
+networks/<network>/hooks/block-added
+networks/<network>/hooks/pre-stage-protocol
+networks/<network>/hooks/post-stage-protocol
 ```
 
 The `.sample` files are boilerplate only and are never executed directly.

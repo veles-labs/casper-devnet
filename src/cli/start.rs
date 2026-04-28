@@ -1867,10 +1867,10 @@ port = 2
     #[tokio::test(flavor = "current_thread")]
     async fn control_server_handles_runtime_status_while_stage_protocol_is_in_flight() {
         let env = TestDataEnv::new();
-        let asset_dir = install_test_custom_asset(&env, "dev").await;
+        install_test_custom_asset(&env, "dev").await;
         let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0").await;
         write_executable_script(
-            &asset_dir.join("hooks").join("pre-stage-protocol"),
+            &layout.hooks_dir().join("pre-stage-protocol"),
             "#!/bin/sh\nset -eu\nprintf 'started\n' > \"$PWD/pre-hook-started\"\nsleep 1\n",
         )
         .await;

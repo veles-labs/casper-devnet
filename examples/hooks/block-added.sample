@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+# Copy this file to hooks/block-added to activate it.
+# argv:  <network_name> <protocol_version>
+# stdin: JSON payload for the BlockAdded SSE event
+# cwd:   networks/<network>/hooks/work/block-added
+
+network_name="${1:?missing network name}"
+protocol_version="${2:?missing protocol version}"
+payload="$(cat)"
+
+height="$(printf '%s\n' "${payload}" | sed -n 's/.*"height":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+if [ -n "${height}" ] && [ $((height % 10)) -ne 0 ]; then
+  exit 0
+fi
+
+echo "sample block-added hook: network=${network_name} protocol_version=${protocol_version} payload=${payload}"

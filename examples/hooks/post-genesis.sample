@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+# Copy this file to hooks/post-genesis to activate it.
+# argv: <network_name> <protocol_version>
+# cwd:  networks/<network>/hooks/work/post-genesis
+
+network_name="${1:?missing network name}"
+protocol_version="${2:?missing protocol version}"
+
+echo "sample post-genesis hook: network=${network_name} protocol_version=${protocol_version}"
+
+if command -v curl >/dev/null 2>&1 && rpc_url="$(casper-devnet network "${network_name}" port --rpc 2>/dev/null)"; then
+  curl -sS "${rpc_url}" \
+    -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"info_get_status","params":[]}' \
+    >"${PWD}/info_get_status.json" || true
+fi

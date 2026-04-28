@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+# Copy this file to hooks/pre-genesis to activate it.
+# argv: <network_name> <protocol_version>
+# cwd:  networks/<network>/hooks/work/pre-genesis
+
+network_name="${1:?missing network name}"
+protocol_version="${2:?missing protocol version}"
+
+echo "sample pre-genesis hook: network=${network_name} protocol_version=${protocol_version}"
+
+if config_dirs="$(casper-devnet network "${network_name}" path "${protocol_version}" 2>/dev/null)"; then
+  printf '%s\n' "${config_dirs}" | while IFS= read -r config_dir; do
+    [ -n "${config_dir}" ] || continue
+    echo "staged config dir: ${config_dir}"
+  done
+fi
