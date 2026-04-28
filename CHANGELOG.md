@@ -8,8 +8,12 @@ Semantic Versioning.
 ### Added
 - Add custom override assets and protocol staging workflows across CLI and MCP:
   `assets add <name> --casper-node --casper-sidecar --chainspec --node-config --sidecar-config`,
-  `stage-protocol`, MCP `stage_protocol`, and per-network live control sockets
-  (`/tmp/<network>.socket`).
+  `network <network> stage-protocol --custom-asset <name>`, MCP `stage_protocol`, and
+  per-network live control sockets (`/tmp/<network>.socket`).
+- Add explicit asset selectors for startup and staging:
+  `start --asset <version>`, `start --custom-asset <name>`,
+  `network <network> stage-protocol --asset <version>`, and
+  `network <network> stage-protocol --custom-asset <name>`.
 - Add asset and network management helpers:
   `assets path <name>`, `assets list` custom-asset visibility, `networks list`, and
   `networks rm <name>` (interactive confirmation or `--yes`).
@@ -42,10 +46,19 @@ Semantic Versioning.
   `casper-devnet network <network> port --rpc` + `curl` example using `info_get_status`.
 - Reuse the shared seed-path derivation helper for both MCP signing flows and the new CLI
   `derive` command.
+- Split asset selection from protocol-version overrides. `start --protocol-version` now only
+  rewrites the generated chainspec protocol version; when omitted, `start` uses the selected
+  asset's chainspec protocol version.
+- Move protocol staging under the singular network command namespace:
+  `network <network> stage-protocol`.
+- Extend MCP `spawn_network` and `stage_protocol` requests with `asset` and `custom_asset`
+  selectors while retaining `asset_name` as a compatibility alias for custom assets.
 
 ### Deprecated
 
 ### Removed
+- Remove the top-level `casper-devnet stage-protocol` command. Use
+  `casper-devnet network <network> stage-protocol` instead.
 
 ### Fixed
 - Avoid unintended offline fallback on macOS by using short `/tmp` control socket paths.
