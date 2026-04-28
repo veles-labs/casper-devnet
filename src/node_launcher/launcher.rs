@@ -21,8 +21,8 @@ use tracing::{debug, info, warn};
 
 use super::utils::{self, NodeExitCode};
 
-/// The name of the file for the on-disk record of the node-launcher state.
-const STATE_FILE_NAME: &str = "casper-node-launcher-state.toml";
+/// The name of the per-node file containing the embedded launcher state.
+pub(crate) const NODE_LAUNCHER_STATE_FILE: &str = "casper-node-launcher-state.toml";
 /// The name of the casper-node binary.
 const NODE_BINARY_NAME: &str = "casper-node";
 /// The name of the config file for casper-node.
@@ -235,7 +235,7 @@ impl Launcher {
 
     /// Provides the path of the file for recording the state of the node-launcher.
     fn state_path(&self) -> PathBuf {
-        self.config_root_dir.join(STATE_FILE_NAME)
+        self.config_root_dir.join(NODE_LAUNCHER_STATE_FILE)
     }
 
     /// Sets the given launcher state and stores it on disk.

@@ -75,6 +75,12 @@ pub(crate) async fn run(args: StageProtocolArgs) -> Result<()> {
                             socket_path.display()
                         ));
                     }
+                    ControlResult::AddNodes { .. } => {
+                        return Err(anyhow!(
+                            "unexpected add_nodes response from {}",
+                            socket_path.display()
+                        ));
+                    }
                 };
                 println!(
                     "staged protocol {} from custom asset '{}' for {} node(s) (live_mode={})",

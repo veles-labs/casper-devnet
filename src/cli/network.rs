@@ -30,12 +30,27 @@ pub(crate) struct NetworkArgs {
 
 #[derive(Subcommand, Clone)]
 enum NetworkCommand {
+    /// Add managed nodes to a running network.
+    AddNodes(NetworkAddNodesArgs),
     /// Check whether a network has observed a block yet.
     IsReady(NetworkIsReadyArgs),
     /// Print the chainspec path for a staged protocol version.
     Path(NetworkPathArgs),
     /// Print a random live endpoint for a running node in the network.
     Port(NetworkPortArgs),
+    /// Print REST /status for a specific node.
+    Status(NetworkStatusArgs),
+}
+
+#[derive(Args, Clone)]
+struct NetworkAddNodesArgs {
+    /// Number of nodes to add.
+    #[arg(long)]
+    count: u32,
+
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -89,6 +104,17 @@ struct NetworkPathArgs {
     net_path: Option<PathBuf>,
 }
 
+#[derive(Args, Clone)]
+struct NetworkStatusArgs {
+    /// Node id to query.
+    #[arg(long)]
+    node_id: u32,
+
+    /// Override the base path for network runtime assets.
+    #[arg(long, value_name = "PATH")]
+    net_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PortSelection {
     Rpc,
@@ -116,11 +142,85 @@ impl NetworkPortArgs {
 
 pub(crate) async fn run(args: NetworkArgs) -> Result<()> {
     match args.command {
+        NetworkCommand::AddNodes(add_nodes) => {
+            run_network_add_nodes(args.network_name, add_nodes).await
+        }
         NetworkCommand::IsReady(is_ready) => {
             run_network_is_ready(args.network_name, is_ready).await
         }
         NetworkCommand::Path(path) => run_network_path(args.network_name, path).await,
         NetworkCommand::Port(port) => run_network_port(args.network_name, port).await,
+        NetworkCommand::Status(status) => run_network_status(args.network_name, status).await,
+    }
+}
+
+async fn run_network_add_nodes(network_name: String, args: NetworkAddNodesArgs) -> Result<()> {
+    if args.count == 0 {
+        return Err(anyhow!("--count must be greater than 0"));
+    }
+
+    let assets_root = match &args.net_path {
+        Some(path) => path.clone(),
+        None => assets::default_assets_root()?,
+    };
+    let layout = AssetsLayout::new(assets_root, network_name);
+    let net_dir = layout.net_dir();
+    if !is_dir(&net_dir).await {
+        return Err(anyhow!(
+            "assets for {} not found under {}; run `start` first",
+            layout.network_name(),
+            shorten_home_path(&net_dir.display().to_string())
+        ));
+    }
+
+    let socket_path = layout.control_socket_path();
+    if !is_control_socket(&socket_path).await {
+        return Err(anyhow!(
+            "network {} is not running under live control socket {}; start it first",
+            layout.network_name(),
+            socket_path.display()
+        ));
+    }
+
+    let response = send_request(
+        &socket_path,
+        &ControlRequest::AddNodes { count: args.count },
+    )
+    .await
+    .map_err(|err| {
+        anyhow!(
+            "failed to add nodes via live control socket {}: {}",
+            socket_path.display(),
+            err
+        )
+    })?;
+
+    match response {
+        ControlResponse::Ok {
+            result:
+                ControlResult::AddNodes {
+                    added_node_ids,
+                    total_nodes,
+                    started_processes,
+                },
+        } => {
+            let added = added_node_ids
+                .into_iter()
+                .map(|id| format!("node-{}", id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "added {} node(s): {} (total_nodes={}, started_processes={})",
+                args.count, added, total_nodes, started_processes
+            );
+            Ok(())
+        }
+        ControlResponse::Ok { result } => Err(anyhow!(
+            "unexpected control response from {}: {:?}",
+            socket_path.display(),
+            result
+        )),
+        ControlResponse::Error { error } => Err(anyhow!(error)),
     }
 }
 
@@ -158,6 +258,45 @@ async fn run_network_port(network_name: String, args: NetworkPortArgs) -> Result
     let mut rng = rand::rng();
     let node_id = *node_ids.choose(&mut rng).expect("non-empty node ids");
     println!("{}", endpoint_for_selection(&layout, node_id, selection));
+    Ok(())
+}
+
+async fn run_network_status(network_name: String, args: NetworkStatusArgs) -> Result<()> {
+    if args.node_id == 0 {
+        return Err(anyhow!("--node-id must be greater than 0"));
+    }
+
+    let assets_root = match &args.net_path {
+        Some(path) => path.clone(),
+        None => assets::default_assets_root()?,
+    };
+    let layout = AssetsLayout::new(assets_root, network_name);
+    let net_dir = layout.net_dir();
+    if !is_dir(&net_dir).await {
+        return Err(anyhow!(
+            "assets for {} not found under {}; run `start` first",
+            layout.network_name(),
+            shorten_home_path(&net_dir.display().to_string())
+        ));
+    }
+
+    let url = format!("{}/status", assets::rest_endpoint(args.node_id));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(4))
+        .build()?;
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| anyhow!("failed to query {}: {}", url, err))?
+        .error_for_status()
+        .map_err(|err| anyhow!("failed to query {}: {}", url, err))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|err| anyhow!("failed to parse {} response: {}", url, err))?;
+
+    println!("{}", format_status(&status));
     Ok(())
 }
 
@@ -298,6 +437,120 @@ fn endpoint_for_selection(layout: &AssetsLayout, node_id: u32, selection: PortSe
         PortSelection::Diagnostics => {
             assets::diagnostics_socket_path(layout.network_name(), node_id)
         }
+    }
+}
+
+fn format_status(status: &serde_json::Value) -> String {
+    let Some(status) = status.as_object() else {
+        return "Cannot parse status return.".to_string();
+    };
+
+    if let Some(error) = status.get("error") {
+        return format!("status error: {}", display_json_value(error, "None"));
+    }
+
+    let is_new_status = status.get("available_block_range").is_some();
+    let mut output = Vec::new();
+
+    if let Some(block_info) = status
+        .get("last_added_block_info")
+        .and_then(serde_json::Value::as_object)
+    {
+        let height = block_info
+            .get("height")
+            .map(|value| display_json_value(value, "None"))
+            .unwrap_or_else(|| "None".to_string());
+        let era = block_info
+            .get("era_id")
+            .map(|value| display_json_value(value, "None"))
+            .unwrap_or_else(|| "None".to_string());
+        output.push(format!("Last Block: {} (Era: {})", height, era));
+    }
+
+    output.extend([
+        format!(
+            "Peer Count: {}",
+            status
+                .get("peers")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+        ),
+        format!("Uptime: {}", display_object_string(status, "uptime", "")),
+        format!(
+            "Build: {}",
+            display_object_value(status, "build_version", "None")
+        ),
+        format!(
+            "Key: {}",
+            display_object_value(status, "our_public_signing_key", "None")
+        ),
+        format!(
+            "Next Upgrade: {}",
+            display_object_value(status, "next_upgrade", "None")
+        ),
+        String::new(),
+    ]);
+
+    if is_new_status {
+        output.push(format!(
+            "Reactor State: {}",
+            display_object_string(status, "reactor_state", "")
+        ));
+        let (low, high) = status
+            .get("available_block_range")
+            .and_then(serde_json::Value::as_object)
+            .map(|range| {
+                (
+                    range
+                        .get("low")
+                        .map(|value| display_json_value(value, ""))
+                        .unwrap_or_default(),
+                    range
+                        .get("high")
+                        .map(|value| display_json_value(value, ""))
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        output.push(format!(
+            "Available Block Range - Low: {}  High: {}",
+            low, high
+        ));
+    }
+    output.push(String::new());
+
+    output.join("\n")
+}
+
+fn display_object_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: &str,
+) -> String {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn display_object_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: &str,
+) -> String {
+    object
+        .get(key)
+        .map(|value| display_json_value(value, default))
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn display_json_value(value: &serde_json::Value, default: &str) -> String {
+    match value {
+        serde_json::Value::Null => default.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -482,7 +735,7 @@ struct BlockSync {
 #[cfg(test)]
 mod tests {
     use super::{
-        PortSelection, endpoint_for_selection, query_live_running_node_ids,
+        PortSelection, endpoint_for_selection, format_status, query_live_running_node_ids,
         query_live_running_node_ids_with_timeout, resolve_network_paths,
     };
     use crate::control::{ControlRequest, ControlResponse, ControlResult};
@@ -594,6 +847,45 @@ mod tests {
             endpoint_for_selection(&layout, 2, PortSelection::Diagnostics),
             crate::assets::diagnostics_socket_path("casper-dev", 2)
         );
+    }
+
+    #[test]
+    fn format_status_renders_new_rest_status() {
+        let status = serde_json::json!({
+            "last_added_block_info": { "height": 42, "era_id": 7 },
+            "peers": [{ "node_id": "a" }, { "node_id": "b" }],
+            "uptime": "10s",
+            "build_version": "2.0.0",
+            "our_public_signing_key": "public-key",
+            "next_upgrade": { "activation_point": 50 },
+            "reactor_state": "Validate",
+            "available_block_range": { "low": 1, "high": 42 }
+        });
+
+        assert_eq!(
+            format_status(&status),
+            "Last Block: 42 (Era: 7)\nPeer Count: 2\nUptime: 10s\nBuild: 2.0.0\nKey: public-key\nNext Upgrade: {\"activation_point\":50}\n\nReactor State: Validate\nAvailable Block Range - Low: 1  High: 42\n"
+        );
+    }
+
+    #[test]
+    fn format_status_handles_legacy_and_missing_fields() {
+        let status = serde_json::json!({
+            "peers": [],
+            "last_added_block_info": { "height": 3, "era_id": 1 }
+        });
+
+        assert_eq!(
+            format_status(&status),
+            "Last Block: 3 (Era: 1)\nPeer Count: 0\nUptime: \nBuild: None\nKey: None\nNext Upgrade: None\n\n"
+        );
+    }
+
+    #[test]
+    fn format_status_renders_error() {
+        let status = serde_json::json!({ "error": "node unavailable" });
+
+        assert_eq!(format_status(&status), "status error: node unavailable");
     }
 
     #[tokio::test(flavor = "current_thread")]

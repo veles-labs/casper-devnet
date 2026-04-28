@@ -28,6 +28,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task;
 
+use crate::node_launcher::NODE_LAUNCHER_STATE_FILE;
+
 pub const BOOTSTRAP_NODES: u32 = 3;
 
 const DEVNET_BASE_PORT_RPC: u32 = 11000;
@@ -555,6 +557,17 @@ pub struct StageProtocolResult {
     pub staged_nodes: u32,
 }
 
+pub struct AddNodesOptions {
+    pub count: u32,
+    pub seed: Arc<str>,
+}
+
+#[derive(Debug)]
+pub struct AddNodesResult {
+    pub added_node_ids: Vec<u32>,
+    pub total_nodes: u32,
+}
+
 #[derive(Clone, Debug)]
 struct HookLogPaths {
     stdout: PathBuf,
@@ -978,6 +991,515 @@ pub async fn ensure_consensus_keys(layout: &AssetsLayout, seed: Arc<str>) -> Res
     }
 
     Ok(restored)
+}
+
+/// Prepare filesystem assets for appending managed non-genesis nodes to a live network.
+pub async fn add_nodes(layout: &AssetsLayout, opts: &AddNodesOptions) -> Result<AddNodesResult> {
+    add_nodes_with_trusted_hash(layout, opts, None).await
+}
+
+async fn add_nodes_with_trusted_hash(
+    layout: &AssetsLayout,
+    opts: &AddNodesOptions,
+    trusted_hash_override: Option<String>,
+) -> Result<AddNodesResult> {
+    if opts.count == 0 {
+        return Err(anyhow!("count must be greater than 0"));
+    }
+
+    let existing_node_ids = layout.node_ids().await?;
+    if existing_node_ids.is_empty() {
+        return Err(anyhow!(
+            "no nodes found under {}; run start first",
+            layout.nodes_dir().display()
+        ));
+    }
+    ensure_contiguous_node_ids(&existing_node_ids)?;
+
+    let active_version = uniform_active_protocol_version(layout, &existing_node_ids).await?;
+    let active_version_fs = active_version.to_string().replace('.', "_");
+    let first_new_node_id = existing_node_ids
+        .last()
+        .copied()
+        .expect("checked non-empty")
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("node id overflow"))?;
+    let total_nodes = existing_node_ids
+        .len()
+        .try_into()
+        .ok()
+        .and_then(|current: u32| current.checked_add(opts.count))
+        .ok_or_else(|| anyhow!("node count overflow"))?;
+    let added_node_ids = (first_new_node_id..=total_nodes).collect::<Vec<_>>();
+
+    let source_node_id = existing_node_ids[0];
+    let source_bin_dir = layout.node_bin_dir(source_node_id).join(&active_version_fs);
+    let source_config_dir = layout
+        .node_config_root(source_node_id)
+        .join(&active_version_fs);
+    ensure_active_version_assets(&source_bin_dir, &source_config_dir).await?;
+
+    let trusted_hash = match trusted_hash_override {
+        Some(trusted_hash) => trusted_hash,
+        None => trusted_hash_for_joining_node(&existing_node_ids).await?,
+    };
+
+    for node_id in &added_node_ids {
+        if let Err(err) = prepare_added_node(
+            layout,
+            source_node_id,
+            *node_id,
+            total_nodes,
+            &active_version_fs,
+            &opts.seed,
+            &trusted_hash,
+        )
+        .await
+        {
+            return Err(rollback_added_nodes_after_error(layout, &added_node_ids, err).await);
+        }
+    }
+
+    if let Err(err) =
+        append_added_nodes_to_derived_accounts(layout, &added_node_ids, Arc::clone(&opts.seed))
+            .await
+    {
+        return Err(rollback_added_nodes_after_error(layout, &added_node_ids, err).await);
+    }
+
+    Ok(AddNodesResult {
+        added_node_ids,
+        total_nodes,
+    })
+}
+
+pub async fn rollback_added_nodes(layout: &AssetsLayout, node_ids: &[u32]) -> Result<()> {
+    let mut errors = Vec::new();
+    for node_id in node_ids {
+        let node_dir = layout.node_dir(*node_id);
+        match tokio_fs::remove_dir_all(&node_dir).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => errors.push(format!("failed to remove {}: {}", node_dir.display(), err)),
+        }
+    }
+
+    if let Err(err) = remove_added_nodes_from_derived_accounts(layout, node_ids).await {
+        errors.push(err.to_string());
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
+}
+
+async fn rollback_added_nodes_after_error(
+    layout: &AssetsLayout,
+    node_ids: &[u32],
+    err: anyhow::Error,
+) -> anyhow::Error {
+    match rollback_added_nodes(layout, node_ids).await {
+        Ok(()) => err,
+        Err(rollback_err) => anyhow!(
+            "{}; failed to roll back added node assets: {}",
+            err,
+            rollback_err
+        ),
+    }
+}
+
+async fn trusted_hash_for_joining_node(node_ids: &[u32]) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(StdDuration::from_secs(4))
+        .build()?;
+    let mut errors = Vec::new();
+
+    for node_id in node_ids {
+        let url = format!("{}/status", rest_endpoint(*node_id));
+        match fetch_trusted_hash(&client, &url).await {
+            Ok(trusted_hash) => return Ok(trusted_hash),
+            Err(err) => errors.push(format!("node-{node_id}: {err}")),
+        }
+    }
+
+    Err(anyhow!(
+        "failed to get trusted hash from existing node status endpoints: {}",
+        errors.join("; ")
+    ))
+}
+
+async fn fetch_trusted_hash(client: &reqwest::Client, url: &str) -> Result<String> {
+    let status = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| anyhow!("failed to query {url}: {err}"))?
+        .error_for_status()
+        .map_err(|err| anyhow!("failed to query {url}: {err}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|err| anyhow!("failed to parse {url} response: {err}"))?;
+
+    status
+        .pointer("/last_added_block_info/hash")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            status
+                .pointer("/last_added_block_info/block_hash")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{url} response missing last_added_block_info.hash"))
+}
+
+fn ensure_contiguous_node_ids(node_ids: &[u32]) -> Result<()> {
+    for (index, node_id) in node_ids.iter().enumerate() {
+        let expected = (index as u32) + 1;
+        if *node_id != expected {
+            return Err(anyhow!(
+                "node directories must be contiguous from node-1; expected node-{}, found node-{}",
+                expected,
+                node_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn uniform_active_protocol_version(
+    layout: &AssetsLayout,
+    node_ids: &[u32],
+) -> Result<Version> {
+    let mut active = None;
+    for node_id in node_ids {
+        let version = active_protocol_version_for_node(layout, *node_id).await?;
+        match &active {
+            Some(active) if active != &version => {
+                return Err(anyhow!(
+                    "active protocol versions are mixed: node-1 is {}, node-{} is {}",
+                    active,
+                    node_id,
+                    version
+                ));
+            }
+            Some(_) => {}
+            None => active = Some(version),
+        }
+    }
+    active.ok_or_else(|| anyhow!("no active protocol version found"))
+}
+
+async fn active_protocol_version_for_node(layout: &AssetsLayout, node_id: u32) -> Result<Version> {
+    let state_path = layout
+        .node_config_root(node_id)
+        .join(NODE_LAUNCHER_STATE_FILE);
+    let contents = tokio_fs::read_to_string(&state_path)
+        .await
+        .map_err(|err| anyhow!("failed to read {}: {}", state_path.display(), err))?;
+    let value: toml::Value = toml::from_str(&contents)
+        .map_err(|err| anyhow!("failed to parse {}: {}", state_path.display(), err))?;
+    let mode = value
+        .get("mode")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| anyhow!("{} missing launcher mode", state_path.display()))?;
+    if mode != "RunNodeAsValidator" {
+        return Err(anyhow!(
+            "node-{} is not running as a validator (launcher mode: {}); try again after migration completes",
+            node_id,
+            mode
+        ));
+    }
+    let version = value
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| anyhow!("{} missing active version", state_path.display()))?;
+    parse_protocol_version(version)
+}
+
+async fn ensure_active_version_assets(
+    source_bin_dir: &Path,
+    source_config_dir: &Path,
+) -> Result<()> {
+    for path in [
+        source_bin_dir.join("casper-node"),
+        source_bin_dir.join("casper-sidecar"),
+        source_config_dir.join("chainspec.toml"),
+        source_config_dir.join("accounts.toml"),
+        source_config_dir.join("config.toml"),
+        source_config_dir.join("sidecar.toml"),
+    ] {
+        if !is_file(&path).await {
+            return Err(anyhow!("missing active version asset {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_added_node(
+    layout: &AssetsLayout,
+    source_node_id: u32,
+    node_id: u32,
+    total_nodes: u32,
+    active_version_fs: &str,
+    seed: &Arc<str>,
+    trusted_hash: &str,
+) -> Result<()> {
+    let source_bin_dir = layout.node_bin_dir(source_node_id).join(active_version_fs);
+    let source_config_dir = layout
+        .node_config_root(source_node_id)
+        .join(active_version_fs);
+    let node_dir = layout.node_dir(node_id);
+    let dest_bin_dir = layout.node_bin_dir(node_id).join(active_version_fs);
+    let dest_config_dir = layout.node_config_root(node_id).join(active_version_fs);
+
+    tokio_fs::create_dir_all(&dest_bin_dir).await?;
+    tokio_fs::create_dir_all(&dest_config_dir).await?;
+    tokio_fs::create_dir_all(node_dir.join("keys")).await?;
+    tokio_fs::create_dir_all(node_dir.join("logs")).await?;
+    tokio_fs::create_dir_all(node_dir.join("storage")).await?;
+
+    copy_file(
+        &source_bin_dir.join("casper-node"),
+        &dest_bin_dir.join("casper-node"),
+    )
+    .await?;
+    copy_file(
+        &source_bin_dir.join("casper-sidecar"),
+        &dest_bin_dir.join("casper-sidecar"),
+    )
+    .await?;
+    copy_file(
+        &source_config_dir.join("chainspec.toml"),
+        &dest_config_dir.join("chainspec.toml"),
+    )
+    .await?;
+    copy_file(
+        &source_config_dir.join("accounts.toml"),
+        &dest_config_dir.join("accounts.toml"),
+    )
+    .await?;
+    copy_file(
+        &source_config_dir.join("config.toml"),
+        &dest_config_dir.join("config.toml"),
+    )
+    .await?;
+    copy_file(
+        &source_config_dir.join("sidecar.toml"),
+        &dest_config_dir.join("sidecar.toml"),
+    )
+    .await?;
+
+    rewrite_added_node_config(
+        layout,
+        node_id,
+        total_nodes,
+        &dest_config_dir.join("config.toml"),
+        trusted_hash,
+    )
+    .await?;
+    rewrite_added_sidecar_config(node_id, &dest_config_dir.join("sidecar.toml")).await?;
+    write_consensus_key_for_node(layout, node_id, Arc::clone(seed)).await
+}
+
+async fn rewrite_added_node_config(
+    layout: &AssetsLayout,
+    node_id: u32,
+    total_nodes: u32,
+    config_path: &Path,
+    trusted_hash: &str,
+) -> Result<()> {
+    let config_contents = tokio_fs::read_to_string(config_path).await?;
+    let bind_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_NETWORK, node_id));
+    let known = known_addresses(node_id, total_nodes);
+    let rest_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_REST, node_id));
+    let sse_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_SSE, node_id));
+    let binary_address = format!("0.0.0.0:{}", node_port(DEVNET_BASE_PORT_BINARY, node_id));
+    let diagnostics_socket = diagnostics_socket_path(layout.network_name(), node_id);
+    let trusted_hash = trusted_hash.to_string();
+    let updated_config = spawn_blocking_result(move || {
+        let mut config_value: toml::Value = toml::from_str(&config_contents)?;
+        set_string(&mut config_value, &["node", "trusted_hash"], trusted_hash)?;
+        set_joining_sync_mode(&mut config_value)?;
+        set_string(
+            &mut config_value,
+            &["consensus", "secret_key_path"],
+            "../../keys/secret_key.pem".to_string(),
+        )?;
+        set_string(
+            &mut config_value,
+            &["network", "bind_address"],
+            bind_address,
+        )?;
+        set_array(&mut config_value, &["network", "known_addresses"], known)?;
+        set_string(
+            &mut config_value,
+            &["storage", "path"],
+            "../../storage".to_string(),
+        )?;
+        set_string(&mut config_value, &["rest_server", "address"], rest_address)?;
+        set_string(
+            &mut config_value,
+            &["event_stream_server", "address"],
+            sse_address,
+        )?;
+        set_string(
+            &mut config_value,
+            &["diagnostics_port", "socket_path"],
+            diagnostics_socket,
+        )?;
+        set_string(
+            &mut config_value,
+            &["binary_port_server", "address"],
+            binary_address,
+        )?;
+        set_bool(
+            &mut config_value,
+            &["binary_port_server", "allow_request_get_trie"],
+            true,
+        )?;
+        set_bool(
+            &mut config_value,
+            &["binary_port_server", "allow_request_speculative_exec"],
+            true,
+        )?;
+        Ok(toml::to_string(&config_value)?)
+    })
+    .await?;
+    tokio_fs::write(config_path, updated_config).await?;
+    Ok(())
+}
+
+async fn rewrite_added_sidecar_config(node_id: u32, sidecar_path: &Path) -> Result<()> {
+    let sidecar_contents = tokio_fs::read_to_string(sidecar_path).await?;
+    let rpc_port = node_port(DEVNET_BASE_PORT_RPC, node_id) as i64;
+    let binary_port = node_port(DEVNET_BASE_PORT_BINARY, node_id) as i64;
+    let updated_sidecar = spawn_blocking_result(move || {
+        let mut sidecar_value: toml::Value = toml::from_str(&sidecar_contents)?;
+        set_string(
+            &mut sidecar_value,
+            &["rpc_server", "main_server", "ip_address"],
+            "0.0.0.0".to_string(),
+        )?;
+        set_integer(
+            &mut sidecar_value,
+            &["rpc_server", "main_server", "port"],
+            rpc_port,
+        )?;
+        set_string(
+            &mut sidecar_value,
+            &["rpc_server", "node_client", "ip_address"],
+            "0.0.0.0".to_string(),
+        )?;
+        set_integer(
+            &mut sidecar_value,
+            &["rpc_server", "node_client", "port"],
+            binary_port,
+        )?;
+        Ok(toml::to_string(&sidecar_value)?)
+    })
+    .await?;
+    tokio_fs::write(sidecar_path, updated_sidecar).await?;
+    Ok(())
+}
+
+async fn write_consensus_key_for_node(
+    layout: &AssetsLayout,
+    node_id: u32,
+    seed: Arc<str>,
+) -> Result<()> {
+    let key_path = layout.node_dir(node_id).join("keys").join(SECRET_KEY_PEM);
+    let account = derive_node_account(seed, node_id, true).await?;
+    let secret_key_pem = account
+        .secret_key_pem
+        .ok_or_else(|| anyhow!("missing secret key material for node-{}", node_id))?;
+    tokio_fs::write(key_path, secret_key_pem).await?;
+    Ok(())
+}
+
+async fn append_added_nodes_to_derived_accounts(
+    layout: &AssetsLayout,
+    node_ids: &[u32],
+    seed: Arc<str>,
+) -> Result<()> {
+    let mut lines = Vec::new();
+    for node_id in node_ids {
+        let account = derive_node_account(Arc::clone(&seed), *node_id, false).await?;
+        lines.push(
+            DerivedAccountInfo {
+                kind: "node",
+                name: format!("node-{}", node_id),
+                id: *node_id,
+                path: account.path,
+                public_key_hex: account.public_key_hex,
+                account_hash: account.account_hash,
+                balance_motes: 0,
+            }
+            .line(),
+        );
+    }
+
+    let path = derived_accounts_path(layout);
+    let mut contents = match tokio_fs::read_to_string(&path).await {
+        Ok(contents) => {
+            let trimmed = contents.trim_end();
+            if trimmed.is_empty() {
+                "kind,name,key_type,derivation,path,account_hash,balance".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            "kind,name,key_type,derivation,path,account_hash,balance".to_string()
+        }
+        Err(err) => return Err(err.into()),
+    };
+    for line in lines {
+        contents.push('\n');
+        contents.push_str(&line);
+    }
+    contents.push('\n');
+    tokio_fs::write(path, contents).await?;
+    Ok(())
+}
+
+async fn remove_added_nodes_from_derived_accounts(
+    layout: &AssetsLayout,
+    node_ids: &[u32],
+) -> Result<()> {
+    let path = derived_accounts_path(layout);
+    let contents = match tokio_fs::read_to_string(&path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let node_names = node_ids
+        .iter()
+        .map(|node_id| format!("node-{}", node_id))
+        .collect::<Vec<_>>();
+    let mut retained = Vec::new();
+    for line in contents.lines() {
+        if !is_added_node_account_line(line, &node_names) {
+            retained.push(line);
+        }
+    }
+
+    let mut updated = retained.join("\n");
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    tokio_fs::write(path, updated).await?;
+    Ok(())
+}
+
+fn is_added_node_account_line(line: &str, node_names: &[String]) -> bool {
+    let mut parts = line.splitn(3, ',');
+    matches!(
+        (parts.next(), parts.next()),
+        (Some("node"), Some(name)) if node_names.iter().any(|candidate| candidate == name)
+    )
 }
 
 pub fn parse_protocol_version(raw: &str) -> Result<Version> {
@@ -1532,6 +2054,21 @@ fn derive_account_material(
         account_hash,
         secret_key_pem,
     })
+}
+
+async fn derive_node_account(
+    seed: Arc<str>,
+    node_id: u32,
+    write_secret: bool,
+) -> Result<DerivedAccountMaterial> {
+    let seed_for_root = seed.to_string();
+    spawn_blocking_result(move || {
+        let root = unsafe_root_from_seed(&seed_for_root)?;
+        let path =
+            DerivationPath::from_str(&format!("{}/{}", DERIVATION_PATH_PREFIX, node_id - 1))?;
+        derive_account_material(&root, &path, write_secret)
+    })
+    .await
 }
 
 async fn write_node_keys(dir: &Path, account: &DerivedAccountMaterial) -> Result<()> {
@@ -3025,6 +3562,24 @@ fn set_bool(root: &mut toml::Value, path: &[&str], value: bool) -> Result<()> {
     set_value(root, path, toml::Value::Boolean(value))
 }
 
+fn set_joining_sync_mode(root: &mut toml::Value) -> Result<()> {
+    let table = root
+        .as_table()
+        .ok_or_else(|| anyhow!("TOML root is not a table"))?;
+    let node = table.get("node").and_then(toml::Value::as_table);
+
+    if node
+        .map(|node| node.contains_key("sync_to_genesis"))
+        .unwrap_or(false)
+    {
+        set_bool(root, &["node", "sync_to_genesis"], false)
+    } else if table.contains_key("sync_to_genesis") {
+        set_bool(root, &["sync_to_genesis"], false)
+    } else {
+        set_string(root, &["node", "sync_handling"], "ttl".to_string())
+    }
+}
+
 fn set_value(root: &mut toml::Value, path: &[&str], value: toml::Value) -> Result<()> {
     let table = root
         .as_table_mut()
@@ -3065,7 +3620,7 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
+    use std::sync::{Arc, MutexGuard};
     use tempfile::TempDir;
 
     struct TestDataEnv {
@@ -3205,12 +3760,122 @@ rewards_handling = { type = 'standard' }
         Ok(layout)
     }
 
+    async fn create_add_nodes_network_layout(
+        root: &Path,
+        network_name: &str,
+        current_version: &str,
+        node_count: u32,
+    ) -> Result<AssetsLayout> {
+        let layout = AssetsLayout::new(root.join("networks"), network_name.to_string());
+        let version_fs = protocol_version_fs(current_version);
+        tokio_fs::create_dir_all(layout.net_dir().join("chainspec")).await?;
+        tokio_fs::write(
+            layout.net_dir().join("chainspec/accounts.toml"),
+            "network accounts\n",
+        )
+        .await?;
+        tokio_fs::write(
+            derived_accounts_path(&layout),
+            "kind,name,key_type,derivation,path,account_hash,balance\n",
+        )
+        .await?;
+
+        for node_id in 1..=node_count {
+            let bin_dir = layout.node_bin_dir(node_id).join(&version_fs);
+            let config_dir = layout.node_config_root(node_id).join(&version_fs);
+            tokio_fs::create_dir_all(&bin_dir).await?;
+            tokio_fs::create_dir_all(&config_dir).await?;
+            tokio_fs::create_dir_all(layout.node_dir(node_id).join("keys")).await?;
+            tokio_fs::create_dir_all(layout.node_dir(node_id).join("logs")).await?;
+            tokio_fs::create_dir_all(layout.node_dir(node_id).join("storage")).await?;
+            tokio_fs::write(bin_dir.join("casper-node"), "node binary\n").await?;
+            tokio_fs::write(bin_dir.join("casper-sidecar"), "sidecar binary\n").await?;
+            tokio_fs::write(
+                config_dir.join("chainspec.toml"),
+                format!("chainspec for node {node_id}\n"),
+            )
+            .await?;
+            tokio_fs::write(config_dir.join("accounts.toml"), "accounts snapshot\n").await?;
+            tokio_fs::write(
+                config_dir.join("config.toml"),
+                "\
+[logging]
+format = \"text\"
+
+[consensus]
+secret_key_path = \"old.pem\"
+
+[network]
+bind_address = \"0.0.0.0:1\"
+known_addresses = []
+
+[storage]
+path = \"old-storage\"
+
+[rest_server]
+address = \"0.0.0.0:2\"
+
+[event_stream_server]
+address = \"0.0.0.0:3\"
+
+[diagnostics_port]
+socket_path = \"old.sock\"
+
+[binary_port_server]
+address = \"0.0.0.0:4\"
+allow_request_get_trie = false
+allow_request_speculative_exec = false
+",
+            )
+            .await?;
+            tokio_fs::write(
+                config_dir.join("sidecar.toml"),
+                "\
+[rpc_server.main_server]
+ip_address = \"127.0.0.1\"
+port = 1
+
+[rpc_server.node_client]
+ip_address = \"127.0.0.1\"
+port = 2
+",
+            )
+            .await?;
+            tokio_fs::write(
+                layout.node_config_root(node_id).join(NODE_LAUNCHER_STATE_FILE),
+                format!(
+                    "mode = \"RunNodeAsValidator\"\nversion = \"{}\"\nbinary_path = \"{}\"\nconfig_path = \"{}\"\n",
+                    current_version,
+                    bin_dir.join("casper-node").display(),
+                    config_dir.join("config.toml").display(),
+                ),
+            )
+            .await?;
+        }
+
+        Ok(layout)
+    }
+
     fn stage_options(asset_name: &str, protocol_version: &str) -> StageProtocolOptions {
         StageProtocolOptions {
             asset_name: asset_name.to_string(),
             protocol_version: protocol_version.to_string(),
             activation_point: 123,
         }
+    }
+
+    fn add_nodes_options(count: u32) -> AddNodesOptions {
+        AddNodesOptions {
+            count,
+            seed: Arc::from("default"),
+        }
+    }
+
+    async fn add_nodes_for_test(
+        layout: &AssetsLayout,
+        opts: &AddNodesOptions,
+    ) -> Result<AddNodesResult> {
+        add_nodes_with_trusted_hash(layout, opts, Some("trusted-hash".to_string())).await
     }
 
     #[test]
@@ -3306,6 +3971,272 @@ maximum_round_length = '17 seconds'
         assert!(updated.contains("activation_point = 2"));
         assert!(updated.contains("version = '2.1.3'"));
         assert!(updated.contains("validator_slots = 5"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_creates_managed_non_genesis_node_assets() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+        let accounts_before =
+            tokio_fs::read_to_string(layout.net_dir().join("chainspec/accounts.toml"))
+                .await
+                .unwrap();
+
+        let result = add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap();
+
+        assert_eq!(result.added_node_ids, vec![2]);
+        assert_eq!(result.total_nodes, 2);
+        let version_dir = layout.node_config_root(2).join("1_0_0");
+        assert!(is_file(&layout.node_bin_dir(2).join("1_0_0/casper-node")).await);
+        assert!(is_file(&layout.node_bin_dir(2).join("1_0_0/casper-sidecar")).await);
+        assert!(is_file(&version_dir.join("chainspec.toml")).await);
+        assert!(is_file(&version_dir.join("accounts.toml")).await);
+        assert!(is_file(&version_dir.join("config.toml")).await);
+        assert!(is_file(&version_dir.join("sidecar.toml")).await);
+        assert!(is_file(&layout.node_dir(2).join("keys/secret_key.pem")).await);
+        assert_eq!(
+            tokio_fs::read_to_string(layout.net_dir().join("chainspec/accounts.toml"))
+                .await
+                .unwrap(),
+            accounts_before
+        );
+
+        let config: toml::Value = toml::from_str(
+            &tokio_fs::read_to_string(version_dir.join("config.toml"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .get("network")
+                .and_then(|value| value.get("bind_address"))
+                .and_then(toml::Value::as_str),
+            Some("0.0.0.0:22102")
+        );
+        assert_eq!(
+            config
+                .get("rest_server")
+                .and_then(|value| value.get("address"))
+                .and_then(toml::Value::as_str),
+            Some("0.0.0.0:14102")
+        );
+        assert_eq!(
+            config
+                .get("node")
+                .and_then(|value| value.get("trusted_hash"))
+                .and_then(toml::Value::as_str),
+            Some("trusted-hash")
+        );
+        assert_eq!(
+            config.get("sync_handling").and_then(toml::Value::as_str),
+            None
+        );
+        assert_eq!(
+            config
+                .get("node")
+                .and_then(|value| value.get("sync_handling"))
+                .and_then(toml::Value::as_str),
+            Some("ttl")
+        );
+
+        let summary = tokio_fs::read_to_string(derived_accounts_path(&layout))
+            .await
+            .unwrap();
+        assert!(summary.contains("node,node-2,secp256k1,bip32,m/44'/506'/0'/0/1,"));
+        assert!(summary.trim_end().ends_with(",0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rollback_added_nodes_removes_assets_and_summary_rows() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+        add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap();
+
+        rollback_added_nodes(&layout, &[2]).await.unwrap();
+
+        assert!(!is_dir(&layout.node_dir(2)).await);
+        let summary = tokio_fs::read_to_string(derived_accounts_path(&layout))
+            .await
+            .unwrap();
+        assert!(!summary.contains("node,node-2,"));
+        assert_eq!(
+            summary.trim_end(),
+            "kind,name,key_type,derivation,path,account_hash,balance"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_rejects_zero_count() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+
+        let err = add_nodes_for_test(&layout, &add_nodes_options(0))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("count must be greater than 0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_rejects_non_contiguous_existing_nodes() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+        tokio_fs::rename(layout.node_dir(1), layout.node_dir(2))
+            .await
+            .unwrap();
+
+        let err = add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("contiguous"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_copies_only_active_version() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(layout.node_bin_dir(1).join("2_0_0"))
+            .await
+            .unwrap();
+        tokio_fs::create_dir_all(layout.node_config_root(1).join("2_0_0"))
+            .await
+            .unwrap();
+        tokio_fs::write(layout.node_bin_dir(1).join("2_0_0/casper-node"), "future")
+            .await
+            .unwrap();
+
+        add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap();
+
+        assert!(is_dir(&layout.node_bin_dir(2).join("1_0_0")).await);
+        assert!(!is_dir(&layout.node_bin_dir(2).join("2_0_0")).await);
+        assert!(!is_dir(&layout.node_config_root(2).join("2_0_0")).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_disables_legacy_genesis_sync_mode() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+        let source_config = layout.node_config_root(1).join("1_0_0/config.toml");
+        let contents = tokio_fs::read_to_string(&source_config).await.unwrap();
+        tokio_fs::write(
+            &source_config,
+            format!("sync_to_genesis = true\n\n{contents}"),
+        )
+        .await
+        .unwrap();
+
+        add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap();
+
+        let generated_config = layout.node_config_root(2).join("1_0_0/config.toml");
+        let config: toml::Value =
+            toml::from_str(&tokio_fs::read_to_string(generated_config).await.unwrap()).unwrap();
+        assert_eq!(
+            config.get("sync_to_genesis").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(config.get("sync_handling").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_disables_legacy_node_genesis_sync_mode() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+        let source_config = layout.node_config_root(1).join("1_0_0/config.toml");
+        let contents = tokio_fs::read_to_string(&source_config).await.unwrap();
+        tokio_fs::write(
+            &source_config,
+            format!("{contents}\n[node]\nsync_to_genesis = true\n"),
+        )
+        .await
+        .unwrap();
+
+        add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap();
+
+        let generated_config = layout.node_config_root(2).join("1_0_0/config.toml");
+        let config: toml::Value =
+            toml::from_str(&tokio_fs::read_to_string(generated_config).await.unwrap()).unwrap();
+        assert_eq!(
+            config
+                .get("node")
+                .and_then(|value| value.get("sync_to_genesis"))
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            config
+                .get("node")
+                .and_then(|value| value.get("sync_handling"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_rejects_migrating_launcher_state() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
+            .await
+            .unwrap();
+        tokio_fs::write(
+            layout.node_config_root(1).join(NODE_LAUNCHER_STATE_FILE),
+            "mode = \"MigrateData\"\n",
+        )
+        .await
+        .unwrap();
+
+        let err = add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("migration completes"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_rejects_mixed_active_versions() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 2)
+            .await
+            .unwrap();
+        tokio_fs::write(
+            layout.node_config_root(2).join(NODE_LAUNCHER_STATE_FILE),
+            "mode = \"RunNodeAsValidator\"\nversion = \"2.0.0\"\n",
+        )
+        .await
+        .unwrap();
+
+        let err = add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("active protocol versions are mixed")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

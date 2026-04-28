@@ -1,10 +1,11 @@
-use crate::assets::{self, AssetsLayout, SetupOptions, StageProtocolOptions};
+use crate::assets::{self, AddNodesOptions, AssetsLayout, SetupOptions, StageProtocolOptions};
 use crate::cli::common::{DEFAULT_SEED, is_file, shorten_home_path};
 use crate::control::{ControlRequest, ControlResponse, ControlResult};
 use crate::diagnostics_port;
 use crate::process::{self, ProcessHandle, RunningProcess, StartPlan};
 use crate::state::{
     ProcessKind, ProcessRecord, ProcessStatus, STATE_FILE_NAME, State, spawn_pid_sync_tasks,
+    spawn_pid_sync_tasks_for_ids,
 };
 use anyhow::{Result, anyhow};
 use backoff::ExponentialBackoff;
@@ -30,11 +31,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::time::MissedTickBehavior;
 use veles_casper_rust_sdk::sse::event::SseEvent;
 use veles_casper_rust_sdk::sse::{self, config::ListenerConfig};
 
 const SSE_WAIT_MESSAGE: &str = "Waiting for SSE connection...";
 const BLOCK_WAIT_MESSAGE: &str = "Waiting for new blocks...";
+const REACTOR_STATE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Args, Clone)]
 pub(crate) struct StartArgs {
@@ -148,7 +151,14 @@ pub(crate) async fn run(args: StartArgs) -> Result<()> {
     let details = format_network_details(&layout, &started).await;
     let health = Arc::new(Mutex::new(SseHealth::new(node_ids.clone(), details)));
     start_sse_spinner(&health).await;
-    spawn_sse_listeners(layout.clone(), &node_ids, health, Arc::clone(&state)).await;
+    spawn_sse_listeners(
+        layout.clone(),
+        &node_ids,
+        Arc::clone(&health),
+        Arc::clone(&state),
+    )
+    .await;
+    spawn_reactor_state_pollers(&node_ids);
     let mut diagnostics_proxy = match diagnostics_port::spawn(&layout).await {
         Ok(proxy) => Some(proxy),
         Err(err) => {
@@ -164,6 +174,7 @@ pub(crate) async fn run(args: StartArgs) -> Result<()> {
     let mut control_server = match spawn_control_server(
         layout.clone(),
         Arc::clone(&state),
+        Arc::clone(&health),
         event_tx.clone(),
         Arc::clone(&planned_exits),
         rust_log.clone(),
@@ -531,6 +542,17 @@ struct ControlServerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+struct ControlContext {
+    layout: AssetsLayout,
+    state: Arc<Mutex<State>>,
+    health: Arc<Mutex<SseHealth>>,
+    event_tx: UnboundedSender<RunEvent>,
+    planned_exits: Arc<Mutex<HashSet<(String, u32)>>>,
+    asset_mutation_lock: Mutex<()>,
+    default_rust_log: String,
+    seed: Arc<str>,
+}
+
 impl ControlServerHandle {
     async fn shutdown(self) {
         self.shutdown.store(true, Ordering::SeqCst);
@@ -588,6 +610,7 @@ fn spawn_exit_watchers(processes: Vec<RunningProcess>, tx: UnboundedSender<RunEv
 async fn spawn_control_server(
     layout: AssetsLayout,
     state: Arc<Mutex<State>>,
+    health: Arc<Mutex<SseHealth>>,
     event_tx: UnboundedSender<RunEvent>,
     planned_exits: Arc<Mutex<HashSet<(String, u32)>>>,
     rust_log: String,
@@ -606,6 +629,16 @@ async fn spawn_control_server(
     }
 
     let listener = UnixListener::bind(&socket_path)?;
+    let context = Arc::new(ControlContext {
+        layout,
+        state,
+        health,
+        event_tx,
+        planned_exits,
+        asset_mutation_lock: Mutex::new(()),
+        default_rust_log: rust_log,
+        seed,
+    });
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_loop = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {
@@ -624,23 +657,9 @@ async fn spawn_control_server(
                 }
                 Err(_) => continue,
             };
-            let layout = layout.clone();
-            let state = Arc::clone(&state);
-            let event_tx = event_tx.clone();
-            let planned_exits = Arc::clone(&planned_exits);
-            let rust_log = rust_log.clone();
-            let seed = Arc::clone(&seed);
+            let context = Arc::clone(&context);
             tokio::spawn(async move {
-                handle_control_stream(
-                    stream,
-                    layout,
-                    state,
-                    event_tx,
-                    planned_exits,
-                    rust_log,
-                    seed,
-                )
-                .await;
+                handle_control_stream(stream, context).await;
             });
         }
 
@@ -650,30 +669,11 @@ async fn spawn_control_server(
     Ok(ControlServerHandle { shutdown, task })
 }
 
-async fn handle_control_stream(
-    mut stream: tokio::net::UnixStream,
-    layout: AssetsLayout,
-    state: Arc<Mutex<State>>,
-    event_tx: UnboundedSender<RunEvent>,
-    planned_exits: Arc<Mutex<HashSet<(String, u32)>>>,
-    default_rust_log: String,
-    seed: Arc<str>,
-) {
+async fn handle_control_stream(mut stream: tokio::net::UnixStream, context: Arc<ControlContext>) {
     let mut request_bytes = Vec::new();
     let response = match stream.read_to_end(&mut request_bytes).await {
         Ok(_) => match serde_json::from_slice::<ControlRequest>(&request_bytes) {
-            Ok(request) => {
-                handle_control_request(
-                    &layout,
-                    &state,
-                    &event_tx,
-                    &planned_exits,
-                    &default_rust_log,
-                    &seed,
-                    request,
-                )
-                .await
-            }
+            Ok(request) => handle_control_request(&context, request).await,
             Err(err) => ControlResponse::Error {
                 error: format!("invalid control request: {}", err),
             },
@@ -695,17 +695,12 @@ async fn handle_control_stream(
 }
 
 async fn handle_control_request(
-    layout: &AssetsLayout,
-    state: &Arc<Mutex<State>>,
-    event_tx: &UnboundedSender<RunEvent>,
-    planned_exits: &Arc<Mutex<HashSet<(String, u32)>>>,
-    default_rust_log: &str,
-    seed: &Arc<str>,
+    context: &ControlContext,
     request: ControlRequest,
 ) -> ControlResponse {
     match request {
         ControlRequest::RuntimeStatus => {
-            let state = state.lock().await;
+            let state = context.state.lock().await;
             ControlResponse::Ok {
                 result: ControlResult::RuntimeStatus {
                     running_node_ids: running_node_ids(&state),
@@ -720,7 +715,8 @@ async fn handle_control_request(
             restart_sidecars,
             rust_log,
         } => {
-            match assets::ensure_consensus_keys(layout, Arc::clone(seed)).await {
+            let _asset_mutation_guard = context.asset_mutation_lock.lock().await;
+            match assets::ensure_consensus_keys(&context.layout, Arc::clone(&context.seed)).await {
                 Ok(restored) => {
                     if restored > 0 {
                         println!("recreated consensus keys for {} node(s)", restored);
@@ -734,7 +730,7 @@ async fn handle_control_request(
             }
 
             let stage = assets::stage_protocol(
-                layout,
+                &context.layout,
                 &StageProtocolOptions {
                     asset_name,
                     protocol_version,
@@ -753,20 +749,20 @@ async fn handle_control_request(
 
             let mut restarted_sidecars = Vec::new();
             if restart_sidecars {
-                let mut state = state.lock().await;
+                let mut state = context.state.lock().await;
                 let planned = sidecar_exit_keys(&state);
                 if !planned.is_empty() {
-                    let mut planned_exits = planned_exits.lock().await;
+                    let mut planned_exits = context.planned_exits.lock().await;
                     planned_exits.extend(planned);
                 }
 
-                let rust_log = rust_log.unwrap_or_else(|| default_rust_log.to_string());
-                match process::restart_sidecars(layout, &mut state, &rust_log).await {
+                let rust_log = rust_log.unwrap_or_else(|| context.default_rust_log.clone());
+                match process::restart_sidecars(&context.layout, &mut state, &rust_log).await {
                     Ok(restarted) => {
                         for proc in &restarted {
                             restarted_sidecars.push(proc.record.node_id);
                         }
-                        spawn_exit_watchers(restarted, event_tx.clone());
+                        spawn_exit_watchers(restarted, context.event_tx.clone());
                     }
                     Err(err) => {
                         return ControlResponse::Error {
@@ -784,6 +780,90 @@ async fn handle_control_request(
                 },
             }
         }
+        ControlRequest::AddNodes { count } => {
+            let _asset_mutation_guard = context.asset_mutation_lock.lock().await;
+            let added = match assets::add_nodes(
+                &context.layout,
+                &AddNodesOptions {
+                    count,
+                    seed: Arc::clone(&context.seed),
+                },
+            )
+            .await
+            {
+                Ok(added) => added,
+                Err(err) => {
+                    return ControlResponse::Error {
+                        error: err.to_string(),
+                    };
+                }
+            };
+
+            let started = {
+                let mut state = context.state.lock().await;
+                process::start_added_nodes(
+                    &context.layout,
+                    &mut state,
+                    &added.added_node_ids,
+                    added.total_nodes,
+                    &context.default_rust_log,
+                )
+                .await
+            };
+            let started = match started {
+                Ok(started) => started,
+                Err(err) => {
+                    let error =
+                        rollback_added_nodes_after_start_error(&context.layout, &added, err).await;
+                    return ControlResponse::Error { error };
+                }
+            };
+            let process_ids = started
+                .iter()
+                .map(|proc| proc.record.id.clone())
+                .collect::<Vec<_>>();
+            let started_processes = started.len() as u32;
+            let details = format_network_details(&context.layout, &started).await;
+            println!(
+                "{} added {} node(s) through control plane",
+                timestamp_prefix(),
+                added.added_node_ids.len()
+            );
+            println!("{}", details);
+            register_expected_sse_nodes(&context.health, &added.added_node_ids).await;
+            spawn_sse_listeners(
+                context.layout.clone(),
+                &added.added_node_ids,
+                Arc::clone(&context.health),
+                Arc::clone(&context.state),
+            )
+            .await;
+            spawn_pid_sync_tasks_for_ids(Arc::clone(&context.state), &process_ids).await;
+            spawn_reactor_state_pollers(&added.added_node_ids);
+            spawn_exit_watchers(started, context.event_tx.clone());
+
+            ControlResponse::Ok {
+                result: ControlResult::AddNodes {
+                    added_node_ids: added.added_node_ids,
+                    total_nodes: added.total_nodes,
+                    started_processes,
+                },
+            }
+        }
+    }
+}
+
+async fn rollback_added_nodes_after_start_error(
+    layout: &AssetsLayout,
+    added: &assets::AddNodesResult,
+    err: anyhow::Error,
+) -> String {
+    match assets::rollback_added_nodes(layout, &added.added_node_ids).await {
+        Ok(()) => err.to_string(),
+        Err(rollback_err) => format!(
+            "{}; failed to roll back added node assets: {}",
+            err, rollback_err
+        ),
     }
 }
 
@@ -840,6 +920,13 @@ impl SseHealth {
     }
 }
 
+async fn register_expected_sse_nodes(health: &Arc<Mutex<SseHealth>>, node_ids: &[u32]) {
+    let mut state = health.lock().await;
+    for node_id in node_ids {
+        state.expected_nodes.insert(*node_id);
+    }
+}
+
 async fn should_log_primary(node_id: u32, health: &Arc<Mutex<SseHealth>>) -> bool {
     if node_id != 1 {
         return false;
@@ -884,6 +971,74 @@ async fn spawn_sse_listeners(
             run_sse_listener(node_id, endpoint, health, state, layout).await;
         });
     }
+}
+
+fn spawn_reactor_state_pollers(node_ids: &[u32]) {
+    for node_id in node_ids {
+        let node_id = *node_id;
+        tokio::spawn(async move {
+            run_reactor_state_poller(node_id).await;
+        });
+    }
+}
+
+async fn run_reactor_state_poller(node_id: u32) {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(REACTOR_STATE_POLL_INTERVAL)
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to create reactor state poller for node-{}: {}",
+                node_id, err
+            );
+            return;
+        }
+    };
+    let url = format!("{}/status", assets::rest_endpoint(node_id));
+    let mut last_state = None;
+    let mut interval = tokio::time::interval(REACTOR_STATE_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        if let Ok(status) = fetch_reactor_status(&client, &url).await
+            && let Some(current_state) = reactor_state_from_status_payload(&status)
+            && last_state.as_deref() != Some(current_state.as_str())
+        {
+            let prefix = timestamp_prefix();
+            match last_state.replace(current_state.clone()) {
+                Some(previous_state) => println!(
+                    "{} node-{} reactor state: {} -> {}",
+                    prefix, node_id, previous_state, current_state
+                ),
+                None => println!(
+                    "{} node-{} reactor state: {}",
+                    prefix, node_id, current_state
+                ),
+            }
+        }
+    }
+}
+
+async fn fetch_reactor_status(client: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
+    Ok(client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?)
+}
+
+fn reactor_state_from_status_payload(status: &serde_json::Value) -> Option<String> {
+    status
+        .get("reactor_state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 async fn run_sse_listener(
@@ -1303,7 +1458,10 @@ fn is_pid_running(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SEED, format_cspr_u512, format_message_payload, spawn_control_server};
+    use super::{
+        DEFAULT_SEED, SseHealth, format_cspr_u512, format_message_payload,
+        reactor_state_from_status_payload, spawn_control_server,
+    };
     use crate::assets::{self, CustomAssetInstallOptions};
     use crate::control::{ControlRequest, ControlResponse, ControlResult, send_request};
     use crate::state::{ProcessGroup, ProcessKind, ProcessRecord, ProcessStatus, State};
@@ -1317,8 +1475,11 @@ mod tests {
     use std::sync::{Arc, MutexGuard};
     use std::time::Duration;
     use tokio::fs as tokio_fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::Mutex as TokioMutex;
     use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::JoinHandle;
 
     const TEST_HOOK_FILE_MODE: u32 = 0o755;
 
@@ -1445,6 +1606,26 @@ rewards_handling = { type = 'standard' }
         assets::custom_assets_root().unwrap().join(name)
     }
 
+    async fn spawn_test_status_server() -> Option<JoinHandle<()>> {
+        let listener = TcpListener::bind("127.0.0.1:14101").await.ok()?;
+        Some(tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let body = r#"{"last_added_block_info":{"hash":"test-trusted-hash"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        }))
+    }
+
     async fn create_test_network_layout(
         root: &std::path::Path,
         network_name: &str,
@@ -1471,12 +1652,52 @@ rewards_handling = { type = 'standard' }
         tokio_fs::create_dir_all(layout.net_dir().join("chainspec"))
             .await
             .unwrap();
+        create_fake_binary(
+            &layout.node_bin_dir(1).join(&version_fs).join("casper-node"),
+            "casper-node",
+        )
+        .await;
+        create_fake_binary(
+            &layout
+                .node_bin_dir(1)
+                .join(&version_fs)
+                .join("casper-sidecar"),
+            "casper-sidecar",
+        )
+        .await;
         tokio_fs::write(
             layout
                 .node_config_root(1)
                 .join(&version_fs)
                 .join("config.toml"),
-            "[logging]\nformat = \"text\"\n",
+            "\
+[logging]
+format = \"text\"
+
+[consensus]
+secret_key_path = \"old.pem\"
+
+[network]
+bind_address = \"0.0.0.0:1\"
+known_addresses = []
+
+[storage]
+path = \"old-storage\"
+
+[rest_server]
+address = \"0.0.0.0:2\"
+
+[event_stream_server]
+address = \"0.0.0.0:3\"
+
+[diagnostics_port]
+socket_path = \"old.sock\"
+
+[binary_port_server]
+address = \"0.0.0.0:4\"
+allow_request_get_trie = false
+allow_request_speculative_exec = false
+",
         )
         .await
         .unwrap();
@@ -1486,6 +1707,59 @@ rewards_handling = { type = 'standard' }
                 .join(&version_fs)
                 .join("chainspec.toml"),
             "",
+        )
+        .await
+        .unwrap();
+        tokio_fs::write(
+            layout
+                .node_config_root(1)
+                .join(&version_fs)
+                .join("accounts.toml"),
+            "",
+        )
+        .await
+        .unwrap();
+        tokio_fs::write(
+            layout
+                .node_config_root(1)
+                .join(&version_fs)
+                .join("sidecar.toml"),
+            "\
+[rpc_server.main_server]
+ip_address = \"127.0.0.1\"
+port = 1
+
+[rpc_server.node_client]
+ip_address = \"127.0.0.1\"
+port = 2
+",
+        )
+        .await
+        .unwrap();
+        tokio_fs::write(
+            layout
+                .node_config_root(1)
+                .join("casper-node-launcher-state.toml"),
+            format!(
+                "mode = \"RunNodeAsValidator\"\nversion = \"{}\"\nbinary_path = \"{}\"\nconfig_path = \"{}\"\n",
+                current_version,
+                layout
+                    .node_bin_dir(1)
+                    .join(&version_fs)
+                    .join("casper-node")
+                    .display(),
+                layout
+                    .node_config_root(1)
+                    .join(&version_fs)
+                    .join("config.toml")
+                    .display()
+            ),
+        )
+        .await
+        .unwrap();
+        tokio_fs::write(
+            layout.net_dir().join("derived-accounts.csv"),
+            "kind,name,key_type,derivation,path,account_hash,balance\n",
         )
         .await
         .unwrap();
@@ -1555,6 +1829,22 @@ rewards_handling = { type = 'standard' }
         assert_eq!(format_message_payload(&payload), "\"hello\"");
     }
 
+    #[test]
+    fn reactor_state_from_status_payload_reads_status_field() {
+        assert_eq!(
+            reactor_state_from_status_payload(&serde_json::json!({"reactor_state": "CatchUp"})),
+            Some("CatchUp".to_string())
+        );
+        assert_eq!(
+            reactor_state_from_status_payload(&serde_json::json!({"reactor_state": null})),
+            None
+        );
+        assert_eq!(
+            reactor_state_from_status_payload(&serde_json::json!({"status": "CatchUp"})),
+            None
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn control_server_handles_runtime_status_while_stage_protocol_is_in_flight() {
         let env = TestDataEnv::new();
@@ -1567,11 +1857,16 @@ rewards_handling = { type = 'standard' }
         .await;
 
         let state = Arc::new(TokioMutex::new(test_state(&layout).await));
+        let health = Arc::new(TokioMutex::new(SseHealth::new(
+            vec![1],
+            "test details".to_string(),
+        )));
         let (event_tx, _event_rx) = unbounded_channel();
         let planned_exits = Arc::new(TokioMutex::new(HashSet::new()));
         let control_server = spawn_control_server(
             layout.clone(),
             Arc::clone(&state),
+            health,
             event_tx,
             planned_exits,
             "info".to_string(),
@@ -1650,5 +1945,78 @@ rewards_handling = { type = 'standard' }
         }
 
         control_server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_server_add_nodes_starts_and_tracks_new_processes() {
+        let env = TestDataEnv::new();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0").await;
+        let status_server = spawn_test_status_server().await;
+        let state = Arc::new(TokioMutex::new(test_state(&layout).await));
+        let health = Arc::new(TokioMutex::new(SseHealth::new(
+            vec![1],
+            "test details".to_string(),
+        )));
+        let (event_tx, _event_rx) = unbounded_channel();
+        let planned_exits = Arc::new(TokioMutex::new(HashSet::new()));
+        let control_server = spawn_control_server(
+            layout.clone(),
+            Arc::clone(&state),
+            Arc::clone(&health),
+            event_tx,
+            planned_exits,
+            "info".to_string(),
+            Arc::<str>::from(DEFAULT_SEED),
+        )
+        .await
+        .unwrap();
+
+        let response = send_request(
+            &layout.control_socket_path(),
+            &ControlRequest::AddNodes { count: 1 },
+        )
+        .await
+        .unwrap();
+
+        match response {
+            ControlResponse::Ok {
+                result:
+                    ControlResult::AddNodes {
+                        added_node_ids,
+                        total_nodes,
+                        started_processes,
+                    },
+            } => {
+                assert_eq!(added_node_ids, vec![2]);
+                assert_eq!(total_nodes, 2);
+                assert_eq!(started_processes, 2);
+            }
+            other => panic!("unexpected add_nodes response: {other:?}"),
+        }
+
+        let state = state.lock().await;
+        assert!(
+            state
+                .processes
+                .iter()
+                .any(|record| record.id == "node-2" && matches!(record.kind, ProcessKind::Node))
+        );
+        assert!(
+            state
+                .processes
+                .iter()
+                .any(|record| record.id == "sidecar-2"
+                    && matches!(record.kind, ProcessKind::Sidecar))
+        );
+        drop(state);
+
+        let health = health.lock().await;
+        assert!(health.expected_nodes.contains(&2));
+        drop(health);
+
+        control_server.shutdown().await;
+        if let Some(status_server) = status_server {
+            status_server.abort();
+        }
     }
 }

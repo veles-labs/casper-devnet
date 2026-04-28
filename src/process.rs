@@ -53,20 +53,107 @@ pub async fn start(
     let mut started = Vec::new();
     for node_id in node_ids {
         if node_id > total_nodes {
-            return Err(anyhow!(
-                "node {} exceeds total nodes {}",
-                node_id,
-                total_nodes
-            ));
+            let err = anyhow!("node {} exceeds total nodes {}", node_id, total_nodes);
+            return Err(cleanup_started_processes(err, started).await);
         }
-        let mut records = start_node(layout, node_id, total_nodes, &plan.rust_log).await?;
-        started.append(&mut records);
+        match start_node(layout, node_id, total_nodes, &plan.rust_log).await {
+            Ok(mut records) => started.append(&mut records),
+            Err(err) => return Err(cleanup_started_processes(err, started).await),
+        }
     }
 
     state.processes = started.iter().map(|proc| proc.record.clone()).collect();
-    state.touch().await?;
+    if let Err(err) = state.touch().await {
+        state.processes.clear();
+        return Err(cleanup_started_processes(err, started).await);
+    }
 
     Ok(started)
+}
+
+async fn cleanup_started_processes(
+    err: anyhow::Error,
+    started: Vec<RunningProcess>,
+) -> anyhow::Error {
+    let cleanup_errors = stop_started_processes(started).await;
+    if cleanup_errors.is_empty() {
+        err
+    } else {
+        anyhow!(
+            "{}; failed to clean up partially started processes: {}",
+            err,
+            cleanup_errors.join("; ")
+        )
+    }
+}
+
+async fn stop_started_processes(processes: Vec<RunningProcess>) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for running in &processes {
+        if let Some(shutdown) = &running.record.shutdown_handle {
+            shutdown.store(true, Ordering::SeqCst);
+        }
+
+        let Some(pid) = current_pid(&running.record) else {
+            continue;
+        };
+        if let Err(err) = send_signal(pid as i32, Signal::SIGTERM) {
+            errors.push(format!(
+                "failed to send {} to {} (pid {}): {}",
+                signal_name(Signal::SIGTERM),
+                running.record.id,
+                pid,
+                err
+            ));
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for running in &processes {
+        let Some(pid) = current_pid(&running.record) else {
+            continue;
+        };
+        while process_alive(pid as i32) && Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+        }
+        if process_alive(pid as i32)
+            && let Err(err) = send_signal(pid as i32, Signal::SIGKILL)
+        {
+            errors.push(format!(
+                "failed to send {} to {} (pid {}): {}",
+                signal_name(Signal::SIGKILL),
+                running.record.id,
+                pid,
+                err
+            ));
+        }
+    }
+
+    for running in processes {
+        match running.handle {
+            ProcessHandle::Child(mut child) => {
+                if tokio::time::timeout(Duration::from_secs(1), child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
+            ProcessHandle::Task(mut handle) => {
+                tokio::select! {
+                    _ = &mut handle => {}
+                    _ = sleep(Duration::from_secs(1)) => {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                }
+            }
+        }
+    }
+
+    errors
 }
 
 /// Stop all running processes tracked in state.
@@ -234,6 +321,56 @@ pub async fn restart_sidecars(
     }
 }
 
+/// Start newly added nodes and track their node/sidecar processes in state.
+pub async fn start_added_nodes(
+    layout: &AssetsLayout,
+    state: &mut State,
+    node_ids: &[u32],
+    total_nodes: u32,
+    rust_log: &str,
+) -> Result<Vec<RunningProcess>> {
+    let mut started = Vec::new();
+
+    for node_id in node_ids {
+        if state.processes.iter().any(|record| {
+            record.node_id == *node_id && matches!(record.last_status, ProcessStatus::Running)
+        }) {
+            let err = anyhow!("node-{} already has running process records", node_id);
+            return Err(cleanup_started_processes(err, started).await);
+        }
+
+        match start_node(layout, *node_id, total_nodes, rust_log).await {
+            Ok(mut records) => started.append(&mut records),
+            Err(err) => return Err(cleanup_started_processes(err, started).await),
+        }
+    }
+
+    let process_ids = started
+        .iter()
+        .map(|proc| proc.record.id.clone())
+        .collect::<Vec<_>>();
+    for running in &started {
+        if let Some(slot) = state.processes.iter_mut().find(|record| {
+            record.node_id == running.record.node_id
+                && std::mem::discriminant(&record.kind)
+                    == std::mem::discriminant(&running.record.kind)
+        }) {
+            *slot = running.record.clone();
+        } else {
+            state.processes.push(running.record.clone());
+        }
+    }
+
+    if let Err(err) = state.touch().await {
+        state
+            .processes
+            .retain(|record| !process_ids.iter().any(|id| id == &record.id));
+        return Err(cleanup_started_processes(err, started).await);
+    }
+
+    Ok(started)
+}
+
 /// Start a single node and optional sidecar.
 async fn start_node(
     layout: &AssetsLayout,
@@ -246,8 +383,10 @@ async fn start_node(
     let node_record = spawn_node(layout, node_id, total_nodes, rust_log).await?;
     records.push(node_record);
 
-    if let Some(sidecar_record) = spawn_sidecar(layout, node_id, total_nodes, rust_log).await? {
-        records.push(sidecar_record);
+    match spawn_sidecar(layout, node_id, total_nodes, rust_log).await {
+        Ok(Some(sidecar_record)) => records.push(sidecar_record),
+        Ok(None) => {}
+        Err(err) => return Err(cleanup_started_processes(err, records).await),
     }
 
     Ok(records)

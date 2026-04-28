@@ -1,8 +1,11 @@
 use self::args_parser::parse_session_args;
-use crate::assets::{self, AssetsLayout, SetupOptions, StageProtocolOptions};
+use crate::assets::{self, AddNodesOptions, AssetsLayout, SetupOptions, StageProtocolOptions};
 use crate::control::{ControlRequest, ControlResponse, ControlResult, send_request};
 use crate::process::{self, StartPlan};
-use crate::state::{ProcessKind, ProcessStatus, STATE_FILE_NAME, State, spawn_pid_sync_tasks};
+use crate::state::{
+    ProcessKind, ProcessStatus, STATE_FILE_NAME, State, spawn_pid_sync_tasks,
+    spawn_pid_sync_tasks_for_ids,
+};
 use anyhow::{Context, Result, anyhow};
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
@@ -33,7 +36,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1133,13 +1136,14 @@ struct NetworkManager {
 struct ManagedNetwork {
     layout: AssetsLayout,
     state: Arc<Mutex<State>>,
-    node_count: u32,
+    node_count: AtomicU32,
     rust_log: String,
     seed: Arc<str>,
     sse_store: Arc<SseStore>,
     last_block_hook_hash: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
     control_shutdown: Arc<AtomicBool>,
+    asset_mutation_lock: Mutex<()>,
     sse_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     control_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -1204,7 +1208,7 @@ impl NetworkManager {
             {
                 return Ok(SpawnNetworkResponse {
                     network_name,
-                    node_count: existing.node_count,
+                    node_count: existing.node_count.load(Ordering::SeqCst),
                     managed: true,
                     already_running: true,
                     forced_setup: false,
@@ -1305,13 +1309,14 @@ impl NetworkManager {
         let managed = Arc::new(ManagedNetwork {
             layout: layout.clone(),
             state: Arc::new(Mutex::new(state)),
-            node_count,
+            node_count: AtomicU32::new(node_count),
             rust_log,
             seed,
             sse_store: Arc::new(SseStore::new(DEFAULT_SSE_HISTORY_CAPACITY)),
             last_block_hook_hash: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             control_shutdown: Arc::new(AtomicBool::new(false)),
+            asset_mutation_lock: Mutex::new(()),
             sse_tasks: Mutex::new(Vec::new()),
             control_task: Mutex::new(None),
         });
@@ -1339,7 +1344,7 @@ impl NetworkManager {
 
     async fn spawn_sse_collectors(&self, network: &Arc<ManagedNetwork>) {
         let mut tasks = Vec::new();
-        for node_id in 1..=network.node_count {
+        for node_id in 1..=network.node_count.load(Ordering::SeqCst) {
             let endpoint = assets::sse_endpoint(node_id);
             let network = Arc::clone(network);
             let task = tokio::spawn(async move {
@@ -1441,6 +1446,10 @@ impl NetworkManager {
                         "unexpected runtime_status response from {}",
                         socket_path.display()
                     )),
+                    ControlResult::AddNodes { .. } => Err(anyhow!(
+                        "unexpected add_nodes response from {}",
+                        socket_path.display()
+                    )),
                 },
                 Ok(ControlResponse::Error { error }) => Err(anyhow!(error)),
                 Err(err) => Err(anyhow!(
@@ -1499,7 +1508,7 @@ impl NetworkManager {
                         return Ok(WaitReadyResponse {
                             network_name: network_name.to_string(),
                             ready: true,
-                            node_count: network.node_count,
+                            node_count: network.node_count.load(Ordering::SeqCst),
                             rest: rest_by_node,
                             last_block_height: state.last_block_height,
                         });
@@ -1511,7 +1520,7 @@ impl NetworkManager {
                 return Ok(WaitReadyResponse {
                     network_name: network_name.to_string(),
                     ready: false,
-                    node_count: network.node_count,
+                    node_count: network.node_count.load(Ordering::SeqCst),
                     rest: HashMap::new(),
                     last_block_height: None,
                 });
@@ -1561,7 +1570,7 @@ impl NetworkManager {
                     discovered: true,
                     managed: true,
                     running: network.is_running().await,
-                    node_count: Some(network.node_count),
+                    node_count: Some(network.node_count.load(Ordering::SeqCst)),
                 });
             } else {
                 let layout = AssetsLayout::new(self.assets_root.clone(), name.clone());
@@ -1582,7 +1591,7 @@ impl NetworkManager {
                     discovered: false,
                     managed: true,
                     running: network.is_running().await,
-                    node_count: Some(network.node_count),
+                    node_count: Some(network.node_count.load(Ordering::SeqCst)),
                 });
             }
         }
@@ -1774,6 +1783,21 @@ async fn handle_managed_control_stream(
     let _ = stream.shutdown().await;
 }
 
+async fn spawn_added_sse_collectors(network: &Arc<ManagedNetwork>, node_ids: &[u32]) {
+    let mut tasks = Vec::new();
+    for node_id in node_ids {
+        let node_id = *node_id;
+        let endpoint = assets::sse_endpoint(node_id);
+        let network = Arc::clone(network);
+        let task = tokio::spawn(async move {
+            run_sse_listener(network, node_id, endpoint).await;
+        });
+        tasks.push(task);
+    }
+    let mut guard = network.sse_tasks.lock().await;
+    guard.extend(tasks);
+}
+
 async fn handle_managed_control_request(
     network: &Arc<ManagedNetwork>,
     request: ControlRequest,
@@ -1795,6 +1819,7 @@ async fn handle_managed_control_request(
             restart_sidecars,
             rust_log,
         } => {
+            let _asset_mutation_guard = network.asset_mutation_lock.lock().await;
             if let Err(err) =
                 assets::ensure_consensus_keys(&network.layout, Arc::clone(&network.seed)).await
             {
@@ -1847,6 +1872,77 @@ async fn handle_managed_control_request(
                 },
             }
         }
+        ControlRequest::AddNodes { count } => {
+            let _asset_mutation_guard = network.asset_mutation_lock.lock().await;
+            let added = match assets::add_nodes(
+                &network.layout,
+                &AddNodesOptions {
+                    count,
+                    seed: Arc::clone(&network.seed),
+                },
+            )
+            .await
+            {
+                Ok(added) => added,
+                Err(err) => {
+                    return ControlResponse::Error {
+                        error: err.to_string(),
+                    };
+                }
+            };
+
+            let started = {
+                let mut state = network.state.lock().await;
+                process::start_added_nodes(
+                    &network.layout,
+                    &mut state,
+                    &added.added_node_ids,
+                    added.total_nodes,
+                    &network.rust_log,
+                )
+                .await
+            };
+            let started = match started {
+                Ok(started) => started,
+                Err(err) => {
+                    let error =
+                        rollback_added_nodes_after_start_error(&network.layout, &added, err).await;
+                    return ControlResponse::Error { error };
+                }
+            };
+            let process_ids = started
+                .iter()
+                .map(|proc| proc.record.id.clone())
+                .collect::<Vec<_>>();
+            let started_processes = started.len() as u32;
+            network
+                .node_count
+                .store(added.total_nodes, Ordering::SeqCst);
+            spawn_added_sse_collectors(network, &added.added_node_ids).await;
+            spawn_pid_sync_tasks_for_ids(Arc::clone(&network.state), &process_ids).await;
+
+            ControlResponse::Ok {
+                result: ControlResult::AddNodes {
+                    added_node_ids: added.added_node_ids,
+                    total_nodes: added.total_nodes,
+                    started_processes,
+                },
+            }
+        }
+    }
+}
+
+async fn rollback_added_nodes_after_start_error(
+    layout: &AssetsLayout,
+    added: &assets::AddNodesResult,
+    err: anyhow::Error,
+) -> String {
+    match assets::rollback_added_nodes(layout, &added.added_node_ids).await {
+        Ok(()) => err.to_string(),
+        Err(rollback_err) => format!(
+            "{}; failed to roll back added node assets: {}",
+            err, rollback_err
+        ),
     }
 }
 

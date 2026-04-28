@@ -242,6 +242,25 @@ When the network is actively managed by `casper-devnet`, this command prefers th
 socket to discover currently running nodes before choosing an endpoint. If that live query is
 unavailable or unresponsive, it falls back to `state.json` instead of hanging indefinitely.
 
+Add managed non-genesis nodes to a running network:
+
+```bash
+casper-devnet network casper-dev add-nodes --count 2
+```
+
+`network <name> add-nodes` is live-only: it requires the foreground `start` or MCP-managed process
+to be running so it can prepare assets, spawn the new node and sidecar processes, track them in
+`state.json`, and stop them during normal shutdown. During expansion, the manager reads a recent
+trusted hash from an existing node's REST `/status`, writes it to `[node].trusted_hash`, and uses
+the active config's joining sync mode (`[node].sync_handling = "ttl"`, or
+`sync_to_genesis = false` for legacy configs).
+Added nodes inherit only the currently active protocol version. If a future protocol version was
+already staged, run `stage-protocol` again after adding nodes so the new nodes receive that staged
+version too.
+The foreground `start` manager logs the full endpoint summary for nodes added through the control
+plane and prints node reactor state changes observed by polling each node's REST `/status` every
+500ms.
+
 If a managed process is running (from `start` or MCP), staging runs in live mode and restarts
 sidecars. Otherwise, staging runs in offline mode and only writes versioned
 `nodes/node-*/bin/<version>` and `nodes/node-*/config/<version>` assets.
@@ -403,6 +422,11 @@ Exactly one of `--secret-key`, `--public-key`, or `--account-hash` must be provi
 When no protocol version is provided, this prints the network root directory. When a protocol
 version is provided, it prints one staged config directory per known node, one path per line.
 
+`casper-devnet network <network> add-nodes` flags:
+
+- `--count <n>`: Number of managed non-genesis nodes to add to the live network
+- `--net-path <path>`: Override network runtime root (same behavior as `start`)
+
 `casper-devnet network <network> port` flags:
 
 - `--rpc`: Print one random running node RPC URL
@@ -413,6 +437,11 @@ version is provided, it prints one staged config directory per known node, one p
 - `--net-path <path>`: Override network runtime root (same behavior as `start`)
 
 Exactly one of `--rpc`, `--sse`, `--rest`, `--binary`, or `--diagnostics` must be provided.
+
+`casper-devnet network <network> status` flags:
+
+- `--node-id <id>`: Node id whose REST `/status` endpoint should be queried
+- `--net-path <path>`: Override network runtime root (same behavior as `start`)
 
 `casper-devnet network <network> is-ready` flags:
 

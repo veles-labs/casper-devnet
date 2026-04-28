@@ -15,6 +15,9 @@ pub enum ControlRequest {
         restart_sidecars: bool,
         rust_log: Option<String>,
     },
+    AddNodes {
+        count: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +38,11 @@ pub enum ControlResult {
         live_mode: bool,
         staged_nodes: u32,
         restarted_sidecars: Vec<u32>,
+    },
+    AddNodes {
+        added_node_ids: Vec<u32>,
+        total_nodes: u32,
+        started_processes: u32,
     },
 }
 

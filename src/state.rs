@@ -139,60 +139,84 @@ pub async fn spawn_pid_sync_tasks(state: Arc<Mutex<State>>) {
     };
 
     for (process_id, pid_handle) in tracked {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut last_seen = Some(u32::MAX);
-            loop {
-                let current_pid = {
-                    let pid = pid_handle.load(Ordering::SeqCst);
-                    (pid != 0).then_some(pid)
+        spawn_pid_sync_task(Arc::clone(&state), process_id, pid_handle);
+    }
+}
+
+pub async fn spawn_pid_sync_tasks_for_ids(state: Arc<Mutex<State>>, process_ids: &[String]) {
+    let tracked = {
+        let state = state.lock().await;
+        state
+            .processes
+            .iter()
+            .filter(|process| process_ids.iter().any(|id| id == &process.id))
+            .filter_map(|process| {
+                process
+                    .pid_handle
+                    .as_ref()
+                    .map(|handle| (process.id.clone(), Arc::clone(handle)))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (process_id, pid_handle) in tracked {
+        spawn_pid_sync_task(Arc::clone(&state), process_id, pid_handle);
+    }
+}
+
+fn spawn_pid_sync_task(state: Arc<Mutex<State>>, process_id: String, pid_handle: Arc<AtomicU32>) {
+    tokio::spawn(async move {
+        let mut last_seen = Some(u32::MAX);
+        loop {
+            let current_pid = {
+                let pid = pid_handle.load(Ordering::SeqCst);
+                (pid != 0).then_some(pid)
+            };
+            let should_exit;
+
+            if current_pid != last_seen {
+                last_seen = current_pid;
+                let mut state = state.lock().await;
+                let Some(process) = state
+                    .processes
+                    .iter_mut()
+                    .find(|process| process.id == process_id)
+                else {
+                    return;
                 };
-                let should_exit;
 
-                if current_pid != last_seen {
-                    last_seen = current_pid;
-                    let mut state = state.lock().await;
-                    let Some(process) = state
-                        .processes
-                        .iter_mut()
-                        .find(|process| process.id == process_id)
-                    else {
-                        return;
-                    };
+                process.pid = current_pid;
+                should_exit =
+                    !matches!(process.last_status, ProcessStatus::Running) && current_pid.is_none();
 
-                    process.pid = current_pid;
-                    should_exit = !matches!(process.last_status, ProcessStatus::Running)
-                        && current_pid.is_none();
-
-                    if let Err(error) = state.touch().await {
-                        warn!(
-                            %error,
-                            process_id,
-                            "failed to persist updated process pid"
-                        );
-                        return;
-                    }
-                } else {
-                    let state = state.lock().await;
-                    let Some(process) = state
-                        .processes
-                        .iter()
-                        .find(|process| process.id == process_id)
-                    else {
-                        return;
-                    };
-                    should_exit = !matches!(process.last_status, ProcessStatus::Running)
-                        && current_pid.is_none();
-                }
-
-                if should_exit {
+                if let Err(error) = state.touch().await {
+                    warn!(
+                        %error,
+                        process_id,
+                        "failed to persist updated process pid"
+                    );
                     return;
                 }
-
-                sleep(Duration::from_millis(100)).await;
+            } else {
+                let state = state.lock().await;
+                let Some(process) = state
+                    .processes
+                    .iter()
+                    .find(|process| process.id == process_id)
+                else {
+                    return;
+                };
+                should_exit =
+                    !matches!(process.last_status, ProcessStatus::Running) && current_pid.is_none();
             }
-        });
-    }
+
+            if should_exit {
+                return;
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+    });
 }
 
 async fn ensure_parent(path: &Path) -> Result<()> {
