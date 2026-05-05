@@ -18,6 +18,7 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-too
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY xtask ./xtask
+COPY examples ./examples
 COPY src ./src
 
 RUN cargo build --release --locked
