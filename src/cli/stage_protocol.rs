@@ -33,6 +33,10 @@ pub(crate) struct StageProtocolArgs {
     #[arg(long)]
     activation_point: u64,
 
+    /// Chainspec override as KEY=VALUE, where VALUE is any valid TOML value.
+    #[arg(long = "chainspec-override", value_name = "KEY=VALUE")]
+    chainspec_overrides: Vec<String>,
+
     /// Override the base path for network runtime assets.
     #[arg(long, value_name = "PATH")]
     net_path: Option<PathBuf>,
@@ -97,6 +101,7 @@ pub(crate) async fn run(network_name: String, args: StageProtocolArgs) -> Result
         asset_name: None,
         protocol_version: args.protocol_version.clone(),
         activation_point: args.activation_point,
+        chainspec_overrides: args.chainspec_overrides.clone(),
         restart_sidecars: true,
         rust_log: None,
     };
@@ -170,6 +175,7 @@ pub(crate) async fn run(network_name: String, args: StageProtocolArgs) -> Result
             asset: asset_selector,
             protocol_version: args.protocol_version.clone(),
             activation_point: args.activation_point,
+            chainspec_overrides: args.chainspec_overrides.clone(),
         },
     )
     .await?;

@@ -68,6 +68,10 @@ pub(crate) struct StartArgs {
     #[arg(long)]
     protocol_version: Option<String>,
 
+    /// Chainspec override as KEY=VALUE, where VALUE is any valid TOML value.
+    #[arg(long = "chainspec-override", value_name = "KEY=VALUE")]
+    chainspec_overrides: Vec<String>,
+
     /// Number of nodes to create and start.
     #[arg(long = "node-count", aliases = ["nodes", "validators"], default_value_t = 4)]
     node_count: u32,
@@ -110,6 +114,11 @@ pub(crate) async fn run(args: StartArgs) -> Result<()> {
     let assets_path = shorten_home_path(&layout.net_dir().display().to_string());
     println!("assets path: {}", assets_path);
     let assets_exist = layout.exists().await;
+    if assets_exist && !args.force_setup && !args.chainspec_overrides.is_empty() {
+        return Err(anyhow!(
+            "--chainspec-override requires --force-setup when network assets already exist"
+        ));
+    }
     if !args.setup_only && !args.force_setup && assets_exist {
         println!("resuming network operations on {}", layout.network_name());
     }
@@ -285,6 +294,7 @@ fn setup_options(args: &StartArgs) -> Result<SetupOptions> {
         network_name: args.network_name.clone(),
         asset,
         protocol_version: args.protocol_version.clone(),
+        chainspec_overrides: args.chainspec_overrides.clone(),
         node_log_format: args.node_log_format.clone(),
         seed: Arc::clone(&args.seed),
     })
@@ -719,6 +729,7 @@ async fn handle_control_request(
             asset_name,
             protocol_version,
             activation_point,
+            chainspec_overrides,
             restart_sidecars,
             rust_log,
         } => {
@@ -754,6 +765,7 @@ async fn handle_control_request(
                     asset: asset_selector,
                     protocol_version,
                     activation_point,
+                    chainspec_overrides,
                 },
             )
             .await;
@@ -1823,6 +1835,35 @@ port = 2
         state
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_rejects_chainspec_overrides_for_existing_network_without_force_setup() {
+        let env = TestDataEnv::new();
+        let network_root = env.root().join("networks");
+        let layout = assets::AssetsLayout::new(network_root.clone(), "casper-dev".to_string());
+        tokio_fs::create_dir_all(layout.nodes_dir()).await.unwrap();
+
+        let err = super::run(super::StartArgs {
+            network_name: "casper-dev".to_string(),
+            net_path: Some(network_root),
+            asset: None,
+            custom_asset: None,
+            protocol_version: None,
+            chainspec_overrides: vec!["core.minimum_era_height=1".to_string()],
+            node_count: 4,
+            users: None,
+            delay: 3,
+            log_level: "info".to_string(),
+            node_log_format: "json".to_string(),
+            setup_only: true,
+            force_setup: false,
+            seed: Arc::from(DEFAULT_SEED),
+        })
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--force-setup"));
+    }
+
     #[test]
     fn format_cspr_u512_handles_whole_and_fractional() {
         assert_eq!(format_cspr_u512(&U512::zero()), "0");
@@ -1901,6 +1942,7 @@ port = 2
             asset_name: None,
             protocol_version: "2.0.0".to_string(),
             activation_point: 123,
+            chainspec_overrides: vec!["core.minimum_era_height=1".to_string()],
             restart_sidecars: false,
             rust_log: None,
         };
@@ -1964,6 +2006,22 @@ port = 2
             }
             other => panic!("unexpected stage_protocol response: {other:?}"),
         }
+        let staged_chainspec = tokio_fs::read_to_string(
+            layout
+                .node_config_root(1)
+                .join("2_0_0")
+                .join("chainspec.toml"),
+        )
+        .await
+        .unwrap();
+        let staged_value: toml::Value = toml::from_str(&staged_chainspec).unwrap();
+        assert_eq!(
+            staged_value
+                .get("core")
+                .and_then(|core| core.get("minimum_era_height"))
+                .and_then(toml::Value::as_integer),
+            Some(1)
+        );
 
         control_server.shutdown().await;
     }

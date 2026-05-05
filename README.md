@@ -220,11 +220,29 @@ Override the chainspec protocol version while using the selected asset files:
 casper-devnet start --asset 2.1.3 --protocol-version 2.2.0
 ```
 
+Patch chainspec values before fresh genesis setup:
+
+```bash
+casper-devnet start --force-setup \
+  --chainspec-override 'core.minimum_era_height=1' \
+  --chainspec-override 'core.test_values=[1, 10]'
+```
+
+`--chainspec-override` uses `key.path=<toml-value>` syntax and may be repeated. Quote
+values that contain shell-sensitive characters or spaces, especially arrays and strings.
+Overrides are applied before launcher defaults, so `--protocol-version`, `--delay`,
+`--network-name`, and `--node-count` still control their generated chainspec fields.
+Overrides only apply to a fresh setup; use `--force-setup` when the network already exists.
+
 Stage a protocol upgrade from a versioned or custom asset:
 
 ```bash
 casper-devnet network casper-dev stage-protocol --asset 2.1.3 --protocol-version 2.2.0 --activation-point 123
 casper-devnet network casper-dev stage-protocol --custom-asset dev --protocol-version 2.2.0 --activation-point 123
+casper-devnet network casper-dev stage-protocol --custom-asset dev \
+  --protocol-version 2.2.0 \
+  --activation-point 123 \
+  --chainspec-override 'core.minimum_era_height=1'
 ```
 
 Derive deterministic account material from a seed and BIP32 path:
@@ -331,6 +349,8 @@ casper-devnet start --setup-only
 ```
 
 Use `--setup-only` when you want to tweak chainspecs or node configs before launching.
+Use `--chainspec-override` with `--setup-only` to apply repeatable TOML value patches during
+fresh asset setup.
 
 Rebuild assets:
 
@@ -391,6 +411,7 @@ Claude CLI config example: PRs welcome.
 - `--asset <version>`: Versioned asset bundle to use from the assets store (accepts `2.1.3` or `v2.1.3`; defaults to newest bundle)
 - `--custom-asset <name>`: Custom asset under `assets/custom/<name>` to use instead of a versioned bundle
 - `--protocol-version <version>`: Override the chainspec protocol version; when omitted, `start` uses the selected asset's chainspec value
+- `--chainspec-override <key.path=value>`: Patch a generated chainspec value before genesis setup; repeatable; value must be valid TOML, for example `'core.test_values=[1, 10]'`; requires a fresh network or `--force-setup`
 - `--network-name <name>`: Network name for configs/paths (default: `casper-dev`)
 - `--net-path <path>`: Override the network runtime root (default: platform data dir `.../networks`)
 - `--node-count <n>`: Number of nodes (aliases: `--nodes`, `--validators`; default: 4)
@@ -416,6 +437,7 @@ Claude CLI config example: PRs welcome.
 - `--custom-asset <name>`: Custom asset under `assets/custom/<name>` to stage from
 - `--protocol-version <version>`: Protocol version to stage (required)
 - `--activation-point <era-id>`: Future era id for activation (required)
+- `--chainspec-override <key.path=value>`: Patch the staged chainspec before pre-stage hooks run; repeatable; value must be valid TOML, for example `'core.test_values=[1, 10]'`
 - `--net-path <path>`: Override network runtime root (same behavior as `start`)
 
 Exactly one of `[asset]`, `--asset`, or `--custom-asset` is required for staging.

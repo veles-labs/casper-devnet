@@ -17,6 +17,8 @@ pub enum ControlRequest {
         asset_name: Option<String>,
         protocol_version: String,
         activation_point: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chainspec_overrides: Vec<String>,
         restart_sidecars: bool,
         rust_log: Option<String>,
     },

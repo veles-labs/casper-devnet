@@ -1257,6 +1257,7 @@ impl NetworkManager {
                         network_name: network_name.clone(),
                         asset: asset_selector.clone(),
                         protocol_version: request.protocol_version.clone(),
+                        chainspec_overrides: Vec::new(),
                         node_log_format,
                         seed: Arc::clone(&seed),
                     },
@@ -1274,6 +1275,7 @@ impl NetworkManager {
                         network_name: network_name.clone(),
                         asset: asset_selector,
                         protocol_version: request.protocol_version.clone(),
+                        chainspec_overrides: Vec::new(),
                         node_log_format,
                         seed: Arc::clone(&seed),
                     },
@@ -1455,6 +1457,7 @@ impl NetworkManager {
                 asset_name: None,
                 protocol_version: protocol_version.to_string(),
                 activation_point,
+                chainspec_overrides: Vec::new(),
                 restart_sidecars: true,
                 rust_log: Some(network.rust_log.clone()),
             };
@@ -1504,6 +1507,7 @@ impl NetworkManager {
                 asset: asset_selector,
                 protocol_version: protocol_version.to_string(),
                 activation_point,
+                chainspec_overrides: Vec::new(),
             },
         )
         .await?;
@@ -1847,6 +1851,7 @@ async fn handle_managed_control_request(
             asset_name,
             protocol_version,
             activation_point,
+            chainspec_overrides,
             restart_sidecars,
             rust_log,
         } => {
@@ -1877,6 +1882,7 @@ async fn handle_managed_control_request(
                     asset: asset_selector,
                     protocol_version,
                     activation_point,
+                    chainspec_overrides,
                 },
             )
             .await;

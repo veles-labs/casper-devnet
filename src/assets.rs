@@ -1,3 +1,5 @@
+mod chainspec_override;
+
 use anyhow::{Result, anyhow};
 use bip32::{DerivationPath, XPrv};
 use blake2::Blake2bVar;
@@ -494,6 +496,7 @@ pub struct SetupOptions {
     pub network_name: String,
     pub asset: AssetSelector,
     pub protocol_version: Option<String>,
+    pub chainspec_overrides: Vec<String>,
     pub node_log_format: String,
     pub seed: Arc<str>,
 }
@@ -511,6 +514,7 @@ pub struct StageProtocolOptions {
     pub asset: AssetSelector,
     pub protocol_version: String,
     pub activation_point: u64,
+    pub chainspec_overrides: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -637,6 +641,7 @@ pub async fn setup_local(layout: &AssetsLayout, opts: &SetupOptions) -> Result<S
         opts.delay_seconds,
         &protocol_version_chain,
         &opts.network_name,
+        &opts.chainspec_overrides,
     )
     .await?;
 
@@ -712,6 +717,7 @@ pub async fn stage_protocol(
 
     let node_log_format = detect_current_node_log_format(layout).await?;
     let accounts_path = layout.net_dir().join("chainspec/accounts.toml");
+    let mut overwritten_builtin_paths = Vec::new();
 
     for node_id in 1..=total_nodes {
         let node_bin_version_dir = layout.node_bin_dir(node_id).join(&protocol_version_fs);
@@ -745,17 +751,27 @@ pub async fn stage_protocol(
         let network_name = layout.network_name().to_string();
         let activation_point = opts.activation_point as i64;
         let protocol_version_chain = protocol_version_chain.clone();
-        let updated_chainspec = spawn_blocking_result(move || {
-            update_chainspec_contents(
-                &staged_chainspec,
-                &protocol_version_chain,
-                &activation_point.to_string(),
-                false,
-                &network_name,
-                total_nodes,
-            )
-        })
-        .await?;
+        let chainspec_overrides = opts.chainspec_overrides.clone();
+        let (updated_chainspec, node_overwritten_builtin_paths) =
+            spawn_blocking_result(move || {
+                let applied_overrides =
+                    chainspec_override::apply(&staged_chainspec, &chainspec_overrides)?;
+                update_chainspec_contents(
+                    &applied_overrides.contents,
+                    &protocol_version_chain,
+                    &activation_point.to_string(),
+                    false,
+                    &network_name,
+                    total_nodes,
+                )
+                .map(|updated| (updated, applied_overrides.overwritten_builtin_paths))
+            })
+            .await?;
+        for path in node_overwritten_builtin_paths {
+            if !overwritten_builtin_paths.contains(&path) {
+                overwritten_builtin_paths.push(path);
+            }
+        }
         tokio_fs::write(&chainspec_dest, updated_chainspec).await?;
 
         if is_file(&accounts_path).await {
@@ -857,6 +873,12 @@ pub async fn stage_protocol(
         })
         .await?;
         tokio_fs::write(&sidecar_dest, updated_sidecar).await?;
+    }
+
+    for path in overwritten_builtin_paths {
+        eprintln!(
+            "warning: chainspec override {path} is overwritten by stage-protocol command defaults"
+        );
     }
 
     clear_post_stage_protocol_hook_state(layout, &protocol_version_chain).await?;
@@ -2205,25 +2227,34 @@ async fn setup_chainspec(
     delay_seconds: u64,
     protocol_version_chain: &str,
     network_name: &str,
+    chainspec_overrides: &[String],
 ) -> Result<()> {
     let chainspec_dest = layout.net_dir().join("chainspec/chainspec.toml");
     copy_file(chainspec_template, &chainspec_dest).await?;
 
     let activation_point = genesis_timestamp(delay_seconds)?;
     let chainspec_contents = tokio_fs::read_to_string(&chainspec_dest).await?;
+    let chainspec_overrides = chainspec_overrides.to_vec();
     let protocol_version_chain = protocol_version_chain.to_string();
     let network_name = network_name.to_string();
-    let updated = spawn_blocking_result(move || {
+    let (updated, overwritten_builtin_paths) = spawn_blocking_result(move || {
+        let applied_overrides =
+            chainspec_override::apply(&chainspec_contents, &chainspec_overrides)?;
         update_chainspec_contents(
-            &chainspec_contents,
+            &applied_overrides.contents,
             &protocol_version_chain,
             &activation_point,
             true,
             &network_name,
             total_nodes,
         )
+        .map(|updated| (updated, applied_overrides.overwritten_builtin_paths))
     })
     .await?;
+
+    for path in overwritten_builtin_paths {
+        eprintln!("warning: chainspec override {path} is overwritten by start command defaults");
+    }
 
     tokio_fs::write(&chainspec_dest, updated).await?;
 
@@ -3928,6 +3959,7 @@ port = 2
             asset: AssetSelector::Custom(asset_name.to_string()),
             protocol_version: protocol_version.to_string(),
             activation_point: 123,
+            chainspec_overrides: Vec::new(),
         }
     }
 
@@ -3939,6 +3971,7 @@ port = 2
             network_name: "casper-dev".to_string(),
             asset,
             protocol_version: protocol_version.map(str::to_string),
+            chainspec_overrides: Vec::new(),
             node_log_format: "json".to_string(),
             seed: Arc::from("default"),
         }
@@ -4146,6 +4179,85 @@ maximum_round_length = '17 seconds'
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn setup_applies_chainspec_overrides_to_network_and_node_configs() {
+        let env = TestDataEnv::new();
+        install_test_versioned_asset("2.1.3", "2.1.3")
+            .await
+            .unwrap();
+        let layout = AssetsLayout::new(env.root().join("networks"), "casper-dev".to_string());
+        let mut options = setup_options(AssetSelector::Versioned("2.1.3".to_string()), None);
+        options.chainspec_overrides = vec![
+            "core.minimum_era_height=1".to_string(),
+            "core.test_values=[1, 10]".to_string(),
+        ];
+
+        setup_local(&layout, &options).await.unwrap();
+
+        let network_chainspec =
+            tokio_fs::read_to_string(layout.net_dir().join("chainspec/chainspec.toml"))
+                .await
+                .unwrap();
+        let node_chainspec = tokio_fs::read_to_string(
+            layout
+                .node_config_root(1)
+                .join("2_1_3")
+                .join("chainspec.toml"),
+        )
+        .await
+        .unwrap();
+
+        for chainspec in [network_chainspec, node_chainspec] {
+            let value: toml::Value = toml::from_str(&chainspec).unwrap();
+            assert_eq!(
+                value
+                    .get("core")
+                    .and_then(|core| core.get("minimum_era_height"))
+                    .and_then(toml::Value::as_integer),
+                Some(1)
+            );
+            assert_eq!(
+                value
+                    .get("core")
+                    .and_then(|core| core.get("test_values"))
+                    .and_then(toml::Value::as_array)
+                    .map(Vec::len),
+                Some(2)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn setup_built_in_chainspec_fields_override_chainspec_overrides() {
+        let env = TestDataEnv::new();
+        install_test_versioned_asset("2.1.3", "2.1.3")
+            .await
+            .unwrap();
+        let layout = AssetsLayout::new(env.root().join("networks"), "casper-dev".to_string());
+        let mut options = setup_options(AssetSelector::Versioned("2.1.3".to_string()), None);
+        options.nodes = 3;
+        options.chainspec_overrides = vec!["core.validator_slots=99".to_string()];
+
+        setup_local(&layout, &options).await.unwrap();
+
+        let chainspec = tokio_fs::read_to_string(
+            layout
+                .node_config_root(1)
+                .join("2_1_3")
+                .join("chainspec.toml"),
+        )
+        .await
+        .unwrap();
+        let value: toml::Value = toml::from_str(&chainspec).unwrap();
+        assert_eq!(
+            value
+                .get("core")
+                .and_then(|core| core.get("validator_slots"))
+                .and_then(toml::Value::as_integer),
+            Some(3)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn stage_protocol_from_versioned_asset_uses_target_protocol_version() {
         let env = TestDataEnv::new();
         install_test_versioned_asset("2.1.3", "2.1.3")
@@ -4161,6 +4273,7 @@ maximum_round_length = '17 seconds'
                 asset: AssetSelector::Versioned("2.1.3".to_string()),
                 protocol_version: "3.0.0".to_string(),
                 activation_point: 123,
+                chainspec_overrides: Vec::new(),
             },
         )
         .await
@@ -4174,6 +4287,89 @@ maximum_round_length = '17 seconds'
                 "3.0.0"
             ))
             .await
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stage_protocol_applies_chainspec_overrides_to_staged_node_configs() {
+        let env = TestDataEnv::new();
+        install_test_custom_asset(&env, "dev").await.unwrap();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 2)
+            .await
+            .unwrap();
+        let mut options = stage_options("dev", "2.0.0");
+        options.chainspec_overrides = vec![
+            "core.minimum_era_height=1".to_string(),
+            "core.test_values=[1, 10]".to_string(),
+        ];
+
+        stage_protocol(&layout, &options).await.unwrap();
+
+        for node_id in 1..=2 {
+            let chainspec = tokio_fs::read_to_string(
+                layout
+                    .node_config_root(node_id)
+                    .join("2_0_0")
+                    .join("chainspec.toml"),
+            )
+            .await
+            .unwrap();
+            let value: toml::Value = toml::from_str(&chainspec).unwrap();
+            assert_eq!(
+                value
+                    .get("core")
+                    .and_then(|core| core.get("minimum_era_height"))
+                    .and_then(toml::Value::as_integer),
+                Some(1)
+            );
+            assert_eq!(
+                value
+                    .get("core")
+                    .and_then(|core| core.get("test_values"))
+                    .and_then(toml::Value::as_array)
+                    .map(Vec::len),
+                Some(2)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stage_protocol_built_in_fields_override_chainspec_overrides() {
+        let env = TestDataEnv::new();
+        install_test_custom_asset(&env, "dev").await.unwrap();
+        let layout = create_test_network_layout(env.root(), "casper-dev", "1.0.0")
+            .await
+            .unwrap();
+        let mut options = stage_options("dev", "2.0.0");
+        options.chainspec_overrides = vec![
+            "protocol.activation_point=999".to_string(),
+            "core.validator_slots=99".to_string(),
+        ];
+
+        stage_protocol(&layout, &options).await.unwrap();
+
+        let chainspec = tokio_fs::read_to_string(
+            layout
+                .node_config_root(1)
+                .join("2_0_0")
+                .join("chainspec.toml"),
+        )
+        .await
+        .unwrap();
+        let value: toml::Value = toml::from_str(&chainspec).unwrap();
+        assert_eq!(
+            value
+                .get("protocol")
+                .and_then(|protocol| protocol.get("activation_point"))
+                .and_then(toml::Value::as_integer),
+            Some(123)
+        );
+        assert_eq!(
+            value
+                .get("core")
+                .and_then(|core| core.get("validator_slots"))
+                .and_then(toml::Value::as_integer),
+            Some(1)
         );
     }
 
@@ -4699,7 +4895,7 @@ maximum_round_length = '17 seconds'
         write_executable_script(
             &layout.hooks_dir().join(PRE_STAGE_PROTOCOL_HOOK),
             format!(
-                "#!/bin/sh\nset -eu\nconfig_dir='{}'\n[ -d \"$config_dir\" ]\n[ -f \"$config_dir/chainspec.toml\" ]\nprintf '%s\n' \"$PWD\" > \"$PWD/pre-hook-cwd\"\nprintf '%s,%s,%s\n' \"$1\" \"$2\" \"$3\" > \"$PWD/pre-hook-args\"\nprintf '\n[hook]\nran = true\n' >> \"$config_dir/chainspec.toml\"\necho pre-stdout\necho pre-stderr >&2\n",
+                "#!/bin/sh\nset -eu\nconfig_dir='{}'\n[ -d \"$config_dir\" ]\n[ -f \"$config_dir/chainspec.toml\" ]\ngrep -q 'minimum_era_height = 1' \"$config_dir/chainspec.toml\"\nprintf '%s\n' \"$PWD\" > \"$PWD/pre-hook-cwd\"\nprintf '%s,%s,%s\n' \"$1\" \"$2\" \"$3\" > \"$PWD/pre-hook-args\"\nprintf '\n[hook]\nran = true\n' >> \"$config_dir/chainspec.toml\"\necho pre-stdout\necho pre-stderr >&2\n",
                 staged_config_dir.display()
             ),
         )
@@ -4720,9 +4916,9 @@ maximum_round_length = '17 seconds'
         tokio_fs::write(&stale_claim, "stale").await.unwrap();
         tokio_fs::write(&stale_completion, "stale").await.unwrap();
 
-        stage_protocol(&layout, &stage_options("dev", "2.0.0"))
-            .await
-            .unwrap();
+        let mut options = stage_options("dev", "2.0.0");
+        options.chainspec_overrides = vec!["core.minimum_era_height=1".to_string()];
+        stage_protocol(&layout, &options).await.unwrap();
 
         let expected_net_dir =
             tokio_fs::canonicalize(layout.hook_work_dir(PRE_STAGE_PROTOCOL_HOOK))

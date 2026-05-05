@@ -49,6 +49,30 @@ fn start_accepts_one_asset_selector() {
 }
 
 #[test]
+fn start_accepts_chainspec_overrides() {
+    assert!(
+        Cli::try_parse_from([
+            "nctl",
+            "start",
+            "--chainspec-override",
+            "core.minimum_era_height=1",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "nctl",
+            "start",
+            "--chainspec-override",
+            "core.minimum_era_height=1",
+            "--chainspec-override",
+            "core.test_values=[1, 10]",
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
 fn stage_protocol_is_nested_under_network() {
     assert!(
         Cli::try_parse_from([
@@ -102,6 +126,46 @@ fn stage_protocol_is_nested_under_network() {
             "2.2.0",
             "--activation-point",
             "123",
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
+fn stage_protocol_accepts_chainspec_overrides() {
+    assert!(
+        Cli::try_parse_from([
+            "nctl",
+            "network",
+            "casper-dev",
+            "stage-protocol",
+            "--custom-asset",
+            "dev",
+            "--protocol-version",
+            "2.2.0",
+            "--activation-point",
+            "123",
+            "--chainspec-override",
+            "core.minimum_era_height=1",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "nctl",
+            "network",
+            "casper-dev",
+            "stage-protocol",
+            "--custom-asset",
+            "dev",
+            "--protocol-version",
+            "2.2.0",
+            "--activation-point",
+            "123",
+            "--chainspec-override",
+            "core.minimum_era_height=1",
+            "--chainspec-override",
+            "core.test_values=[1, 10]",
         ])
         .is_ok()
     );
