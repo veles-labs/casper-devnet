@@ -17,6 +17,10 @@ Semantic Versioning.
 
 ### Security
 
+## [0.9.1] - 2026-05-05
+### Changed
+- Tag-only release (no code changes recorded).
+
 ## [0.9.0] - 2026-05-05
 ### Added
 - Add custom override assets and protocol staging workflows across CLI and MCP:
@@ -242,7 +246,8 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.0...v0.8.1
 [0.6.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.2...v0.6.0
