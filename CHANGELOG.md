@@ -6,6 +6,19 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.9.0] - 2026-05-05
+### Added
 - Add custom override assets and protocol staging workflows across CLI and MCP:
   `assets add <name> --casper-node --casper-sidecar --chainspec --node-config --sidecar-config`,
   `network <network> stage-protocol --custom-asset <name>`, MCP `stage_protocol`, and
@@ -14,6 +27,9 @@ Semantic Versioning.
   `start --asset <version>`, `start --custom-asset <name>`,
   `network <network> stage-protocol --asset <version>`, and
   `network <network> stage-protocol --custom-asset <name>`.
+- Add repeatable `--chainspec-override <key.path=value>` for `start` and
+  `network <network> stage-protocol`, accepting TOML values to patch generated chainspecs before
+  fresh genesis setup or staged protocol setup.
 - Add asset and network management helpers:
   `assets path <name>`, `assets list` custom-asset visibility, `networks list`, and
   `networks rm <name>` (interactive confirmation or `--yes`).
@@ -226,7 +242,8 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.0...v0.8.1
 [0.6.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.5.1...v0.5.2
