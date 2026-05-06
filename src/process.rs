@@ -1,4 +1,5 @@
 use crate::assets::{AssetsLayout, BOOTSTRAP_NODES};
+use crate::consensus_key_provider::ConsensusKeyProviderConfig;
 use crate::node_launcher::Launcher;
 use crate::state::{ProcessGroup, ProcessKind, ProcessRecord, ProcessStatus, State};
 use anyhow::{Result, anyhow};
@@ -33,6 +34,7 @@ pub enum ProcessHandle {
 /// Start parameters derived from CLI arguments.
 pub struct StartPlan {
     pub rust_log: String,
+    pub seed: Arc<str>,
 }
 
 /// Start all nodes (and sidecars if available), updating state on success.
@@ -56,7 +58,15 @@ pub async fn start(
             let err = anyhow!("node {} exceeds total nodes {}", node_id, total_nodes);
             return Err(cleanup_started_processes(err, started).await);
         }
-        match start_node(layout, node_id, total_nodes, &plan.rust_log).await {
+        match start_node(
+            layout,
+            node_id,
+            total_nodes,
+            &plan.rust_log,
+            Arc::clone(&plan.seed),
+        )
+        .await
+        {
             Ok(mut records) => started.append(&mut records),
             Err(err) => return Err(cleanup_started_processes(err, started).await),
         }
@@ -212,7 +222,7 @@ pub async fn stop(state: &mut State) -> Result<()> {
                         err
                     ));
                 }
-                if process_alive(pid as i32) {
+                if !wait_for_process_exit(pid as i32, Duration::from_secs(5)).await {
                     errors.push(format!(
                         "{} (pid {}) still running after SIGKILL",
                         record.id, pid
@@ -328,6 +338,7 @@ pub async fn start_added_nodes(
     node_ids: &[u32],
     total_nodes: u32,
     rust_log: &str,
+    seed: Arc<str>,
 ) -> Result<Vec<RunningProcess>> {
     let mut started = Vec::new();
 
@@ -339,7 +350,7 @@ pub async fn start_added_nodes(
             return Err(cleanup_started_processes(err, started).await);
         }
 
-        match start_node(layout, *node_id, total_nodes, rust_log).await {
+        match start_node(layout, *node_id, total_nodes, rust_log, Arc::clone(&seed)).await {
             Ok(mut records) => started.append(&mut records),
             Err(err) => return Err(cleanup_started_processes(err, started).await),
         }
@@ -377,10 +388,11 @@ async fn start_node(
     node_id: u32,
     total_nodes: u32,
     rust_log: &str,
+    seed: Arc<str>,
 ) -> Result<Vec<RunningProcess>> {
     let mut records = Vec::new();
 
-    let node_record = spawn_node(layout, node_id, total_nodes, rust_log).await?;
+    let node_record = spawn_node(layout, node_id, total_nodes, rust_log, seed).await?;
     records.push(node_record);
 
     match spawn_sidecar(layout, node_id, total_nodes, rust_log).await {
@@ -398,6 +410,7 @@ async fn spawn_node(
     node_id: u32,
     total_nodes: u32,
     rust_log: &str,
+    seed: Arc<str>,
 ) -> Result<RunningProcess> {
     let node_dir = layout.node_dir(node_id);
 
@@ -422,6 +435,9 @@ async fn spawn_node(
     launcher.set_cwd(node_dir.clone());
     launcher.set_hook_context(layout.net_dir(), layout.hooks_dir());
     launcher.set_rust_log(rust_log.to_string());
+    launcher.set_consensus_key_provider(ConsensusKeyProviderConfig::for_layout(
+        layout, node_id, seed,
+    ));
 
     let mut env = BTreeMap::new();
     env.insert(

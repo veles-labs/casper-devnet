@@ -145,16 +145,10 @@ pub(crate) async fn run(args: StartArgs) -> Result<()> {
 
     assets::ensure_network_hook_samples(&layout).await?;
 
-    if !args.force_setup && assets_exist {
-        let restored = assets::ensure_consensus_keys(&layout, Arc::clone(&args.seed)).await?;
-        if restored > 0 {
-            println!("recreated consensus keys for {} node(s)", restored);
-        }
-    }
-
     let rust_log = args.log_level.clone();
     let plan = StartPlan {
         rust_log: rust_log.clone(),
+        seed: Arc::clone(&args.seed),
     };
 
     let state_path = layout.net_dir().join(STATE_FILE_NAME);
@@ -746,19 +740,6 @@ async fn handle_control_request(
                 }
             };
             let _asset_mutation_guard = context.asset_mutation_lock.lock().await;
-            match assets::ensure_consensus_keys(&context.layout, Arc::clone(&context.seed)).await {
-                Ok(restored) => {
-                    if restored > 0 {
-                        println!("recreated consensus keys for {} node(s)", restored);
-                    }
-                }
-                Err(err) => {
-                    return ControlResponse::Error {
-                        error: format!("failed to recreate consensus keys: {}", err),
-                    };
-                }
-            }
-
             let stage = assets::stage_protocol(
                 &context.layout,
                 &StageProtocolOptions {
@@ -838,6 +819,7 @@ async fn handle_control_request(
                     &added.added_node_ids,
                     added.total_nodes,
                     &context.default_rust_log,
+                    Arc::clone(&context.seed),
                 )
                 .await
             };
@@ -1261,32 +1243,18 @@ async fn record_api_version(node_id: u32, version: String, health: &Arc<Mutex<Ss
     }
 }
 
-async fn mark_block_seen(health: &Arc<Mutex<SseHealth>>, layout: &AssetsLayout) {
-    let (block_spinner, node_ids) = {
+async fn mark_block_seen(health: &Arc<Mutex<SseHealth>>, _layout: &AssetsLayout) {
+    let block_spinner = {
         let mut state = health.lock().await;
         if state.block_seen {
             return;
         }
         state.block_seen = true;
-        (
-            state.block_spinner.take(),
-            state.expected_nodes.iter().copied().collect::<Vec<_>>(),
-        )
+        state.block_spinner.take()
     };
 
     if let Some(mut spinner) = block_spinner {
         spinner.stop_with_message(BLOCK_WAIT_MESSAGE.to_string());
-    }
-
-    match assets::remove_consensus_keys(layout, &node_ids).await {
-        Ok(removed) => {
-            if removed > 0 {
-                println!("Consensus secret keys removed from disk.");
-            }
-        }
-        Err(err) => {
-            eprintln!("warning: failed to remove consensus secret keys: {}", err);
-        }
     }
 }
 

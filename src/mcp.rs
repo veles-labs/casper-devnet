@@ -1295,10 +1295,6 @@ impl NetworkManager {
 
         assets::ensure_network_hook_samples(&layout).await?;
 
-        if !force_setup && assets_exist {
-            let _ = assets::ensure_consensus_keys(&layout, Arc::clone(&seed)).await?;
-        }
-
         let node_count = layout.count_nodes().await?;
         if node_count == 0 {
             return Err(anyhow!("network has no nodes to start"));
@@ -1321,6 +1317,7 @@ impl NetworkManager {
             &layout,
             &StartPlan {
                 rust_log: rust_log.clone(),
+                seed: Arc::clone(&seed),
             },
             &mut state,
         )
@@ -1868,14 +1865,6 @@ async fn handle_managed_control_request(
                 }
             };
             let _asset_mutation_guard = network.asset_mutation_lock.lock().await;
-            if let Err(err) =
-                assets::ensure_consensus_keys(&network.layout, Arc::clone(&network.seed)).await
-            {
-                return ControlResponse::Error {
-                    error: format!("failed to recreate consensus keys: {}", err),
-                };
-            }
-
             let staged = assets::stage_protocol(
                 &network.layout,
                 &StageProtocolOptions {
@@ -1948,6 +1937,7 @@ async fn handle_managed_control_request(
                     &added.added_node_ids,
                     added.total_nodes,
                     &network.rust_log,
+                    Arc::clone(&network.seed),
                 )
                 .await
             };

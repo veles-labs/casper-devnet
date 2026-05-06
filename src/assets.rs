@@ -1081,7 +1081,6 @@ async fn add_nodes_with_trusted_hash(
             *node_id,
             total_nodes,
             &active_version_fs,
-            &opts.seed,
             &trusted_hash,
         )
         .await
@@ -1274,7 +1273,6 @@ async fn prepare_added_node(
     node_id: u32,
     total_nodes: u32,
     active_version_fs: &str,
-    seed: &Arc<str>,
     trusted_hash: &str,
 ) -> Result<()> {
     let source_bin_dir = layout.node_bin_dir(source_node_id).join(active_version_fs);
@@ -1331,7 +1329,7 @@ async fn prepare_added_node(
     )
     .await?;
     rewrite_added_sidecar_config(node_id, &dest_config_dir.join("sidecar.toml")).await?;
-    write_consensus_key_for_node(layout, node_id, Arc::clone(seed)).await
+    Ok(())
 }
 
 async fn rewrite_added_node_config(
@@ -1432,20 +1430,6 @@ async fn rewrite_added_sidecar_config(node_id: u32, sidecar_path: &Path) -> Resu
     })
     .await?;
     tokio_fs::write(sidecar_path, updated_sidecar).await?;
-    Ok(())
-}
-
-async fn write_consensus_key_for_node(
-    layout: &AssetsLayout,
-    node_id: u32,
-    seed: Arc<str>,
-) -> Result<()> {
-    let key_path = layout.node_dir(node_id).join("keys").join(SECRET_KEY_PEM);
-    let account = derive_node_account(seed, node_id, true).await?;
-    let secret_key_pem = account
-        .secret_key_pem
-        .ok_or_else(|| anyhow!("missing secret key material for node-{}", node_id))?;
-    tokio_fs::write(key_path, secret_key_pem).await?;
     Ok(())
 }
 
@@ -2144,14 +2128,6 @@ async fn derive_node_account(
     .await
 }
 
-async fn write_node_keys(dir: &Path, account: &DerivedAccountMaterial) -> Result<()> {
-    tokio_fs::create_dir_all(dir).await?;
-    if let Some(secret_key_pem) = &account.secret_key_pem {
-        tokio_fs::write(dir.join(SECRET_KEY_PEM), secret_key_pem).await?;
-    }
-    Ok(())
-}
-
 async fn setup_seeded_keys(
     layout: &AssetsLayout,
     total_nodes: u32,
@@ -2172,10 +2148,9 @@ async fn setup_seeded_keys(
         let account = spawn_blocking_result({
             let root = root.clone();
             let path = path.clone();
-            move || derive_account_material(&root, &path, true)
+            move || derive_account_material(&root, &path, false)
         })
         .await?;
-        write_node_keys(&layout.node_dir(node_id).join("keys"), &account).await?;
 
         let info = DerivedAccountInfo {
             kind: "validator",
@@ -2599,6 +2574,13 @@ pub(crate) async fn derive_account_from_seed_path(
         })
     })
     .await
+}
+
+pub(crate) async fn derive_node_secret_key_pem(seed: Arc<str>, node_id: u32) -> Result<String> {
+    let material = derive_node_account(seed, node_id, true).await?;
+    material
+        .secret_key_pem
+        .ok_or_else(|| anyhow!("missing secret key material for node-{}", node_id))
 }
 
 struct CustomAssetPaths {
@@ -4397,7 +4379,7 @@ maximum_round_length = '17 seconds'
         assert!(is_file(&version_dir.join("accounts.toml")).await);
         assert!(is_file(&version_dir.join("config.toml")).await);
         assert!(is_file(&version_dir.join("sidecar.toml")).await);
-        assert!(is_file(&layout.node_dir(2).join("keys/secret_key.pem")).await);
+        assert!(!is_file(&layout.node_dir(2).join("keys/secret_key.pem")).await);
         assert_eq!(
             tokio_fs::read_to_string(layout.net_dir().join("chainspec/accounts.toml"))
                 .await

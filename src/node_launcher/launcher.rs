@@ -1,15 +1,18 @@
 use crate::assets::{self, PendingPostStageProtocolHookResult};
+use crate::consensus_key_provider::ConsensusKeyProviderConfig;
 use std::{
     collections::BTreeMap,
     mem,
     path::{Path, PathBuf},
+    process::ExitStatus,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+use futures::FutureExt;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -92,6 +95,7 @@ pub struct Launcher {
     cwd: Option<PathBuf>,
     hook_context: Option<HookContext>,
     rust_log: Option<String>,
+    consensus_key_provider: Option<ConsensusKeyProviderConfig>,
 }
 
 impl Launcher {
@@ -123,6 +127,7 @@ impl Launcher {
             cwd: None,
             hook_context: None,
             rust_log: None,
+            consensus_key_provider: None,
         };
 
         match forced_version {
@@ -190,6 +195,11 @@ impl Launcher {
     /// Override `RUST_LOG` for the node process.
     pub fn set_rust_log(&mut self, rust_log: String) {
         self.rust_log = Some(rust_log);
+    }
+
+    /// Configure one-shot FIFO consensus key delivery before each node child process start.
+    pub(crate) fn set_consensus_key_provider(&mut self, config: ConsensusKeyProviderConfig) {
+        self.consensus_key_provider = Some(config);
     }
 
     /// Atomically tracks the PID of the currently running node.
@@ -592,7 +602,8 @@ impl Launcher {
                     .arg(NEW_CONFIG_ARG)
                     .arg(&new_info.config_path);
                 self.configure_command(&mut command).await?;
-                let exit_code = utils::run_node(command, self.child_pid.as_ref()).await?;
+                let exit_status = self.run_node_command(&mut command, None).await?;
+                let exit_code = node_exit_code_from_status(&command, exit_status)?;
                 info!(
                     old_version=%old_info.version,
                     new_version=%new_info.version,
@@ -606,33 +617,62 @@ impl Launcher {
     }
 
     async fn run_validator(&self, mut command: Command, version: &Version) -> Result<NodeExitCode> {
-        let mut child =
-            utils::map_and_log_error(command.spawn(), format!("failed to execute {command:?}"))?;
+        let exit_status = self.run_node_command(&mut command, Some(version)).await?;
+        node_exit_code_from_status(&command, exit_status)
+    }
+
+    async fn run_node_command(
+        &self,
+        command: &mut Command,
+        post_stage_version: Option<&Version>,
+    ) -> Result<ExitStatus> {
+        let command_debug = format!("{command:?}");
+        let provider = match &self.consensus_key_provider {
+            Some(config) => Some(config.prepare().await?),
+            None => None,
+        };
+        let provider_shutdown = Arc::new(AtomicBool::new(false));
+        let mut provider_task = provider
+            .map(|provider| tokio::spawn(provider.run_once(Arc::clone(&provider_shutdown))).fuse());
+
+        let mut child = match utils::map_and_log_error(
+            command.spawn(),
+            format!("failed to execute {command_debug}"),
+        ) {
+            Ok(child) => child,
+            Err(err) => {
+                provider_shutdown.store(true, Ordering::SeqCst);
+                if let Some(task) = provider_task.take() {
+                    let _ = task.await;
+                }
+                return Err(err);
+            }
+        };
         if let Some(pid) = child.id() {
             self.child_pid.store(pid, Ordering::SeqCst);
         }
 
-        self.spawn_post_stage_protocol_hook(version);
-
-        let exit_status = utils::map_and_log_error(
-            child.wait().await,
-            format!("failed to wait for completion of {command:?}"),
-        )?;
-        self.child_pid.store(0, Ordering::SeqCst);
-
-        match exit_status.code() {
-            Some(code) if code == NodeExitCode::Success as i32 => Ok(NodeExitCode::Success),
-            Some(code) if code == NodeExitCode::ShouldDowngrade as i32 => {
-                Ok(NodeExitCode::ShouldDowngrade)
-            }
-            Some(code) if code == NodeExitCode::ShouldExitLauncher as i32 => {
-                Ok(NodeExitCode::ShouldExitLauncher)
-            }
-            _ => {
-                warn!(%exit_status, "failed running {command:?}");
-                bail!("{command:?} exited with error");
-            }
+        if let Some(version) = post_stage_version {
+            self.spawn_post_stage_protocol_hook(version);
         }
+
+        let exit_status = match provider_task {
+            Some(provider_task) => {
+                wait_for_child_and_key_provider(
+                    &mut child,
+                    provider_task,
+                    provider_shutdown,
+                    &command_debug,
+                )
+                .await
+            }
+            None => utils::map_and_log_error(
+                child.wait().await,
+                format!("failed to wait for completion of {command_debug}"),
+            ),
+        };
+        self.child_pid.store(0, Ordering::SeqCst);
+        exit_status
     }
 
     fn spawn_post_stage_protocol_hook(&self, version: &Version) {
@@ -675,6 +715,59 @@ impl Launcher {
     }
 }
 
+async fn wait_for_child_and_key_provider(
+    child: &mut tokio::process::Child,
+    mut provider_task: futures::future::Fuse<tokio::task::JoinHandle<Result<()>>>,
+    provider_shutdown: Arc<AtomicBool>,
+    command_debug: &str,
+) -> Result<ExitStatus> {
+    let mut provider_done = false;
+    loop {
+        tokio::select! {
+            exit_status = child.wait() => {
+                provider_shutdown.store(true, Ordering::SeqCst);
+                let exit_status = utils::map_and_log_error(
+                    exit_status,
+                    format!("failed to wait for completion of {command_debug}"),
+                )?;
+                if !provider_done {
+                    let provider_result = provider_task
+                        .await
+                        .map_err(|err| anyhow!("consensus key provider task failed: {}", err))?;
+                    provider_result?;
+                }
+                return Ok(exit_status);
+            }
+            provider_join = &mut provider_task, if !provider_done => {
+                provider_done = true;
+                let provider_result = provider_join
+                    .map_err(|err| anyhow!("consensus key provider task failed: {}", err))?;
+                if let Err(err) = provider_result {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+fn node_exit_code_from_status(command: &Command, exit_status: ExitStatus) -> Result<NodeExitCode> {
+    match exit_status.code() {
+        Some(code) if code == NodeExitCode::Success as i32 => Ok(NodeExitCode::Success),
+        Some(code) if code == NodeExitCode::ShouldDowngrade as i32 => {
+            Ok(NodeExitCode::ShouldDowngrade)
+        }
+        Some(code) if code == NodeExitCode::ShouldExitLauncher as i32 => {
+            Ok(NodeExitCode::ShouldExitLauncher)
+        }
+        _ => {
+            warn!(%exit_status, "failed running {command:?}");
+            bail!("{command:?} exited with error");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +791,7 @@ mod tests {
                 network_dir: network_dir.to_path_buf(),
             }),
             rust_log: None,
+            consensus_key_provider: None,
         }
     }
 

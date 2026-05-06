@@ -1,15 +1,8 @@
-use std::{
-    collections::BTreeSet,
-    fmt::Display,
-    path::Path,
-    str::FromStr,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::{collections::BTreeSet, fmt::Display, path::Path, str::FromStr};
 
 use anyhow::{Error, Result, bail};
 use semver::Version;
 use tokio::fs as tokio_fs;
-use tokio::process::Command;
 use tracing::{debug, warn};
 
 /// Represents the exit code of the node process.
@@ -119,42 +112,6 @@ pub(crate) async fn versions_from_path<P: AsRef<Path>>(dir: P) -> Result<BTreeSe
     }
 
     Ok(versions)
-}
-
-/// Runs the given command as a child process.
-pub(crate) async fn run_node(mut command: Command, child_pid: &AtomicU32) -> Result<NodeExitCode> {
-    let mut child = map_and_log_error(command.spawn(), format!("failed to execute {command:?}"))?;
-    if let Some(pid) = child.id() {
-        child_pid.store(pid, Ordering::SeqCst);
-    }
-
-    let exit_status = map_and_log_error(
-        child.wait().await,
-        format!("failed to wait for completion of {command:?}"),
-    )?;
-    child_pid.store(0, Ordering::SeqCst);
-
-    match exit_status.code() {
-        Some(code) if code == NodeExitCode::Success as i32 => {
-            debug!("successfully finished running {command:?}");
-            Ok(NodeExitCode::Success)
-        }
-        Some(code) if code == NodeExitCode::ShouldDowngrade as i32 => {
-            debug!("finished running {command:?} - should downgrade now");
-            Ok(NodeExitCode::ShouldDowngrade)
-        }
-        Some(code) if code == NodeExitCode::ShouldExitLauncher as i32 => {
-            debug!(
-                "finished running {:?} - trying to run shutdown script now",
-                command
-            );
-            Ok(NodeExitCode::ShouldExitLauncher)
-        }
-        _ => {
-            warn!(%exit_status, "failed running {command:?}");
-            bail!("{command:?} exited with error");
-        }
-    }
 }
 
 /// Maps an error to a different type of error, while also logging the error at warn level.

@@ -24,7 +24,7 @@ CI, and tests.
 | Implementation | Large shell script | Rust binary (portable) |
 | Node launcher | External `casper-node-launcher` | Embedded launcher logic |
 | Requirements | Node + launcher + sidecar + scripts | Assets bundle (node + sidecar + templates) |
-| Keys/accounts | Random keys, friction to name/locate | Deterministic keys from a seed (BIP32 paths) |
+| Keys/accounts | Random keys, friction to name/locate | Deterministic accounts and one-shot FIFO consensus keys from a seed (BIP32 paths) |
 | macOS devnet start | Often requires extra local compilation | Download pre-built cross-platform bundles |
 | Network feedback | Extra commands to watch blocks/txs | Persistent SSE connection with live output |
 
@@ -291,9 +291,11 @@ If a managed process is running (from `start` or MCP), staging runs in live mode
 sidecars. Otherwise, staging runs in offline mode and only writes versioned
 `nodes/node-*/bin/<version>` and `nodes/node-*/config/<version>` assets.
 Live staging control uses a per-network Unix socket at `/tmp/<network-name>.socket`
-for runtime stage requests.
-In live mode, consensus keys are restored from the network seed before staging so
-`migrate-data` can run successfully at the upgrade boundary.
+for runtime stage requests. Managed node processes serve consensus secret keys through
+per-node `keys/secret_key.pem` FIFOs, deriving the PEM from the network seed only when
+the first reader opens the FIFO. After the first successful delivery, the FIFO is removed
+and the key is not served again for that child process; the embedded launcher creates a
+fresh one-shot FIFO before later `migrate-data` runs or validator restarts.
 Node and sidecar log aliases (for example `node-1.stdout`) are atomically repointed to
 versioned log files during protocol transitions; use `tail -F` to follow across alias swaps.
 If `networks/<network>/hooks/pre-stage-protocol` exists, it runs after the target version's
@@ -351,6 +353,9 @@ casper-devnet start --setup-only
 Use `--setup-only` when you want to tweak chainspecs or node configs before launching.
 Use `--chainspec-override` with `--setup-only` to apply repeatable TOML value patches during
 fresh asset setup.
+`--setup-only` writes configs that reference `keys/secret_key.pem`, but it does not write
+regular consensus secret key PEM files. Managed `start`/MCP runs create one-shot FIFO key
+providers for those paths at runtime.
 
 Rebuild assets:
 

@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod cli;
+mod consensus_key_provider;
 pub mod control;
 mod diagnostics_port;
 pub mod mcp;
