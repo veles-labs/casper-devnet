@@ -6,16 +6,17 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
-- Add one-shot FIFO consensus key delivery for managed validator processes. Managed starts now
-  create `keys/secret_key.pem` as a `0600` FIFO, derive the deterministic consensus secret from
-  the network seed on first read, log delivery, and remove the FIFO immediately after delivery.
+- Add one-shot inherited pipe consensus key delivery for managed validator processes. Managed
+  starts now point temporary child configs at `/proc/self/fd/<fd>` on Linux or `/dev/fd/<fd>` on
+  macOS, derive the deterministic consensus secret from the network seed, write it once, and close
+  the pipe.
 
 ### Changed
-- Managed setup and add-node flows no longer leave regular validator `keys/secret_key.pem` files
-  behind. Public key and account data are still generated, and `casper-devnet derive --secret-key`
-  remains the explicit way to export a consensus secret PEM.
+- Managed setup and add-node flows no longer create validator `keys/` directories or regular
+  `keys/secret_key.pem` files. Public key and account data are still generated, and
+  `casper-devnet derive --secret-key` remains the explicit way to export a consensus secret PEM.
 - Launcher-driven validator, `migrate-data`, and post-upgrade validator child processes now get a
-  fresh FIFO key provider before each `casper-node` start.
+  fresh inherited pipe key provider before each `casper-node` start.
 
 ### Deprecated
 
@@ -24,14 +25,14 @@ Semantic Versioning.
   protocol staging, and first-block cleanup.
 
 ### Fixed
-- Fix live protocol upgrades with FIFO-backed consensus keys by provisioning a fresh one-shot FIFO
+- Fix live protocol upgrades with ephemeral consensus keys by provisioning fresh one-shot pipes
   before `migrate-data` and upgraded validator restarts.
 - Wait briefly after `SIGKILL` before reporting a child process as still running, avoiding
   misleading shutdown messages while the operating system reaps the process.
 
 ### Security
 - Avoid long-lived managed validator consensus secret PEMs at rest by serving consensus secrets
-  ephemerally through FIFOs during managed process startup.
+  ephemerally through inherited pipes during managed process startup.
 
 ## [0.9.1] - 2026-05-05
 ### Changed

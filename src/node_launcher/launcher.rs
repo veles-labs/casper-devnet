@@ -1,5 +1,5 @@
 use crate::assets::{self, PendingPostStageProtocolHookResult};
-use crate::consensus_key_provider::ConsensusKeyProviderConfig;
+use crate::consensus_key_provider::{ConsensusKeyProvider, ConsensusKeyProviderConfig};
 use std::{
     collections::BTreeMap,
     mem,
@@ -197,7 +197,7 @@ impl Launcher {
         self.rust_log = Some(rust_log);
     }
 
-    /// Configure one-shot FIFO consensus key delivery before each node child process start.
+    /// Configure one-shot inherited pipe consensus key delivery for node child processes.
     pub(crate) fn set_consensus_key_provider(&mut self, config: ConsensusKeyProviderConfig) {
         self.consensus_key_provider = Some(config);
     }
@@ -584,25 +584,42 @@ impl Launcher {
     async fn step(&mut self) -> Result<()> {
         let exit_code = match &self.state {
             State::RunNodeAsValidator(node_info) => {
+                let provider = self
+                    .prepare_consensus_key_provider(std::slice::from_ref(&node_info.config_path))
+                    .await?;
+                let config_path = provider
+                    .as_ref()
+                    .map(|provider| provider.config_paths()[0].clone())
+                    .unwrap_or_else(|| node_info.config_path.clone());
                 let mut command = Command::new(&node_info.binary_path);
-                command
-                    .arg(VALIDATOR_SUBCOMMAND)
-                    .arg(&node_info.config_path);
+                command.arg(VALIDATOR_SUBCOMMAND).arg(&config_path);
                 self.configure_command(&mut command).await?;
-                let exit_code = self.run_validator(command, &node_info.version).await?;
+                let exit_code = self
+                    .run_validator(command, &node_info.version, provider)
+                    .await?;
                 info!(version=%node_info.version, "finished running node as validator");
                 exit_code
             }
             State::MigrateData { old_info, new_info } => {
+                let provider = self
+                    .prepare_consensus_key_provider(&[
+                        old_info.config_path.clone(),
+                        new_info.config_path.clone(),
+                    ])
+                    .await?;
+                let config_paths = provider.as_ref().map_or_else(
+                    || vec![old_info.config_path.clone(), new_info.config_path.clone()],
+                    ConsensusKeyProvider::config_paths,
+                );
                 let mut command = Command::new(&new_info.binary_path);
                 command
                     .arg(MIGRATE_SUBCOMMAND)
                     .arg(OLD_CONFIG_ARG)
-                    .arg(&old_info.config_path)
+                    .arg(&config_paths[0])
                     .arg(NEW_CONFIG_ARG)
-                    .arg(&new_info.config_path);
+                    .arg(&config_paths[1]);
                 self.configure_command(&mut command).await?;
-                let exit_status = self.run_node_command(&mut command, None).await?;
+                let exit_status = self.run_node_command(&mut command, provider, None).await?;
                 let exit_code = node_exit_code_from_status(&command, exit_status)?;
                 info!(
                     old_version=%old_info.version,
@@ -616,24 +633,38 @@ impl Launcher {
         self.transition_state(exit_code).await
     }
 
-    async fn run_validator(&self, mut command: Command, version: &Version) -> Result<NodeExitCode> {
-        let exit_status = self.run_node_command(&mut command, Some(version)).await?;
+    async fn prepare_consensus_key_provider(
+        &self,
+        config_paths: &[PathBuf],
+    ) -> Result<Option<ConsensusKeyProvider>> {
+        match &self.consensus_key_provider {
+            Some(config) => Ok(Some(config.prepare(config_paths).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn run_validator(
+        &self,
+        mut command: Command,
+        version: &Version,
+        provider: Option<ConsensusKeyProvider>,
+    ) -> Result<NodeExitCode> {
+        let exit_status = self
+            .run_node_command(&mut command, provider, Some(version))
+            .await?;
         node_exit_code_from_status(&command, exit_status)
     }
 
     async fn run_node_command(
         &self,
         command: &mut Command,
+        mut provider: Option<ConsensusKeyProvider>,
         post_stage_version: Option<&Version>,
     ) -> Result<ExitStatus> {
         let command_debug = format!("{command:?}");
-        let provider = match &self.consensus_key_provider {
-            Some(config) => Some(config.prepare().await?),
-            None => None,
-        };
-        let provider_shutdown = Arc::new(AtomicBool::new(false));
-        let mut provider_task = provider
-            .map(|provider| tokio::spawn(provider.run_once(Arc::clone(&provider_shutdown))).fuse());
+        if let Some(provider) = provider.as_ref() {
+            provider.install_on_command(command);
+        }
 
         let mut child = match utils::map_and_log_error(
             command.spawn(),
@@ -641,9 +672,11 @@ impl Launcher {
         ) {
             Ok(child) => child,
             Err(err) => {
-                provider_shutdown.store(true, Ordering::SeqCst);
-                if let Some(task) = provider_task.take() {
-                    let _ = task.await;
+                if let Some(provider) = provider {
+                    let cleanup = provider.cleanup().await;
+                    if let Err(cleanup_err) = cleanup {
+                        return Err(anyhow!("{err}; additionally {cleanup_err}"));
+                    }
                 }
                 return Err(err);
             }
@@ -652,19 +685,39 @@ impl Launcher {
             self.child_pid.store(pid, Ordering::SeqCst);
         }
 
+        let provider_task = if provider.is_some() {
+            let delivery_task = {
+                let provider = provider.as_mut().expect("provider checked above");
+                provider.close_parent_read_ends();
+                provider.spawn_delivery(self.stdout_path.clone())
+            };
+            match delivery_task {
+                Ok(task) => Some(task.fuse()),
+                Err(err) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    self.child_pid.store(0, Ordering::SeqCst);
+                    let cleanup = match provider.take() {
+                        Some(provider) => provider.cleanup().await,
+                        None => Ok(()),
+                    };
+                    if let Err(cleanup_err) = cleanup {
+                        return Err(anyhow!("{err}; additionally {cleanup_err}"));
+                    }
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+
         if let Some(version) = post_stage_version {
             self.spawn_post_stage_protocol_hook(version);
         }
 
         let exit_status = match provider_task {
             Some(provider_task) => {
-                wait_for_child_and_key_provider(
-                    &mut child,
-                    provider_task,
-                    provider_shutdown,
-                    &command_debug,
-                )
-                .await
+                wait_for_child_and_key_provider(&mut child, provider_task, &command_debug).await
             }
             None => utils::map_and_log_error(
                 child.wait().await,
@@ -672,7 +725,17 @@ impl Launcher {
             ),
         };
         self.child_pid.store(0, Ordering::SeqCst);
-        exit_status
+
+        let cleanup = match provider {
+            Some(provider) => provider.cleanup().await,
+            None => Ok(()),
+        };
+        match (exit_status, cleanup) {
+            (Ok(exit_status), Ok(())) => Ok(exit_status),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), Err(cleanup_err)) => Err(anyhow!("{err}; additionally {cleanup_err}")),
+        }
     }
 
     fn spawn_post_stage_protocol_hook(&self, version: &Version) {
@@ -718,14 +781,12 @@ impl Launcher {
 async fn wait_for_child_and_key_provider(
     child: &mut tokio::process::Child,
     mut provider_task: futures::future::Fuse<tokio::task::JoinHandle<Result<()>>>,
-    provider_shutdown: Arc<AtomicBool>,
     command_debug: &str,
 ) -> Result<ExitStatus> {
     let mut provider_done = false;
     loop {
         tokio::select! {
             exit_status = child.wait() => {
-                provider_shutdown.store(true, Ordering::SeqCst);
                 let exit_status = utils::map_and_log_error(
                     exit_status,
                     format!("failed to wait for completion of {command_debug}"),

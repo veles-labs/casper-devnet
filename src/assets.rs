@@ -1285,7 +1285,6 @@ async fn prepare_added_node(
 
     tokio_fs::create_dir_all(&dest_bin_dir).await?;
     tokio_fs::create_dir_all(&dest_config_dir).await?;
-    tokio_fs::create_dir_all(node_dir.join("keys")).await?;
     tokio_fs::create_dir_all(node_dir.join("logs")).await?;
     tokio_fs::create_dir_all(node_dir.join("storage")).await?;
 
@@ -2000,7 +1999,6 @@ async fn setup_directories(
         let node_dir = layout.node_dir(node_id);
         tokio_fs::create_dir_all(node_dir.join("bin").join(protocol_version_fs)).await?;
         tokio_fs::create_dir_all(node_dir.join("config").join(protocol_version_fs)).await?;
-        tokio_fs::create_dir_all(node_dir.join("keys")).await?;
         tokio_fs::create_dir_all(node_dir.join("logs")).await?;
         tokio_fs::create_dir_all(node_dir.join("storage")).await?;
     }
@@ -4098,6 +4096,7 @@ maximum_round_length = '17 seconds'
 
         assert_eq!(result.protocol_version, "2.2.0");
         assert!(is_dir(&layout.node_config_root(1).join("2_2_0")).await);
+        assert!(!is_dir(&layout.node_dir(1).join("keys")).await);
         assert_eq!(generated_chainspec_version(&layout, "2.2.0").await, "2.2.0");
     }
 
@@ -4379,6 +4378,7 @@ maximum_round_length = '17 seconds'
         assert!(is_file(&version_dir.join("accounts.toml")).await);
         assert!(is_file(&version_dir.join("config.toml")).await);
         assert!(is_file(&version_dir.join("sidecar.toml")).await);
+        assert!(!is_dir(&layout.node_dir(2).join("keys")).await);
         assert!(!is_file(&layout.node_dir(2).join("keys/secret_key.pem")).await);
         assert_eq!(
             tokio_fs::read_to_string(layout.net_dir().join("chainspec/accounts.toml"))

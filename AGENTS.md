@@ -49,6 +49,8 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 
 ## Conventions
 - Use `tokio::fs` for IO and `spawn_blocking` for CPU/TOML operations.
+- When considering a libc/unsafe syscall wrapper, first prefer the safe Rust equivalent from `nix`
+  when one exists; use raw `libc` only when no suitable safe wrapper is available.
 - Prefer concise user-facing logs.
 - Default target for assets is the build target (from `build.rs`).
 - For network interactions, do **not** use `casper_client` directly; use `veles_casper_rust_sdk::jsonrpc::CasperClient` instead.
