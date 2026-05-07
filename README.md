@@ -280,9 +280,8 @@ to be running so it can prepare assets, spawn the new node and sidecar processes
 trusted hash from an existing node's REST `/status`, writes it to `[node].trusted_hash`, and uses
 the active config's joining sync mode (`[node].sync_handling = "ttl"`, or
 `sync_to_genesis = false` for legacy configs).
-Added nodes inherit only the currently active protocol version. If a future protocol version was
-already staged, run `network <name> stage-protocol` again after adding nodes so the new nodes
-receive that staged version too.
+Added nodes inherit the currently active protocol version and any higher protocol versions already
+staged on existing nodes, so a node added before an activation era can follow the pending upgrade.
 The foreground `start` manager logs the full endpoint summary for nodes added through the control
 plane and prints node reactor state changes observed by polling each node's REST `/status` every
 500ms.

@@ -13,6 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Cursor, Read};
@@ -1063,11 +1064,13 @@ async fn add_nodes_with_trusted_hash(
     let added_node_ids = (first_new_node_id..=total_nodes).collect::<Vec<_>>();
 
     let source_node_id = existing_node_ids[0];
-    let source_bin_dir = layout.node_bin_dir(source_node_id).join(&active_version_fs);
-    let source_config_dir = layout
-        .node_config_root(source_node_id)
-        .join(&active_version_fs);
-    ensure_active_version_assets(&source_bin_dir, &source_config_dir).await?;
+    let mut version_dirs = vec![active_version_fs];
+    version_dirs.extend(
+        future_protocol_version_dirs_for_node(layout, source_node_id, &active_version).await?,
+    );
+    for version_fs in &version_dirs {
+        ensure_version_assets(layout, source_node_id, version_fs).await?;
+    }
 
     let trusted_hash = match trusted_hash_override {
         Some(trusted_hash) => trusted_hash,
@@ -1080,7 +1083,8 @@ async fn add_nodes_with_trusted_hash(
             source_node_id,
             *node_id,
             total_nodes,
-            &active_version_fs,
+            &active_version,
+            &version_dirs,
             &trusted_hash,
         )
         .await
@@ -1248,10 +1252,13 @@ async fn active_protocol_version_for_node(layout: &AssetsLayout, node_id: u32) -
     parse_protocol_version(version)
 }
 
-async fn ensure_active_version_assets(
-    source_bin_dir: &Path,
-    source_config_dir: &Path,
+async fn ensure_version_assets(
+    layout: &AssetsLayout,
+    source_node_id: u32,
+    version_fs: &str,
 ) -> Result<()> {
+    let source_bin_dir = layout.node_bin_dir(source_node_id).join(version_fs);
+    let source_config_dir = layout.node_config_root(source_node_id).join(version_fs);
     for path in [
         source_bin_dir.join("casper-node"),
         source_bin_dir.join("casper-sidecar"),
@@ -1267,26 +1274,134 @@ async fn ensure_active_version_assets(
     Ok(())
 }
 
+async fn future_protocol_version_dirs_for_node(
+    layout: &AssetsLayout,
+    node_id: u32,
+    active_version: &Version,
+) -> Result<Vec<String>> {
+    let binary_versions = protocol_versions_from_dir(&layout.node_bin_dir(node_id)).await?;
+    let config_versions = protocol_versions_from_dir(&layout.node_config_root(node_id)).await?;
+    if binary_versions != config_versions {
+        return Err(anyhow!(
+            "installed binary versions ({}) don't match installed configs ({}) for node-{}",
+            format_protocol_versions(&binary_versions),
+            format_protocol_versions(&config_versions),
+            node_id
+        ));
+    }
+
+    Ok(binary_versions
+        .into_iter()
+        .filter(|version| version > active_version)
+        .map(|version| version.to_string().replace('.', "_"))
+        .collect())
+}
+
+async fn protocol_versions_from_dir(dir: &Path) -> Result<BTreeSet<Version>> {
+    let mut versions = BTreeSet::new();
+    let mut entries = tokio_fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().replace('_', ".");
+        if let Ok(version) = Version::parse(&name) {
+            versions.insert(version);
+        }
+    }
+    Ok(versions)
+}
+
+fn format_protocol_versions(versions: &BTreeSet<Version>) -> String {
+    versions
+        .iter()
+        .map(Version::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn prepare_added_node(
     layout: &AssetsLayout,
     source_node_id: u32,
     node_id: u32,
     total_nodes: u32,
-    active_version_fs: &str,
+    active_version: &Version,
+    version_dirs: &[String],
     trusted_hash: &str,
 ) -> Result<()> {
-    let source_bin_dir = layout.node_bin_dir(source_node_id).join(active_version_fs);
-    let source_config_dir = layout
-        .node_config_root(source_node_id)
-        .join(active_version_fs);
     let node_dir = layout.node_dir(node_id);
-    let dest_bin_dir = layout.node_bin_dir(node_id).join(active_version_fs);
-    let dest_config_dir = layout.node_config_root(node_id).join(active_version_fs);
+
+    tokio_fs::create_dir_all(node_dir.join("logs")).await?;
+    tokio_fs::create_dir_all(node_dir.join("storage")).await?;
+
+    for version_fs in version_dirs {
+        prepare_added_node_version(
+            layout,
+            source_node_id,
+            node_id,
+            total_nodes,
+            version_fs,
+            trusted_hash,
+        )
+        .await?;
+    }
+
+    write_added_node_launcher_state(layout, node_id, active_version).await?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct AddedNodeLauncherState {
+    mode: &'static str,
+    version: String,
+    binary_path: PathBuf,
+    config_path: PathBuf,
+}
+
+async fn write_added_node_launcher_state(
+    layout: &AssetsLayout,
+    node_id: u32,
+    active_version: &Version,
+) -> Result<()> {
+    let active_version_fs = active_version.to_string().replace('.', "_");
+    let state = AddedNodeLauncherState {
+        mode: "RunNodeAsValidator",
+        version: active_version.to_string(),
+        binary_path: layout
+            .node_bin_dir(node_id)
+            .join(&active_version_fs)
+            .join("casper-node"),
+        config_path: layout
+            .node_config_root(node_id)
+            .join(&active_version_fs)
+            .join("config.toml"),
+    };
+    let contents = toml::to_string_pretty(&state)?;
+    tokio_fs::write(
+        layout
+            .node_config_root(node_id)
+            .join(NODE_LAUNCHER_STATE_FILE),
+        contents,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn prepare_added_node_version(
+    layout: &AssetsLayout,
+    source_node_id: u32,
+    node_id: u32,
+    total_nodes: u32,
+    version_fs: &str,
+    trusted_hash: &str,
+) -> Result<()> {
+    let source_bin_dir = layout.node_bin_dir(source_node_id).join(version_fs);
+    let source_config_dir = layout.node_config_root(source_node_id).join(version_fs);
+    let dest_bin_dir = layout.node_bin_dir(node_id).join(version_fs);
+    let dest_config_dir = layout.node_config_root(node_id).join(version_fs);
 
     tokio_fs::create_dir_all(&dest_bin_dir).await?;
     tokio_fs::create_dir_all(&dest_config_dir).await?;
-    tokio_fs::create_dir_all(node_dir.join("logs")).await?;
-    tokio_fs::create_dir_all(node_dir.join("storage")).await?;
 
     copy_file(
         &source_bin_dir.join("casper-node"),
@@ -3984,6 +4099,42 @@ port = 2
         add_nodes_with_trusted_hash(layout, opts, Some("trusted-hash".to_string())).await
     }
 
+    async fn clone_node_version(
+        layout: &AssetsLayout,
+        node_id: u32,
+        source_version_fs: &str,
+        target_version_fs: &str,
+    ) {
+        let source_bin_dir = layout.node_bin_dir(node_id).join(source_version_fs);
+        let target_bin_dir = layout.node_bin_dir(node_id).join(target_version_fs);
+        let source_config_dir = layout.node_config_root(node_id).join(source_version_fs);
+        let target_config_dir = layout.node_config_root(node_id).join(target_version_fs);
+        tokio_fs::create_dir_all(&target_bin_dir).await.unwrap();
+        tokio_fs::create_dir_all(&target_config_dir).await.unwrap();
+
+        for file_name in ["casper-node", "casper-sidecar"] {
+            tokio_fs::copy(
+                source_bin_dir.join(file_name),
+                target_bin_dir.join(file_name),
+            )
+            .await
+            .unwrap();
+        }
+        for file_name in [
+            "chainspec.toml",
+            "accounts.toml",
+            "config.toml",
+            "sidecar.toml",
+        ] {
+            tokio_fs::copy(
+                source_config_dir.join(file_name),
+                target_config_dir.join(file_name),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
     #[test]
     fn format_cspr_handles_whole_and_fractional() {
         assert_eq!(format_cspr(0), "0");
@@ -4488,28 +4639,69 @@ maximum_round_length = '17 seconds'
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn add_nodes_copies_only_active_version() {
+    async fn add_nodes_copies_active_and_future_staged_versions() {
         let env = TestDataEnv::new();
         let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "1.0.0", 1)
             .await
             .unwrap();
-        tokio_fs::create_dir_all(layout.node_bin_dir(1).join("2_0_0"))
-            .await
-            .unwrap();
-        tokio_fs::create_dir_all(layout.node_config_root(1).join("2_0_0"))
-            .await
-            .unwrap();
-        tokio_fs::write(layout.node_bin_dir(1).join("2_0_0/casper-node"), "future")
-            .await
-            .unwrap();
+        clone_node_version(&layout, 1, "1_0_0", "2_0_0").await;
 
         add_nodes_for_test(&layout, &add_nodes_options(1))
             .await
             .unwrap();
 
         assert!(is_dir(&layout.node_bin_dir(2).join("1_0_0")).await);
-        assert!(!is_dir(&layout.node_bin_dir(2).join("2_0_0")).await);
-        assert!(!is_dir(&layout.node_config_root(2).join("2_0_0")).await);
+        assert!(is_file(&layout.node_bin_dir(2).join("2_0_0/casper-node")).await);
+        assert!(is_file(&layout.node_bin_dir(2).join("2_0_0/casper-sidecar")).await);
+        assert!(is_file(&layout.node_config_root(2).join("2_0_0/chainspec.toml")).await);
+        assert!(is_file(&layout.node_config_root(2).join("2_0_0/accounts.toml")).await);
+        assert!(is_file(&layout.node_config_root(2).join("2_0_0/config.toml")).await);
+        assert!(is_file(&layout.node_config_root(2).join("2_0_0/sidecar.toml")).await);
+
+        let future_config: toml::Value = toml::from_str(
+            &tokio_fs::read_to_string(layout.node_config_root(2).join("2_0_0/config.toml"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            future_config
+                .get("network")
+                .and_then(|value| value.get("bind_address"))
+                .and_then(toml::Value::as_str),
+            Some("0.0.0.0:22102")
+        );
+        assert_eq!(
+            future_config
+                .get("node")
+                .and_then(|value| value.get("trusted_hash"))
+                .and_then(toml::Value::as_str),
+            Some("trusted-hash")
+        );
+
+        let launcher_state =
+            tokio_fs::read_to_string(layout.node_config_root(2).join(NODE_LAUNCHER_STATE_FILE))
+                .await
+                .unwrap();
+        assert!(launcher_state.contains("version = \"1.0.0\""));
+        assert!(launcher_state.contains("1_0_0/config.toml"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_nodes_skips_historical_versions() {
+        let env = TestDataEnv::new();
+        let layout = create_add_nodes_network_layout(env.root(), "casper-dev", "2.0.0", 1)
+            .await
+            .unwrap();
+        clone_node_version(&layout, 1, "2_0_0", "1_0_0").await;
+
+        add_nodes_for_test(&layout, &add_nodes_options(1))
+            .await
+            .unwrap();
+
+        assert!(is_dir(&layout.node_bin_dir(2).join("2_0_0")).await);
+        assert!(!is_dir(&layout.node_bin_dir(2).join("1_0_0")).await);
+        assert!(!is_dir(&layout.node_config_root(2).join("1_0_0")).await);
     }
 
     #[tokio::test(flavor = "current_thread")]
