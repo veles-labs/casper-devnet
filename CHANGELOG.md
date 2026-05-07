@@ -14,6 +14,8 @@ Semantic Versioning.
 ### Removed
 
 ### Fixed
+- Fix Linux `start --force-setup` failures when `/tmp` and the devnet data directory are on
+  different filesystems by writing `state.json` atomic temp files beside the target state file.
 
 ### Security
 

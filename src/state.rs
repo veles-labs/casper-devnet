@@ -227,25 +227,34 @@ async fn ensure_parent(path: &Path) -> Result<()> {
 }
 
 async fn write_atomic(path: &Path, contents: String) -> Result<()> {
-    let base_name = path
-        .file_name()
-        .unwrap_or_else(|| OsStr::new(STATE_FILE_NAME))
-        .to_string_lossy();
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let tmp_dir = tempfile::Builder::new()
-        .prefix("casper-devnet-state")
-        .tempdir()?;
-    let tmp_name = format!("{}.{}.{}.tmp", base_name, std::process::id(), suffix);
-    let tmp_path = tmp_dir.path().join(tmp_name);
+    let tmp_path = atomic_tmp_path(path, suffix);
     tokio_fs::write(&tmp_path, contents).await?;
     if let Err(err) = tokio_fs::rename(&tmp_path, path).await {
         let _ = tokio_fs::remove_file(&tmp_path).await;
         return Err(err.into());
     }
     Ok(())
+}
+
+fn atomic_tmp_path(path: &Path, suffix: u128) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base_name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(STATE_FILE_NAME))
+        .to_string_lossy();
+    parent.join(format!(
+        ".{}.{}.{}.tmp",
+        base_name,
+        std::process::id(),
+        suffix
+    ))
 }
 
 #[cfg(test)]
@@ -280,6 +289,21 @@ mod tests {
         let contents = tokio_fs::read_to_string(path).await.unwrap();
         let value: Value = serde_json::from_str(&contents).unwrap();
         value["processes"][0]["pid"].as_u64()
+    }
+
+    #[test]
+    fn atomic_tmp_path_uses_state_file_parent() {
+        let state_path = Path::new("/tmp/devnet/networks/casper-dev/state.json");
+        let tmp_path = atomic_tmp_path(state_path, 42);
+
+        assert_eq!(tmp_path.parent(), state_path.parent());
+        assert!(
+            tmp_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".state.json.")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
