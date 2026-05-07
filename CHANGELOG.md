@@ -14,6 +14,11 @@ Semantic Versioning.
 ### Removed
 
 ### Fixed
+
+### Security
+
+## [0.10.1] - 2026-05-07
+### Fixed
 - Fix Linux `start --force-setup` failures when `/tmp` and the devnet data directory are on
   different filesystems by writing `state.json` atomic temp files beside the target state file.
 
@@ -278,7 +283,8 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.1...v0.9.0
