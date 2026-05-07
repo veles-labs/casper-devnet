@@ -6,6 +6,19 @@ Semantic Versioning.
 
 ## [Unreleased]
 ### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.10.0] - 2026-05-07
+### Added
 - Add one-shot inherited pipe consensus key delivery for managed validator processes. Managed
   starts now point temporary child configs at `/proc/self/fd/<fd>` on Linux or `/dev/fd/<fd>` on
   macOS, derive the deterministic consensus secret from the network seed, write it once, and close
@@ -263,7 +276,8 @@ Semantic Versioning.
 ### Added
 - Initial release.
 
-[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/veles-labs/casper-devnet-launcher/compare/v0.8.0...v0.8.1
