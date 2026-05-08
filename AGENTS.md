@@ -15,6 +15,8 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - `README.md`: concise product overview, quick start, common workflows, and links to detailed docs.
   Do not move long reference material back into the README.
 - `docs/cli-reference.md`: command names, flags, defaults, and CLI examples.
+- `docs/how-it-works.md`: setup internals, generated file layout, config rewrites, process start
+  sequence, deterministic keys, and inherited-pipe key delivery.
 - `docs/mcp.md`: MCP server workflow, client snippets, transaction construction, and transaction lookup rules.
 - `docs/hooks-and-upgrades.md`: protocol staging, hook lifecycle, live/offline upgrade behavior, and add-node behavior.
 - `docs/diagnostics.md`: diagnostics websocket and HTTP proxy usage.
@@ -73,6 +75,9 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - Keep `README.md`, linked docs under `docs/`, and generated CLI help/defaults consistent whenever
   user-facing CLI behavior changes. README should stay concise; put detailed behavior in the
   canonical linked doc and link to it rather than duplicating long reference sections.
+- Keep implementation docs, especially `docs/how-it-works.md`, consistent with code changes to
+  setup, asset layout, config generation, process lifecycle, protocol staging, deterministic keys,
+  or inherited-pipe key delivery. Check the relevant source files before updating those docs.
 - When docs mention command names, flags, or defaults, verify them with `cargo run --quiet -- ... --help`.
 - Before finishing a task, run `cargo clippy --all --all-targets --all-features --tests` only if any `.rs` code is changed, and report failures.
 - Update `CHANGELOG.md` only when explicitly asked. When asked, derive the changelog work from

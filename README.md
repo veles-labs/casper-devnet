@@ -19,6 +19,7 @@ Links: [Crates.io](https://crates.io/crates/casper-devnet),
 | --- | --- |
 | [Docs map](docs/README.md) | Choosing the smallest doc to read or update. |
 | [CLI reference](docs/cli-reference.md) | Commands, flags, defaults, and examples. |
+| [How it works](docs/how-it-works.md) | Step-by-step setup, generated files, config rewrites, and key delivery. |
 | [MCP workflow](docs/mcp.md) | Running the MCP server and constructing transactions. |
 | [Hooks and upgrades](docs/hooks-and-upgrades.md) | Network hooks, protocol staging, and live/offline upgrades. |
 | [Diagnostics proxy](docs/diagnostics.md) | Websocket and HTTP access to node diagnostics sockets. |
@@ -152,6 +153,8 @@ casper-devnet derive "m/44'/506'/0'/0/100" --account-hash -o -
 ```
 
 For the full command surface, see the [CLI reference](docs/cli-reference.md).
+For the generated file layout and config rewrite details, see
+[How it works](docs/how-it-works.md).
 
 ## MCP, Upgrades, And Diagnostics
 
