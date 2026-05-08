@@ -1,40 +1,61 @@
 # Casper Devnet Launcher
 
-Casper Devnet Launcher is a Rust tool for running a local Casper network, based on and heavily
-inspired by the NCTL workflow, to make local devnets quick and easy for smart contract developers.
-It embeds the essential node-launcher behavior in-process, so you only need the `casper-node`
-and (optionally) `casper-sidecar` binaries.
+Casper Devnet Launcher is a Rust CLI for running a local Casper devnet from
+pre-built assets. It borrows the useful parts of the NCTL workflow, but targets
+smart contract developers, application developers, and CI jobs that need one
+command to prepare assets, start processes, stream feedback, and shut down cleanly.
 
 ![Casper Devnet Launcher demo](casper-devnet.gif)
 
-## Why this exists
+Links: [Crates.io](https://crates.io/crates/casper-devnet),
+[docs.rs](https://docs.rs/casper-devnet),
+[GitHub](https://github.com/veles-labs/casper-devnet-launcher),
+[Docker image](https://github.com/veles-labs/casper-devnet-launcher/pkgs/container/casper-devnet),
+[asset releases](https://github.com/veles-labs/devnet-launcher-assets/releases).
 
-NCTL is fantastic for core protocol development and for building assets from source trees, but it
-comes with a large shell script surface, external process supervision, and multi-step UX. This tool
-targets application and contract developers who want a repeatable, portable devnet for development,
-CI, and tests.
+## Documentation
 
-## Comparison with NCTL
+| Document | Use it for |
+| --- | --- |
+| [Docs map](docs/README.md) | Choosing the smallest doc to read or update. |
+| [CLI reference](docs/cli-reference.md) | Commands, flags, defaults, and examples. |
+| [MCP workflow](docs/mcp.md) | Running the MCP server and constructing transactions. |
+| [Hooks and upgrades](docs/hooks-and-upgrades.md) | Network hooks, protocol staging, and live/offline upgrades. |
+| [Diagnostics proxy](docs/diagnostics.md) | Websocket and HTTP access to node diagnostics sockets. |
 
-| Area | NCTL | Casper Devnet Launcher (this repo) |
-| --- | --- | --- |
-| Primary audience | Core protocol development | Smart contract/app developers, CI/tests |
-| Process control | External supervisor (supervisord) | In-process process control |
-| Setup workflow | Multiple commands | Single command: `casper-devnet start` |
-| Implementation | Large shell script | Rust binary (portable) |
-| Node launcher | External `casper-node-launcher` | Embedded launcher logic |
-| Requirements | Node + launcher + sidecar + scripts | Assets bundle (node + sidecar + templates) |
-| Keys/accounts | Random keys, friction to name/locate | Deterministic accounts and one-shot inherited pipe consensus keys from a seed (BIP32 paths) |
-| macOS devnet start | Often requires extra local compilation | Download pre-built cross-platform bundles |
-| Network feedback | Extra commands to watch blocks/txs | Persistent SSE connection with live output |
-
-## Installation
+## Quick Start
 
 ```bash
 cargo install casper-devnet --locked
+casper-devnet assets pull
+casper-devnet start
 ```
 
-## Docker usage
+`assets pull` downloads the latest matching asset bundle, verifies the `.sha512`
+file, compares `manifest.json`, installs the bundle, and writes `assets/latest`
+with the release tag. `start` uses the newest installed bundle by default and
+starts the `casper-dev` network with four nodes.
+
+When a network already has prepared assets, `casper-devnet start` resumes from
+the existing network directory. Use `--force-setup` to rebuild generated assets.
+
+## Why This Exists
+
+NCTL is built for core protocol development and source-tree workflows. Casper
+Devnet Launcher is built for repeatable local devnets in app development, tests,
+and CI.
+
+| Area | NCTL | Casper Devnet Launcher |
+| --- | --- | --- |
+| Audience | Core protocol development | Contract/app developers, CI |
+| Startup | Multi-step shell workflow | `casper-devnet start` |
+| Process control | External supervisor | Managed inside the Rust process |
+| Node launcher | External binary | Embedded launcher logic |
+| Assets | Built from local trees | Downloaded or locally added bundles |
+| Accounts | Random/generated workflow | Deterministic seed-based material |
+| Feedback | Extra commands | Live SSE output during the run |
+
+## Docker
 
 Pull the image:
 
@@ -42,7 +63,7 @@ Pull the image:
 docker pull ghcr.io/veles-labs/casper-devnet
 ```
 
-Run a devnet with the default data location (persist assets and network state with a volume):
+Run a devnet and persist assets plus network state in a local volume:
 
 ```bash
 docker run --rm -it \
@@ -51,7 +72,7 @@ docker run --rm -it \
   ghcr.io/veles-labs/casper-devnet
 ```
 
-Use a custom data directory by overriding `XDG_DATA_HOME` and mounting it:
+Use a custom data directory by overriding `XDG_DATA_HOME`:
 
 ```bash
 docker run --rm -it \
@@ -61,54 +82,25 @@ docker run --rm -it \
   ghcr.io/veles-labs/casper-devnet
 ```
 
-The exposed ports map to node-1 services: RPC (11101), REST (14101), SSE (18101), network gossip
-(22101), binary protocol (28101), and diagnostics websocket proxy
-(ws://127.0.0.1:32000/diagnostics/node-1/). The diagnostics proxy also accepts HTTP POST requests
-to `/diagnostics/node-1/` for non-websocket clients and streams NDJSON responses.
+The exposed ports map to node-1 RPC (`11101`), REST (`14101`), SSE (`18101`),
+network gossip (`22101`), binary protocol (`28101`), and diagnostics websocket
+proxy (`32000`). See [Diagnostics proxy](docs/diagnostics.md) for details.
 
-## Diagnostics HTTP Proxy
+## Common Workflows
 
-The diagnostics proxy is useful in environments where you cannot or do not want to keep a
-websocket connection open. It accepts plain HTTP POST requests, forwards them to the node's
-diagnostics Unix socket, and returns line-delimited JSON responses. This is handy for automation
-or for setting failure points and collecting detailed runtime state.
-
-Set a failure point (stop at a specific block height):
+Install or update downloaded assets:
 
 ```bash
-curl -v -XPOST --data 'stop --at block:250' http://127.0.0.1:32000/diagnostics/node-1/
+casper-devnet assets pull
+casper-devnet assets pull --force
+casper-devnet assets pull --target x86_64-unknown-linux-gnu
 ```
 
-Dump network info:
-
-```bash
-curl -v -XPOST --data 'net-info' http://127.0.0.1:32000/diagnostics/node-1/
-```
-
-Dump queues:
-
-```bash
-curl -v -XPOST --data 'dump-queues' http://127.0.0.1:32000/diagnostics/node-1/
-```
-
-For interactive workflows, use websockets so you can send commands and immediately see responses
-without re-establishing connections:
-
-```bash
-wscat -c ws://127.0.0.1:32000/diagnostics/node-1/
-```
-
-## Usage
-
-Add a local assets bundle:
+Install local assets:
 
 ```bash
 casper-devnet assets add /path/to/assets-bundle.tar.gz
-```
 
-Add a custom override asset (symlink-backed local paths):
-
-```bash
 casper-devnet assets add dev \
   --casper-node /path/to/casper-node \
   --casper-sidecar /path/to/casper-sidecar \
@@ -117,132 +109,38 @@ casper-devnet assets add dev \
   --sidecar-config /path/to/sidecar-config.toml
 ```
 
-Custom asset names are write-once: reusing an existing name returns an error instead of replacing
-the asset directory.
-
-List installed protocol bundles and custom assets:
+List and inspect assets:
 
 ```bash
 casper-devnet assets list
-```
-
-Print absolute path to a custom asset directory (shell-substitution friendly):
-
-```bash
 casper-devnet assets path dev
-vim "$(casper-devnet assets path dev)/chainspec.toml"
 ```
 
-Custom assets install only symlink-backed asset files. Hooks are network-scoped and live under
-the managed network directory.
-
-List managed network directories:
-
-```bash
-casper-devnet networks list
-```
-
-Remove a managed network directory from disk:
-
-```bash
-casper-devnet networks rm casper-dev
-casper-devnet networks rm casper-dev --yes
-```
-
-Print the staged per-node config directories for a protocol version:
-
-```bash
-casper-devnet network casper-dev path 2.2.0
-```
-
-Print the network root:
-
-```bash
-casper-devnet network casper-dev path
-```
-
-Download assets from the latest release:
-
-```bash
-casper-devnet assets pull
-```
-
-Supported host architectures:
-
-- `aarch64-apple-darwin`
-- `aarch64-unknown-linux-gnu`
-- `x86_64-apple-darwin`
-- `x86_64-unknown-linux-gnu`
-
-See also [https://github.com/veles-labs/devnet-launcher-assets/releases/](https://github.com/veles-labs/devnet-launcher-assets/releases/).
-
-Force re-download:
-
-```bash
-casper-devnet assets pull --force
-```
-
-Override the target triple:
-
-```bash
-casper-devnet assets pull --target x86_64-unknown-linux-gnu
-```
-
-## Security note
-
-`casper-devnet assets pull` downloads pre-built binaries from
-[https://github.com/veles-labs/devnet-launcher-assets/releases](https://github.com/veles-labs/devnet-launcher-assets/).
-If you are not comfortable running pre-built binaries, download the assets repo and rebuild the
-binaries locally using the provided scripts before installing them with `assets add`.
-
-List available protocol versions:
-
-```bash
-casper-devnet assets list
-```
-
-Start a devnet:
-
-```bash
-casper-devnet start
-```
-
-Start from a specific installed bundle, or from a custom asset:
+Start with a specific asset or protocol version:
 
 ```bash
 casper-devnet start --asset 2.1.3
 casper-devnet start --custom-asset dev
-```
-
-Override the chainspec protocol version while using the selected asset files:
-
-```bash
 casper-devnet start --asset 2.1.3 --protocol-version 2.2.0
 ```
 
-Patch chainspec values before fresh genesis setup:
+Prepare assets without starting processes, or rebuild an existing network:
 
 ```bash
+casper-devnet start --setup-only
+casper-devnet start --force-setup
 casper-devnet start --force-setup \
-  --chainspec-override 'core.minimum_era_height=1' \
-  --chainspec-override 'core.test_values=[1, 10]'
+  --chainspec-override 'core.minimum_era_height=1'
 ```
 
-`--chainspec-override` uses `key.path=<toml-value>` syntax and may be repeated. Quote
-values that contain shell-sensitive characters or spaces, especially arrays and strings.
-Overrides are applied before launcher defaults, so `--protocol-version`, `--delay`,
-`--network-name`, and `--node-count` still control their generated chainspec fields.
-Overrides only apply to a fresh setup; use `--force-setup` when the network already exists.
-
-Stage a protocol upgrade from a versioned or custom asset:
+Inspect managed networks:
 
 ```bash
-casper-devnet network casper-dev stage-protocol --asset 2.1.3 --protocol-version 2.2.0 --activation-point 123
-casper-devnet network casper-dev stage-protocol --custom-asset dev --protocol-version 2.2.0 --activation-point 123
-casper-devnet network casper-dev stage-protocol --custom-asset dev \
-  --protocol-version 2.2.0 \
-  --activation-point 123 \
-  --chainspec-override 'core.minimum_era_height=1'
+casper-devnet networks list
+casper-devnet networks rm casper-dev --yes
+casper-devnet network casper-dev is-ready
+casper-devnet network casper-dev port --rpc
+casper-devnet network casper-dev port --sse
 ```
 
 Derive deterministic account material from a seed and BIP32 path:
@@ -250,292 +148,61 @@ Derive deterministic account material from a seed and BIP32 path:
 ```bash
 casper-devnet derive "m/44'/506'/0'/0/0" --secret-key
 casper-devnet derive "m/44'/506'/0'/0/100" --public-key
-casper-devnet derive "m/44'/506'/0'/0/100" --account-hash -o /tmp/derived
 casper-devnet derive "m/44'/506'/0'/0/100" --account-hash -o -
 ```
 
-Print a random live endpoint for a running node:
+For the full command surface, see the [CLI reference](docs/cli-reference.md).
 
-```bash
-casper-devnet network casper-dev port --rpc
-casper-devnet network casper-dev port --sse
-casper-devnet network casper-dev port --rest
-casper-devnet network casper-dev port --binary
-casper-devnet network casper-dev port --diagnostics
-```
+## MCP, Upgrades, And Diagnostics
 
-When the network is actively managed by `casper-devnet`, this command prefers the live control
-socket to discover currently running nodes before choosing an endpoint. If that live query is
-unavailable or unresponsive, it falls back to `state.json` instead of hanging indefinitely.
-
-Add managed non-genesis nodes to a running network:
-
-```bash
-casper-devnet network casper-dev add-nodes --count 2
-```
-
-`network <name> add-nodes` is live-only: it requires the foreground `start` or MCP-managed process
-to be running so it can prepare assets, spawn the new node and sidecar processes, track them in
-`state.json`, and stop them during normal shutdown. During expansion, the manager reads a recent
-trusted hash from an existing node's REST `/status`, writes it to `[node].trusted_hash`, and uses
-the active config's joining sync mode (`[node].sync_handling = "ttl"`, or
-`sync_to_genesis = false` for legacy configs).
-Added nodes inherit the currently active protocol version and any higher protocol versions already
-staged on existing nodes, so a node added before an activation era can follow the pending upgrade.
-The foreground `start` manager logs the full endpoint summary for nodes added through the control
-plane and prints node reactor state changes observed by polling each node's REST `/status` every
-500ms.
-
-If a managed process is running (from `start` or MCP), staging runs in live mode and restarts
-sidecars. Otherwise, staging runs in offline mode and only writes versioned
-`nodes/node-*/bin/<version>` and `nodes/node-*/config/<version>` assets.
-Live staging control uses a per-network Unix socket at `/tmp/<network-name>.socket`
-for runtime stage requests. Managed node processes serve consensus secret keys through
-inherited pipe file descriptors, deriving the PEM from the network seed and writing it once
-after each child process starts. Managed on-disk configs still reference
-`keys/secret_key.pem`, but the embedded launcher starts validators and `migrate-data` with
-temporary configs whose consensus key paths point at `/proc/self/fd/<fd>` on Linux or
-`/dev/fd/<fd>` on macOS. The generated PEM is not served again for that config read, and
-fresh pipes are created before later `migrate-data` runs or validator restarts.
-Node and sidecar log aliases (for example `node-1.stdout`) are atomically repointed to
-versioned log files during protocol transitions; use `tail -F` to follow across alias swaps.
-If `networks/<network>/hooks/pre-stage-protocol` exists, it runs after the target version's
-per-node `bin/<version>` and `config/<version>` directories have been staged, and before
-post-stage metadata is queued, with argv
-`<network_name> <protocol_version> <activation_point>`. Use
-`casper-devnet network <network> path <protocol_version>` inside the hook to locate each staged
-per-node config directory. If the hook fails, the newly staged version directories are removed and
-`post-stage-protocol` is not queued.
-If `networks/<network>/hooks/post-stage-protocol` exists, it runs once later at the real upgrade
-boundary, after the launcher starts the target validator version, with argv
-`<network_name> <protocol_version>`.
-If `networks/<network>/hooks/pre-genesis` exists, it runs after assets have been prepared
-for a fresh network but before the network is started, with argv
-`<network_name> <protocol_version>`.
-If `networks/<network>/hooks/post-genesis` exists, it runs once after the fresh network
-produces its first block, with argv `<network_name> <protocol_version>`.
-If `networks/<network>/hooks/block-added` exists, it runs on each observed new block with
-argv `<network_name> <protocol_version>` and the block event JSON payload on stdin.
-Each hook runs in its own working directory under `networks/<network>/hooks/work/<hook-name>/`, so
-hooks can leave files behind for later hooks to inspect.
-Hook stdout/stderr are streamed line by line through `casper-devnet` stderr as
-`<hook_name> stdout: ...` and `<hook_name> stderr: ...`. Non-zero exits are still reported, but
-successful exit code `0` is quiet. The raw hook streams are also written under
-`networks/<network>/hooks/logs/`.
-The generated sample hooks live under `networks/<network>/hooks/*.sample`. The samples show how
-to call `casper-devnet network <network> port --rpc`, issue an `info_get_status` JSON-RPC
-request, consume `block-added` JSON from stdin, and use `casper-devnet network <network> path
-[<protocol_version>]` to locate the network root or staged per-node config directories.
-
-Run MCP control plane server (STDIO + HTTP):
+Run the MCP control plane server:
 
 ```bash
 casper-devnet mcp
-```
-
-Run MCP in HTTP-only mode:
-
-```bash
 casper-devnet mcp --transport http --http-bind 127.0.0.1:32100 --http-path /mcp
 ```
 
-Check whether a devnet has produced blocks (useful for CI):
+MCP does not auto-start a network. Use `spawn_network`, `wait_network_ready`,
+then the network tools exposed by the MCP server. Transaction construction rules
+and client configuration examples are in [MCP workflow](docs/mcp.md).
+
+Stage a protocol upgrade:
 
 ```bash
-casper-devnet network casper-dev is-ready
+casper-devnet network casper-dev stage-protocol \
+  --asset 2.1.3 \
+  --protocol-version 2.2.0 \
+  --activation-point 123
 ```
 
-Create assets without starting processes:
+Hook lifecycle and upgrade behavior are documented in
+[Hooks and upgrades](docs/hooks-and-upgrades.md). Diagnostics websocket and HTTP
+proxy examples are documented in [Diagnostics proxy](docs/diagnostics.md).
 
-```bash
-casper-devnet start --setup-only
+## Assets And Security
+
+Downloaded assets come from
+[veles-labs/devnet-launcher-assets releases](https://github.com/veles-labs/devnet-launcher-assets/releases).
+If you are not comfortable running pre-built binaries, rebuild assets locally
+from the assets repository and install the resulting bundle with `assets add`.
+
+Assets and runtime state live under the platform data directory selected by the
+`directories` crate:
+
+- `assets/` stores downloaded bundles as `v{version}/...`
+- `assets/custom/<name>/` stores symlink-backed custom assets
+- `networks/<network>/` stores generated runtime assets and `state.json`
+
+Versioned bundles must contain:
+
+```text
+vX.Y.Z/bin/casper-node
+vX.Y.Z/bin/casper-sidecar
+vX.Y.Z/chainspec.toml
+vX.Y.Z/node-config.toml
+vX.Y.Z/sidecar-config.toml
+vX.Y.Z/manifest.json
 ```
-
-Use `--setup-only` when you want to tweak chainspecs or node configs before launching.
-Use `--chainspec-override` with `--setup-only` to apply repeatable TOML value patches during
-fresh asset setup.
-`--setup-only` writes configs that reference `keys/secret_key.pem`, but it does not create
-`keys/` directories or write regular consensus secret key PEM files. Managed `start`/MCP runs
-use one-shot inherited pipe key delivery at runtime.
-
-Rebuild assets:
-
-```bash
-casper-devnet start --force-setup
-```
-
-## MCP workflow
-
-`casper-devnet mcp` does not auto-start a network. Use MCP tools in this order:
-
-1. `spawn_network` (defaults to `force_setup=true` for fresh setup; set `force_setup=false` to resume existing assets).
-2. `wait_network_ready` (waits for running processes, healthy `/status`, `reactor_state=Validate`, and first observed block).
-3. Call network tools (RPC/status/block/log/SSE/transactions).
-
-MCP server defaults:
-
-- `transport=both`
-- `http_bind=127.0.0.1:32100`
-- `http_path=/mcp`
-
-MCP tools require `network_name`; node-scoped tools also require `node_id`.
-Managed networks are stopped automatically when the MCP server exits.
-Use `managed_processes` to inspect managed node/sidecar processes, with optional process-name filtering and `running_only` control.
-Use `stage_protocol` to stage versioned-asset or custom-asset upgrades for managed networks
-(`live_mode=true`) or discovered stopped networks (`live_mode=false`).
-`rpc_query_global_state` auto-resolves the latest block hash when both `block_id` and `state_root_hash` are omitted.
-For transaction construction, use MCP tools (`make_transaction_package_call`, `make_transaction_contract_call`, `make_transaction_session_wasm`) with `send_transaction_signed` instead of invoking external `casper-client` binaries.
-`session_args` supports full CLType strings (including nested types such as `Option<List<U512>>`, `Map<String,U64>`, tuples, and `ByteArray[32]`). Scalars can be passed as string/number/bool, `null` maps to `None` for `Option<T>`, and composite values should be provided as hex bytes (`0x...`). Pass this field as JSON (array/object), not an escaped JSON string. Legacy `session_args_json` is still accepted for compatibility.
-`send_transaction_signed.transaction` should be a typed JSON object. Field name `transaction_json` is not accepted, and encoded JSON strings are not supported.
-Use MCP transaction query tools (`get_transaction`, `wait_transaction`) instead of shelling out to `curl` for `info_get_transaction` calls.
-Valid `session_args` examples:
-- `[{"name":"value","type":"I32","value":"1"}]`
-- `[{"name":"items","type":"List<U64>","value":"0x03000000010000000000000002000000000000000300000000000000"}]`
-Unsupported formats:
-- `{"value":1}` (object shorthand)
-- `["value:i32=1"]` (casper-client CLI arg string format)
-
-Codex CLI stdio MCP example (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.casper-devnet]
-command = "casper-devnet"
-args = ["mcp", "--transport", "stdio"]
-```
-
-Or add it via Codex CLI:
-
-```bash
-codex mcp add casper-devnet -- casper-devnet mcp --transport stdio
-```
-
-If `casper-devnet` is not on `PATH`, set `command` to an absolute binary path.
-Claude CLI config example: PRs welcome.
-
-## Common flags
-
-- `--asset <version>`: Versioned asset bundle to use from the assets store (accepts `2.1.3` or `v2.1.3`; defaults to newest bundle)
-- `--custom-asset <name>`: Custom asset under `assets/custom/<name>` to use instead of a versioned bundle
-- `--protocol-version <version>`: Override the chainspec protocol version; when omitted, `start` uses the selected asset's chainspec value
-- `--chainspec-override <key.path=value>`: Patch a generated chainspec value before genesis setup; repeatable; value must be valid TOML, for example `'core.test_values=[1, 10]'`; requires a fresh network or `--force-setup`
-- `--network-name <name>`: Network name for configs/paths (default: `casper-dev`)
-- `--net-path <path>`: Override the network runtime root (default: platform data dir `.../networks`)
-- `--node-count <n>`: Number of nodes (aliases: `--nodes`, `--validators`; default: 4)
-- `--users <n>`: Number of user accounts (default: node count)
-- `--delay <seconds>`: Genesis activation delay (default: 3). Keep it short for local devnets; increase if you need more time to attach tooling before genesis.
-- `--log-level <level>`: Child process log level (default: `info`)
-- `--node-log-format <format>`: Node logging format in config (default: `json`)
-- `--setup-only`: Build assets and exit
-- `--force-setup`: Rebuild assets even if they exist, while preserving `networks/<network>/hooks/`
-- `--seed <string>`: Seed for deterministic devnet keys (default: `default`)
-
-`casper-devnet mcp` flags:
-
-- `--transport <stdio|http|both>`: MCP transport mode (default: `both`)
-- `--http-bind <addr:port>`: HTTP bind address for streamable MCP (default: `127.0.0.1:32100`)
-- `--http-path <path>`: HTTP mount path for MCP endpoint (default: `/mcp`)
-- `--net-path <path>`: Override network runtime root (same behavior as `start`)
-
-`casper-devnet network <network> stage-protocol` flags:
-
-- `[asset]`: Optional positional shorthand for `--asset <version>`
-- `--asset <version>`: Versioned asset bundle to stage from
-- `--custom-asset <name>`: Custom asset under `assets/custom/<name>` to stage from
-- `--protocol-version <version>`: Protocol version to stage (required)
-- `--activation-point <era-id>`: Future era id for activation (required)
-- `--chainspec-override <key.path=value>`: Patch the staged chainspec before pre-stage hooks run; repeatable; value must be valid TOML, for example `'core.test_values=[1, 10]'`
-- `--net-path <path>`: Override network runtime root (same behavior as `start`)
-
-Exactly one of `[asset]`, `--asset`, or `--custom-asset` is required for staging.
-
-`casper-devnet derive` flags:
-
-- `<path>`: BIP32 derivation path to resolve
-- `--secret-key`: Print or write the derived secret key PEM
-- `--public-key`: Print or write the derived public key hex
-- `--account-hash`: Print or write the derived account hash
-- `--seed <string>`: Deterministic seed for derivation (default: `default`)
-- `-o, --output <path>`: Output directory, or `-` for stdout
-
-Exactly one of `--secret-key`, `--public-key`, or `--account-hash` must be provided.
-
-`casper-devnet network <network> path` flags:
-
-- `[protocol_version]`: Optional protocol version to inspect
-- `--net-path <path>`: Override network runtime root (same behavior as `start`)
-
-When no protocol version is provided, this prints the network root directory. When a protocol
-version is provided, it prints one staged config directory per known node, one path per line.
-
-`casper-devnet network <network> add-nodes` flags:
-
-- `--count <n>`: Number of managed non-genesis nodes to add to the live network
-- `--net-path <path>`: Override network runtime root (same behavior as `start`)
-
-`casper-devnet network <network> port` flags:
-
-- `--rpc`: Print one random running node RPC URL
-- `--sse`: Print one random running node SSE URL
-- `--rest`: Print one random running node REST URL
-- `--binary`: Print one random running node binary-port address
-- `--diagnostics`: Print one random running node diagnostics socket path
-- `--net-path <path>`: Override network runtime root (same behavior as `start`)
-
-Exactly one of `--rpc`, `--sse`, `--rest`, `--binary`, or `--diagnostics` must be provided.
-
-`casper-devnet network <network> status` flags:
-
-- `--node-id <id>`: Node id whose REST `/status` endpoint should be queried
-- `--net-path <path>`: Override network runtime root (same behavior as `start`)
-
-`casper-devnet network <network> is-ready` flags:
-
-- `--net-path <path>`: Override network runtime root (same behavior as `start`)
-
-## Assets bundle layout
-
-The bundle is extracted into the platform data directory and should include a versioned root with
-the following shape:
-
-```
-v2.1.1/bin/casper-node
-v2.1.1/bin/casper-sidecar
-v2.1.1/chainspec.toml
-v2.1.1/sidecar-config.toml
-v2.1.1/node-config.toml
-```
-
-Custom override assets are stored separately under `assets/custom/<name>/` as symlinks to local
-`casper-node`, `casper-sidecar`, `chainspec.toml`, `node-config.toml`, and `sidecar-config.toml`.
-Custom assets do not install or execute hooks.
-
-Network hooks live under each managed network directory. Samples are generated as:
-
-```
-networks/<network>/hooks/pre-genesis.sample
-networks/<network>/hooks/post-genesis.sample
-networks/<network>/hooks/block-added.sample
-networks/<network>/hooks/pre-stage-protocol.sample
-networks/<network>/hooks/post-stage-protocol.sample
-```
-
-Only exact active hook filenames are executed:
-
-```
-networks/<network>/hooks/pre-genesis
-networks/<network>/hooks/post-genesis
-networks/<network>/hooks/block-added
-networks/<network>/hooks/pre-stage-protocol
-networks/<network>/hooks/post-stage-protocol
-```
-
-The `.sample` files are boilerplate only and are never executed directly.
 
 For manual rebuilds and bundle scripts, see
-[https://github.com/veles-labs/devnet-launcher-assets/](https://github.com/veles-labs/devnet-launcher-assets/).
-
-## Notes
-
-- The launcher runs the node directly and manages processes internally; no external supervisor is required.
-- The embedded launcher state is handled within the process; only the node/sidecar binaries are required.
-- Assets are stored under the platform data directory (e.g., `~/.local/share/xyz.veleslabs.casper-devnet` on Linux or `~/Library/Application Support/xyz.veleslabs.casper-devnet` on macOS), with `assets/` for bundles and `networks/` for runtime assets.
+[veles-labs/devnet-launcher-assets](https://github.com/veles-labs/devnet-launcher-assets/).

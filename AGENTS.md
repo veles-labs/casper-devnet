@@ -9,6 +9,19 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - `casper-devnet assets list`: list installed protocol versions (newest first).
 - `casper-devnet start [--protocol-version <ver>]`: start devnet. Defaults to newest bundle version. Logs “resuming…” if assets already exist and `--force-setup` is not used.
 
+## Documentation map
+- Start with `docs/README.md` when changing docs or user-facing behavior; it is the token-saving
+  map for which detailed doc to read next.
+- `README.md`: concise product overview, quick start, common workflows, and links to detailed docs.
+  Do not move long reference material back into the README.
+- `docs/cli-reference.md`: command names, flags, defaults, and CLI examples.
+- `docs/mcp.md`: MCP server workflow, client snippets, transaction construction, and transaction lookup rules.
+- `docs/hooks-and-upgrades.md`: protocol staging, hook lifecycle, live/offline upgrade behavior, and add-node behavior.
+- `docs/diagnostics.md`: diagnostics websocket and HTTP proxy usage.
+- For token-saving ingestion, read only `docs/README.md` plus the doc relevant to the behavior being
+  changed. Prefer `rg` for exact flags/terms before opening long docs. Bulk-read all docs only for
+  cross-cutting documentation changes.
+
 ## Assets layout
 - Platform data dir (via `directories` crate):
   - `.../assets/` stores bundles: `v{version}/...`
@@ -32,7 +45,7 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 
 ## Logging and SSE
 - SSE logs are timestamp-prefixed (no node id).
-- Child `RUST_LOG` is set from `--loglevel` (default `info`).
+- Child `RUST_LOG` is set from `--log-level` (default `info`).
 - Node config logging format uses `--node-log-format` (default `json`).
 
 ## Non-goals and removals
@@ -57,7 +70,10 @@ Casper devnet launcher in Rust. It is heavily influenced by the NCTL workflow bu
 - For MCP transaction construction, do **not** shell out to `casper-client` CLI binaries; use MCP constructor tools and pass `session_args` as structured JSON (not escaped text), using either full `RuntimeArgs` JSON or an array of `{name,type,value}` objects (example: `[{"name":"value","type":"I32","value":"1"}]`). Composite values (`List`, `Map`, tuples, `Result`, `ByteArray`) should use hex bytes (`0x...`). Do not use object shorthand (`{"value":1}`) or casper-client string-arg syntax (`["value:i32=1"]`). Legacy `session_args_json` is accepted only for compatibility.
 - For `send_transaction_signed`, provide `transaction` as typed JSON (`transaction: {...}`); encoded JSON strings are not supported, and `transaction_json` is not accepted.
 - Do not use `curl` for JSON-RPC transaction lookups; use MCP `get_transaction` (single fetch) or `wait_transaction` (poll-until-executed) tools instead.
-- Keep `README.md` updated with CLI defaults/flags whenever code changes.
+- Keep `README.md`, linked docs under `docs/`, and generated CLI help/defaults consistent whenever
+  user-facing CLI behavior changes. README should stay concise; put detailed behavior in the
+  canonical linked doc and link to it rather than duplicating long reference sections.
+- When docs mention command names, flags, or defaults, verify them with `cargo run --quiet -- ... --help`.
 - Before finishing a task, run `cargo clippy --all --all-targets --all-features --tests` only if any `.rs` code is changed, and report failures.
 - Update `CHANGELOG.md` only when explicitly asked. When asked, derive the changelog work from
   changes against the upstream branch, considering commits, modified files, and staged files as
